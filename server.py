@@ -14,9 +14,9 @@ def mcp__graph__explore(query: str) -> str:
     """Executes a read-only Cypher query to explore code relationships (Layer 0) and memories (Layer 1)."""
     clean_query = query.strip()
     
-    # Guardrail 1: Enforce Read-Only Mutation Blocks
+    # Guardrail 1: Enforce Read-Only Mutation Blocks (using whole word matching)
     forbidden = ["CREATE", "MERGE", "SET", "DELETE", "REMOVE", "DROP", "ALTER"]
-    if any(k in clean_query.upper() for k in forbidden):
+    if any(re.search(rf"\b{k}\b", clean_query, re.IGNORECASE) for k in forbidden):
         return "ERROR: Write operations forbidden via this tool. Use mcp__workspace tools to alter memory."
     
     # Guardrail 2: Automatic Window Size Constraints
