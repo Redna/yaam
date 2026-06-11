@@ -2,26 +2,32 @@ import os
 import re
 import json
 import time
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 import ladybug as lb
-from db import get_connection, DB_PATH
+from db import get_connection
 from logger import log_event
 
-mcp = FastMCP("yaam_memory")
+# Initialize Prefect FastMCP
+mcp = FastMCP("yaam")
 
 @mcp.tool()
 def mcp__graph__explore(query: str) -> str:
-    """Executes a read-only Cypher query to explore code relationships (Layer 0) and memories (Layer 1)."""
+    """
+    Executes a read-only Cypher query to explore code relationships (Layer 0) 
+    and agent memories (Layer 1).
+    """
     clean_query = query.strip()
     
     # Guardrail 1: Enforce Read-Only Mutation Blocks (using whole word matching)
     forbidden = ["CREATE", "MERGE", "SET", "DELETE", "REMOVE", "DROP", "ALTER"]
     if any(re.search(rf"\b{k}\b", clean_query, re.IGNORECASE) for k in forbidden):
-        return "ERROR: Write operations forbidden via this tool. Use mcp__workspace tools to alter memory."
+        return "ERROR: Write operations forbidden via this tool. Use workspace mutation tools to alter memory."
     
     # Guardrail 2: Automatic Window Size Constraints
     if "LIMIT" not in clean_query.upper():
+        # Inject LIMIT 500 into the return clause
         clean_query = re.sub(r'(RETURN\s+.+)', r'\1 LIMIT 500', clean_query, flags=re.IGNORECASE)
+        # Fallback if regex failed to find RETURN
         if "LIMIT 500" not in clean_query.upper():
              clean_query += " LIMIT 500"
 
@@ -44,7 +50,7 @@ def mcp__graph__explore(query: str) -> str:
                     f.write(f"{str(r)}\n")
             return (f"SUCCESS: Query returned {len(rows)} rows. "
                     f"To protect your context window, results have been spooled to disk at: '{output_file}'. "
-                    f"Use your local file tools (e.g., grep, view_file, or bash/sed) to inspect the data.")
+                    f"Use your local file tools (e.g., grep, cat) to inspect the data.")
         
         return "Results:\n" + "\n".join(f"- {str(r)}" for r in rows)
     except Exception as e:
