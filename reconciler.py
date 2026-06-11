@@ -67,7 +67,13 @@ def reconcile():
             """
             conn.execute(invalidation_query)
 
-    print(f"Reconciliation complete. Processed {len(status_map)} items.")
+    # Suppress output if running in a hook context or just make it silent by default
+    # print(f"Reconciliation complete. Processed {len(status_map)} items.")
 
 if __name__ == "__main__":
     reconcile()
+    # Output valid hook decision for Gemini CLI
+    import json
+    import sys
+    if not sys.stdin.isatty():
+        print(json.dumps({"decision": "allow"}))

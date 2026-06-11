@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "yaam": {
+      "command": "/home/anima/yaam/.venv/bin/python3",
+      "args": [
+        "/home/anima/yaam/server.py"
+      ]
+    }
+  },
+  "hooks": {
+    "AfterTool": {
+      "command": "/home/anima/yaam/.venv/bin/python3",
+      "args": [
+        "/home/anima/yaam/reconciler.py"
+      ]
+    }
+  }
+}
