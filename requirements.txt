@@ -1,0 +1,5 @@
+mcp
+mcp[server]
+ladybug
+tree-sitter
+tree-sitter-python

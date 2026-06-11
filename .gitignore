@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env
+
+# LadybugDB files
+*.lbug/
+memory.lbug/
+
+# YAAM internals
+.chunks/
+history.jsonl
