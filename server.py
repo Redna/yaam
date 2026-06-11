@@ -28,7 +28,7 @@ def mcp__graph__explore(query: str) -> str:
     try:
         conn = get_connection()
         results = conn.execute(clean_query)
-        rows = results.get_all_rows()
+        rows = results.get_all()
         
         if not rows:
             return "Query completed successfully. Zero rows returned."
