@@ -15,7 +15,14 @@ def get_connection(max_retries=10, initial_delay=0.05):
     for attempt in range(max_retries):
         try:
             db = lb.Database(DB_PATH)
-            return lb.Connection(db)
+            conn = lb.Connection(db)
+            # Auto-initialize schema if Workspace table does not exist
+            try:
+                conn.execute("MATCH (w:Workspace) RETURN w LIMIT 1")
+            except Exception as ex:
+                if "does not exist" in str(ex).lower() or "binder exception" in str(ex).lower():
+                    setup_database_with_conn(conn)
+            return conn
         except Exception as e:
             if attempt == max_retries - 1:
                 # If we've exhausted all retries, raise the lock exception
@@ -24,10 +31,8 @@ def get_connection(max_retries=10, initial_delay=0.05):
             time.sleep(delay + random.uniform(0.01, 0.05))
             delay *= 1.5
 
-def setup_database():
-    """Initializes the LadybugDB schema for YAAM."""
-    conn = get_connection()
-    
+def setup_database_with_conn(conn):
+    """Initializes the LadybugDB schema using an existing connection."""
     # Helper to execute and ignore 'Table already exists' errors
     def safe_execute(query):
         try:
@@ -49,7 +54,11 @@ def setup_database():
     # Cross-Layer Mappings (Polymorphic Target Support)
     safe_execute("CREATE REL TABLE MAPPED_TO(FROM Workspace TO Entity, created_at INT64, invalidated_at INT64, is_stale BOOLEAN)")
     safe_execute("CREATE REL TABLE HAS_SCRATCHPAD(FROM Workspace TO Scratchpad)")
-    
+
+def setup_database():
+    """Initializes the LadybugDB schema for YAAM."""
+    conn = get_connection()
+    setup_database_with_conn(conn)
     print("Database schema setup complete.", file=sys.stderr)
 
 if __name__ == "__main__":

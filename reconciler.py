@@ -8,8 +8,8 @@ def get_git_status():
     """Runs git status --porcelain and returns the list of modified/deleted files."""
     try:
         result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=True)
-        lines = result.stdout.strip().split("\n")
-        if not lines or lines == ['']:
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
             return []
         
         status_map = []
