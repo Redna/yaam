@@ -4,12 +4,25 @@ import sys
 
 DB_PATH = "./memory.lbug"
 
-def get_connection():
+def get_connection(max_retries=10, initial_delay=0.05):
     # Do NOT use a global singleton for the Database object.
     # We need to let it close (be garbage collected) so that other 
     # processes (like the AfterTool reconciler hook) can acquire the lock.
-    db = lb.Database(DB_PATH)
-    return lb.Connection(db)
+    import time
+    import random
+    
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            db = lb.Database(DB_PATH)
+            return lb.Connection(db)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                # If we've exhausted all retries, raise the lock exception
+                raise e
+            # Sleep with exponential backoff and random jitter
+            time.sleep(delay + random.uniform(0.01, 0.05))
+            delay *= 1.5
 
 def setup_database():
     """Initializes the LadybugDB schema for YAAM."""
