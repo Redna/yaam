@@ -78,9 +78,9 @@ def workspace_initialize(name: str, description: str) -> str:
     with redirect_stdout(sys.stderr):
         try:
             from reconciler import reconcile
-            reconcile()
+            reconcile(full=True)
         except Exception as e:
-            logger.error(f"Passive reconciliation failed: {e}")
+            logger.error(f"Full initialization reconciliation failed: {e}")
 
         log_event("workspace_initialize", {"name": name, "description": description})
         try:

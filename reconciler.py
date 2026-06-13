@@ -21,93 +21,170 @@ def get_git_status():
     except subprocess.CalledProcessError:
         return []
 
+def get_all_files():
+    """Recursively finds all files in the workspace, ignoring ignored directories."""
+    ignored_dirs = {".git", ".venv", "__pycache__", ".pytest_cache", ".claude", ".gemini", "node_modules"}
+    files = []
+    for root, dirs, filenames in os.walk("."):
+        # Modify dirs in-place to skip ignored directories
+        dirs[:] = [d for d in dirs if d not in ignored_dirs]
+        for filename in filenames:
+            filepath = os.path.join(root, filename)
+            # Normalize path (remove leading './')
+            if filepath.startswith("./"):
+                filepath = filepath[2:]
+            files.append(filepath)
+    return files
+
 from parser import extract_entities
 
-def reconcile():
-    """Updates the Entity table based on filesystem changes."""
-    status_map = get_git_status()
-    if not status_map:
-        return
-
+def reconcile(full=False):
+    """Updates the Entity table based on filesystem changes or performs a full scan."""
     conn = get_connection()
     ts = int(time.time())
 
-    for item in status_map:
-        path = item["path"]
-        git_status = item["status"]
-        
-        # Mapping git status to Entity status
-        entity_status = "active"
-        if git_status == "D":
-            entity_status = "deleted"
-        
-        # 1. Handle the File Entity using parameters
-        conn.execute(
-            "MERGE (e:Entity {id: $path_val}) SET e.type = 'File', e.status = $status_val, e.last_modified = $ts_val",
-            {"path_val": path, "status_val": entity_status, "ts_val": ts}
-        )
-
-        # 2. Extract and link Classes and Functions for Python files
-        if entity_status == "active" and path.endswith(".py"):
-            try:
-                entities = extract_entities(path)
-                
-                # Create and link top-level functions
-                for func_name in entities["top_level_functions"]:
-                    func_id = f"{path}::{func_name}"
-                    conn.execute(
-                        "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val",
-                        {"fid": func_id, "ts_val": ts}
-                    )
-                    conn.execute(
-                        "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
-                        {"pid": path, "fid": func_id}
-                    )
-                
-                # Create and link classes and their methods
-                for class_name, methods in entities["classes"].items():
-                    class_id = f"{path}::{class_name}"
-                    # Create Class node
-                    conn.execute(
-                        "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val",
-                        {"cid": class_id, "ts_val": ts}
-                    )
-                    # Link Class to File
-                    conn.execute(
-                        "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
-                        {"pid": path, "cid": class_id}
-                    )
+    if full:
+        disk_files = set(get_all_files())
+        # 1. Process all files on disk
+        for path in disk_files:
+            conn.execute(
+                "MERGE (e:Entity {id: $path_val}) SET e.type = 'File', e.status = 'active', e.last_modified = $ts_val",
+                {"path_val": path, "ts_val": ts}
+            )
+            if path.endswith(".py"):
+                try:
+                    entities = extract_entities(path)
                     
-                    # Create Class Methods
-                    for method_name in methods:
-                        method_id = f"{path}::{class_name}::{method_name}"
+                    # Create and link top-level functions
+                    for func_name in entities["top_level_functions"]:
+                        func_id = f"{path}::{func_name}"
                         conn.execute(
-                            "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val",
-                            {"mid": method_id, "ts_val": ts}
+                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val",
+                            {"fid": func_id, "ts_val": ts}
                         )
-                        # Link Method to Class
                         conn.execute(
-                            "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
-                            {"cid": class_id, "mid": method_id}
+                            "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
+                            {"pid": path, "fid": func_id}
                         )
-            except Exception as e:
-                import sys
-                print(f"Error parsing functions and classes in {path}: {e}", file=sys.stderr)
+                    
+                    # Create and link classes and their methods
+                    for class_name, methods in entities["classes"].items():
+                        class_id = f"{path}::{class_name}"
+                        conn.execute(
+                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val",
+                            {"cid": class_id, "ts_val": ts}
+                        )
+                        conn.execute(
+                            "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
+                            {"pid": path, "cid": class_id}
+                        )
+                        
+                        for method_name in methods:
+                            method_id = f"{path}::{class_name}::{method_name}"
+                            conn.execute(
+                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val",
+                                {"mid": method_id, "ts_val": ts}
+                            )
+                            conn.execute(
+                                "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
+                                {"cid": class_id, "mid": method_id}
+                            )
+                except Exception as e:
+                    import sys
+                    print(f"Error parsing functions and classes in {path}: {e}", file=sys.stderr)
         
-        # Soft invalidation for deleted files (Layer 1 Mappings)
-        if entity_status == "deleted":
-            # Identify and flag matching active workspaces
-            invalidation_query = """
-            MATCH (w:Workspace)-[r:MAPPED_TO]->(e:Entity)
-            WHERE e.id = $path_val OR e.id STARTS WITH $path_prefix
-            SET r.is_stale = true, r.invalidated_at = $ts_val
-            """
-            conn.execute(invalidation_query, {"path_val": path, "path_prefix": f"{path}::", "ts_val": ts})
+        # 2. Soft-delete files in DB that are no longer on disk
+        db_files = []
+        try:
+            res = conn.execute("MATCH (e:Entity {type: 'File'}) RETURN e.id")
+            db_files = [row[0] for row in res.get_all()]
+        except Exception:
+            pass
+            
+        for db_file in db_files:
+            if db_file not in disk_files:
+                conn.execute(
+                    "MATCH (e:Entity {id: $path_val}) SET e.status = 'deleted', e.last_modified = $ts_val",
+                    {"path_val": db_file, "ts_val": ts}
+                )
+                invalidation_query = """
+                MATCH (w:Workspace)-[r:MAPPED_TO]->(e:Entity)
+                WHERE e.id = $path_val OR e.id STARTS WITH $path_prefix
+                SET r.is_stale = true, r.invalidated_at = $ts_val
+                """
+                conn.execute(invalidation_query, {"path_val": db_file, "path_prefix": f"{db_file}::", "ts_val": ts})
+
+    else:
+        status_map = get_git_status()
+        if not status_map:
+            return
+
+        for item in status_map:
+            path = item["path"]
+            git_status = item["status"]
+            
+            entity_status = "active"
+            if git_status == "D":
+                entity_status = "deleted"
+            
+            conn.execute(
+                "MERGE (e:Entity {id: $path_val}) SET e.type = 'File', e.status = $status_val, e.last_modified = $ts_val",
+                {"path_val": path, "status_val": entity_status, "ts_val": ts}
+            )
+
+            if entity_status == "active" and path.endswith(".py"):
+                try:
+                    entities = extract_entities(path)
+                    
+                    for func_name in entities["top_level_functions"]:
+                        func_id = f"{path}::{func_name}"
+                        conn.execute(
+                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val",
+                            {"fid": func_id, "ts_val": ts}
+                        )
+                        conn.execute(
+                            "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
+                            {"pid": path, "fid": func_id}
+                        )
+                    
+                    for class_name, methods in entities["classes"].items():
+                        class_id = f"{path}::{class_name}"
+                        conn.execute(
+                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val",
+                            {"cid": class_id, "ts_val": ts}
+                        )
+                        conn.execute(
+                            "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
+                            {"pid": path, "cid": class_id}
+                        )
+                        
+                        for method_name in methods:
+                            method_id = f"{path}::{class_name}::{method_name}"
+                            conn.execute(
+                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val",
+                                {"mid": method_id, "ts_val": ts}
+                            )
+                            conn.execute(
+                                "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
+                                {"cid": class_id, "mid": method_id}
+                            )
+                except Exception as e:
+                    import sys
+                    print(f"Error parsing functions and classes in {path}: {e}", file=sys.stderr)
+            
+            if entity_status == "deleted":
+                invalidation_query = """
+                MATCH (w:Workspace)-[r:MAPPED_TO]->(e:Entity)
+                WHERE e.id = $path_val OR e.id STARTS WITH $path_prefix
+                SET r.is_stale = true, r.invalidated_at = $ts_val
+                """
+                conn.execute(invalidation_query, {"path_val": path, "path_prefix": f"{path}::", "ts_val": ts})
 
 if __name__ == "__main__":
-    reconcile()
+    import sys
+    full_sync = "--full" in sys.argv
+    reconcile(full=full_sync)
     # Output valid hook decision for Gemini CLI
     import json
-    import sys
     if not sys.stdin.isatty():
         print(json.dumps({"decision": "allow"}))
