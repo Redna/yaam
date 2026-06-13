@@ -16,9 +16,9 @@ This engine is optimized for **cross-agent compatibility**, supporting both **Cl
 
 ## Installation Guide
 
-To avoid polluting your repositories with duplicate setup and execution scripts, **Global Installation** is the recommended method. 
+To achieve zero-friction setup without nesting Git repositories, use the following one-liner commands.
 
-### Option 1: Global Plugin Mode (Recommended - Clean Setup)
+### Option 1: Global Plugin Mode (Recommended - Cleanest Setup)
 
 In this mode, the YAAM codebase is stored in a single, central directory on your machine. No plugin source files are copied or cloned into your active project repositories.
 
@@ -30,40 +30,25 @@ Install the plugin globally using your private repository SSH URL:
 * **How it works:** Claude Code clones this repository once into its global user plugins directory. The server runs globally but operates relative to whichever local workspace folder you open Claude in.
 
 #### B. Antigravity CLI (via plugins folder)
-Clone the repository once directly into the Antigravity CLI global plugins directory:
+Run this one-liner to clone the repository once directly into the Antigravity global plugins directory and run the installation script:
 ```bash
-git clone git@github.com:Redna/yaam.git ~/.gemini/antigravity-cli/plugins/yaam-memory
+git clone git@github.com:Redna/yaam.git ~/.gemini/antigravity-cli/plugins/yaam-memory && cd ~/.gemini/antigravity-cli/plugins/yaam-memory && ./install.py
 ```
-* **How it works:** Antigravity CLI parses the `plugin.json` manifest globally, registering tools and hooks, and executes the server under its native OS sandbox (`nsjail` / `sandbox-exec`) on the active workspace.
 
 ---
 
-### Option 2: Project-Local Mode (Legacy/Manual Fallback)
+### Option 2: Project-Local Mode (No Repository Nesting)
 
-If you explicitly need to bundle the plugin inside a specific repository or want to customize it locally:
+If you need the YAAM files directly inside a specific project repository, run this single command from your target repository root:
 
-1. **Copy YAAM files into your project root:**
-   ```bash
-   # Core execution scripts
-   cp /path/to/yaam/server.py /new/repo/
-   cp /path/to/yaam/reconciler.py /new/repo/
-   cp /path/to/yaam/db.py /new/repo/
-   cp /path/to/yaam/parser.py /new/repo/
-   cp /path/to/yaam/logger.py /new/repo/
-   cp /path/to/yaam/requirements.txt /new/repo/
-   cp /path/to/yaam/install.py /new/repo/
+```bash
+git archive --remote=git@github.com:Redna/yaam.git main | tar -x && ./install.py --local
+```
 
-   # Configs & Skills
-   cp -R /path/to/yaam/.agents /new/repo/
-   cp /path/to/yaam/.mcp.json /new/repo/
-   ```
-
-2. **Run the installer locally:**
-   ```bash
-   chmod +x install.py
-   ./install.py --local
-   ```
-   *This initializes a local `.venv` and database at `.agents/memory.lbug` without modifying global files.*
+* **How it works:**
+  1. `git archive` downloads all the codebase files from the remote `main` branch via SSH.
+  2. `tar -x` extracts them directly into your current directory (avoiding any nested Git repository clutter).
+  3. `./install.py --local` initializes the project-local `.venv` and database inside the active directory.
 
 ---
 
