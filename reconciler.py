@@ -21,7 +21,7 @@ def get_git_status():
     except subprocess.CalledProcessError:
         return []
 
-from parser import extract_functions
+from parser import extract_entities
 
 def reconcile():
     """Updates the Entity table based on filesystem changes."""
@@ -47,25 +47,52 @@ def reconcile():
             {"path_val": path, "status_val": entity_status, "ts_val": ts}
         )
 
-        # 2. Extract and link Functions for Python files
+        # 2. Extract and link Classes and Functions for Python files
         if entity_status == "active" and path.endswith(".py"):
             try:
-                functions = extract_functions(path)
-                for func_name in functions:
+                entities = extract_entities(path)
+                
+                # Create and link top-level functions
+                for func_name in entities["top_level_functions"]:
                     func_id = f"{path}::{func_name}"
-                    # Create function entity
                     conn.execute(
                         "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val",
                         {"fid": func_id, "ts_val": ts}
                     )
-                    # Link function to file
                     conn.execute(
                         "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
                         {"pid": path, "fid": func_id}
                     )
+                
+                # Create and link classes and their methods
+                for class_name, methods in entities["classes"].items():
+                    class_id = f"{path}::{class_name}"
+                    # Create Class node
+                    conn.execute(
+                        "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val",
+                        {"cid": class_id, "ts_val": ts}
+                    )
+                    # Link Class to File
+                    conn.execute(
+                        "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
+                        {"pid": path, "cid": class_id}
+                    )
+                    
+                    # Create Class Methods
+                    for method_name in methods:
+                        method_id = f"{path}::{class_name}::{method_name}"
+                        conn.execute(
+                            "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val",
+                            {"mid": method_id, "ts_val": ts}
+                        )
+                        # Link Method to Class
+                        conn.execute(
+                            "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
+                            {"cid": class_id, "mid": method_id}
+                        )
             except Exception as e:
                 import sys
-                print(f"Error parsing functions in {path}: {e}", file=sys.stderr)
+                print(f"Error parsing functions and classes in {path}: {e}", file=sys.stderr)
         
         # Soft invalidation for deleted files (Layer 1 Mappings)
         if entity_status == "deleted":

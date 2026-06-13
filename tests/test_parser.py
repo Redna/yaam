@@ -32,5 +32,32 @@ def another_func(a, b):
             if os.path.exists(test_file):
                 os.remove(test_file)
 
+    def test_extract_entities(self):
+        test_content = """
+def hello():
+    print("world")
+
+class MyClass:
+    def method(self):
+        pass
+
+def another_func(a, b):
+    return a + b
+"""
+        test_file = "temp_test_parser_entities.py"
+        with open(test_file, "w") as f:
+            f.write(test_content)
+        
+        try:
+            from parser import extract_entities
+            entities = extract_entities(test_file)
+            self.assertIn("hello", entities["top_level_functions"])
+            self.assertIn("another_func", entities["top_level_functions"])
+            self.assertIn("MyClass", entities["classes"])
+            self.assertEqual(entities["classes"]["MyClass"], ["method"])
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+
 if __name__ == "__main__":
     unittest.main()
