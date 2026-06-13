@@ -52,9 +52,13 @@ def another_func(a, b):
             from parser import extract_entities
             entities = extract_entities(test_file)
             self.assertIn("hello", entities["top_level_functions"])
+            self.assertEqual(entities["top_level_functions"]["hello"], 2)
             self.assertIn("another_func", entities["top_level_functions"])
+            self.assertEqual(entities["top_level_functions"]["another_func"], 9)
             self.assertIn("MyClass", entities["classes"])
-            self.assertEqual(entities["classes"]["MyClass"], ["method"])
+            self.assertEqual(entities["classes"]["MyClass"]["line"], 5)
+            self.assertIn("method", entities["classes"]["MyClass"]["methods"])
+            self.assertEqual(entities["classes"]["MyClass"]["methods"]["method"], 6)
         finally:
             if os.path.exists(test_file):
                 os.remove(test_file)

@@ -2,6 +2,7 @@ import os
 import subprocess
 import ladybug as lb
 import time
+import json
 from db import get_connection
 
 def get_git_status():
@@ -56,11 +57,12 @@ def reconcile(full=False):
                     entities = extract_entities(path)
                     
                     # Create and link top-level functions
-                    for func_name in entities["top_level_functions"]:
+                    for func_name, line_num in entities["top_level_functions"].items():
                         func_id = f"{path}::{func_name}"
+                        metadata = json.dumps({"line": line_num})
                         conn.execute(
-                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val",
-                            {"fid": func_id, "ts_val": ts}
+                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val, f.metadata = $meta_val",
+                            {"fid": func_id, "ts_val": ts, "meta_val": metadata}
                         )
                         conn.execute(
                             "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
@@ -68,22 +70,24 @@ def reconcile(full=False):
                         )
                     
                     # Create and link classes and their methods
-                    for class_name, methods in entities["classes"].items():
+                    for class_name, class_info in entities["classes"].items():
                         class_id = f"{path}::{class_name}"
+                        class_meta = json.dumps({"line": class_info["line"]})
                         conn.execute(
-                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val",
-                            {"cid": class_id, "ts_val": ts}
+                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val, c.metadata = $meta_val",
+                            {"cid": class_id, "ts_val": ts, "meta_val": class_meta}
                         )
                         conn.execute(
                             "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
                             {"pid": path, "cid": class_id}
                         )
                         
-                        for method_name in methods:
+                        for method_name, method_line in class_info["methods"].items():
                             method_id = f"{path}::{class_name}::{method_name}"
+                            method_meta = json.dumps({"line": method_line})
                             conn.execute(
-                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val",
-                                {"mid": method_id, "ts_val": ts}
+                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val, m.metadata = $meta_val",
+                                {"mid": method_id, "ts_val": ts, "meta_val": method_meta}
                             )
                             conn.execute(
                                 "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
@@ -136,33 +140,36 @@ def reconcile(full=False):
                 try:
                     entities = extract_entities(path)
                     
-                    for func_name in entities["top_level_functions"]:
+                    for func_name, line_num in entities["top_level_functions"].items():
                         func_id = f"{path}::{func_name}"
+                        metadata = json.dumps({"line": line_num})
                         conn.execute(
-                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val",
-                            {"fid": func_id, "ts_val": ts}
+                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val, f.metadata = $meta_val",
+                            {"fid": func_id, "ts_val": ts, "meta_val": metadata}
                         )
                         conn.execute(
                             "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
                             {"pid": path, "fid": func_id}
                         )
                     
-                    for class_name, methods in entities["classes"].items():
+                    for class_name, class_info in entities["classes"].items():
                         class_id = f"{path}::{class_name}"
+                        class_meta = json.dumps({"line": class_info["line"]})
                         conn.execute(
-                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val",
-                            {"cid": class_id, "ts_val": ts}
+                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val, c.metadata = $meta_val",
+                            {"cid": class_id, "ts_val": ts, "meta_val": class_meta}
                         )
                         conn.execute(
                             "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
                             {"pid": path, "cid": class_id}
                         )
                         
-                        for method_name in methods:
+                        for method_name, method_line in class_info["methods"].items():
                             method_id = f"{path}::{class_name}::{method_name}"
+                            method_meta = json.dumps({"line": method_line})
                             conn.execute(
-                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val",
-                                {"mid": method_id, "ts_val": ts}
+                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val, m.metadata = $meta_val",
+                                {"mid": method_id, "ts_val": ts, "meta_val": method_meta}
                             )
                             conn.execute(
                                 "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
