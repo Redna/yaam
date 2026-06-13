@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "yaam": {
+    "yaam_memory": {
       "command": "/home/anima/yaam/.venv/bin/python3",
       "args": [
         "/home/anima/yaam/server.py"

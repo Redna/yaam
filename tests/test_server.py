@@ -32,11 +32,11 @@ class TestServer(unittest.TestCase):
 
     def test_workspace_tools(self):
         # 1. Initialize workspace
-        resp = server.mcp__workspace__initialize("test_ws", "Unit test workspace")
+        resp = server.workspace_initialize("test_ws", "Unit test workspace")
         self.assertIn("initialized successfully", resp)
         
         # 2. Add note
-        resp = server.mcp__workspace__append_note("test_ws", "Test note content")
+        resp = server.workspace_append_note("test_ws", "Test note content")
         self.assertIn("Note added", resp)
         
         # 3. Verify in DB
@@ -52,7 +52,7 @@ class TestServer(unittest.TestCase):
 
     def test_graph_explore_guard(self):
         # Attempt a write operation via explore
-        resp = server.mcp__graph__explore("CREATE (n:Entity {id: 'hack'})")
+        resp = server.graph_explore("CREATE (n:Entity {id: 'hack'})")
         self.assertIn("ERROR: Write operations forbidden", resp)
 
 if __name__ == "__main__":

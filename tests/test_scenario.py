@@ -35,7 +35,7 @@ class TestAgentScenario(unittest.TestCase):
 
     def test_end_to_end_agent_loop(self):
         # 1. Agent initializes workspace
-        server.mcp__workspace__initialize("auth_fix", "Fixing login leak")
+        server.workspace_initialize("auth_fix", "Fixing login leak")
         
         # 2. Agent creates a new file (simulated tool execution)
         test_file = "auth_handler.py"
@@ -47,7 +47,7 @@ class TestAgentScenario(unittest.TestCase):
             reconcile()
             
             # 4. Agent adds a note
-            server.mcp__workspace__append_note("auth_fix", "Implemented login stub in auth_handler.py")
+            server.workspace_append_note("auth_fix", "Implemented login stub in auth_handler.py")
             
             # 5. Agent queries the graph
             conn = db.get_connection()

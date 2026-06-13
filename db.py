@@ -1,9 +1,13 @@
 import ladybug as lb
 import os
+import sys
 
 DB_PATH = "./memory.lbug"
 
 def get_connection():
+    # Do NOT use a global singleton for the Database object.
+    # We need to let it close (be garbage collected) so that other 
+    # processes (like the AfterTool reconciler hook) can acquire the lock.
     db = lb.Database(DB_PATH)
     return lb.Connection(db)
 
@@ -19,7 +23,7 @@ def setup_database():
             if "already exists" in str(e).lower():
                 pass
             else:
-                print(f"Error executing query: {query}\n{e}")
+                print(f"Error executing query: {query}\n{e}", file=sys.stderr)
 
     # Layer 0: The Structural File System / AST Topology
     safe_execute("CREATE NODE TABLE Entity(id STRING, type STRING, status STRING, last_modified INT64, metadata STRING, PRIMARY KEY (id))")
@@ -33,7 +37,7 @@ def setup_database():
     safe_execute("CREATE REL TABLE MAPPED_TO(FROM Workspace TO Entity, created_at INT64, invalidated_at INT64, is_stale BOOLEAN)")
     safe_execute("CREATE REL TABLE HAS_SCRATCHPAD(FROM Workspace TO Scratchpad)")
     
-    print("Database schema setup complete.")
+    print("Database schema setup complete.", file=sys.stderr)
 
 if __name__ == "__main__":
     setup_database()
