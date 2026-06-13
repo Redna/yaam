@@ -32,23 +32,26 @@ Install the plugin globally using your private repository SSH URL:
 #### B. Antigravity CLI (via plugins folder)
 Run this one-liner to clone the repository once directly into the Antigravity global plugins directory and run the installation script:
 ```bash
-git clone git@github.com:Redna/yaam.git ~/.gemini/antigravity-cli/plugins/yaam-memory && cd ~/.gemini/antigravity-cli/plugins/yaam-memory && ./install.py
+git clone git@github.com:Redna/yaam.git ~/.gemini/antigravity-cli/plugins/yaam-memory && cd ~/.gemini/antigravity-cli/plugins/yaam-memory && ./install.sh
 ```
 
 ---
 
 ### Option 2: Project-Local Mode (No Repository Nesting)
 
-If you need the YAAM files directly inside a specific project repository, run this single command from your target repository root:
+If you need the YAAM files directly inside a specific project repository, run one of these single commands from your target repository root:
 
+#### A. Piping via Git SSH (Zero Token Setup)
+If you have SSH authentication set up on your machine, this command pulls the installer via SSH, pipes it to bash, and extracts the repository locally:
 ```bash
-git archive --remote=git@github.com:Redna/yaam.git main | tar -x && ./install.py --local
+git archive --remote=git@github.com:Redna/yaam.git main install.sh | tar -xO install.sh | bash -s -- --local
 ```
 
-* **How it works:**
-  1. `git archive` downloads all the codebase files from the remote `main` branch via SSH.
-  2. `tar -x` extracts them directly into your current directory (avoiding any nested Git repository clutter).
-  3. `./install.py --local` initializes the project-local `.venv` and database inside the active directory.
+#### B. Piping via HTTPS Curl (Token Required)
+If you prefer using `curl`, you can use a GitHub Personal Access Token (PAT):
+```bash
+curl -H "Authorization: token $GITHUB_TOKEN" -sSL https://raw.githubusercontent.com/Redna/yaam/main/install.sh | bash -s -- --local
+```
 
 ---
 
