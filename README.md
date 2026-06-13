@@ -16,55 +16,54 @@ This engine is optimized for **cross-agent compatibility**, supporting both **Cl
 
 ## Installation Guide
 
-Depending on your agent environment, you can install YAAM either as a native agent plugin or manually as a project-level server.
+To avoid polluting your repositories with duplicate setup and execution scripts, **Global Installation** is the recommended method. 
 
-### Option A: Native Plugin Installation (Recommended)
+### Option 1: Global Plugin Mode (Recommended - Clean Setup)
 
-Since YAAM bundles native plugin manifests, you can install it directly using your agent's native extension mechanisms.
+In this mode, the YAAM codebase is stored in a single, central directory on your machine. No plugin source files are copied or cloned into your active project repositories.
 
-#### 1. Claude Code (via `/plugin install`)
-Run the native plugin installer inside Claude Code. Since this is a private repository, ensure your local Git SSH keys are configured:
+#### A. Claude Code (via `/plugin install`)
+Install the plugin globally using your private repository SSH URL:
 ```bash
 /plugin install git@github.com:Redna/yaam.git
 ```
-* **How it works:** Claude Code clones the repo into its isolated storage, reads [.claude-plugin/plugin.json](file:///.claude-plugin/plugin.json), and starts the server.
+* **How it works:** Claude Code clones this repository once into its global user plugins directory. The server runs globally but operates relative to whichever local workspace folder you open Claude in.
 
-#### 2. Antigravity CLI (via plugins folder)
-Clone the repository directly into the Antigravity CLI user-global plugins directory:
+#### B. Antigravity CLI (via plugins folder)
+Clone the repository once directly into the Antigravity CLI global plugins directory:
 ```bash
 git clone git@github.com:Redna/yaam.git ~/.gemini/antigravity-cli/plugins/yaam-memory
 ```
-* **How it works:** Antigravity CLI reads the root [plugin.json](file:///plugin.json) manifest, registers the `PostToolUse` lifecycle hook, and executes the server under its native OS sandbox (`nsjail` / `sandbox-exec`).
+* **How it works:** Antigravity CLI parses the `plugin.json` manifest globally, registering tools and hooks, and executes the server under its native OS sandbox (`nsjail` / `sandbox-exec`) on the active workspace.
 
 ---
 
-### Option B: Local Setup or Manual Project Setup
+### Option 2: Project-Local Mode (Legacy/Manual Fallback)
 
-If you prefer to configure it for a specific project directory only (rather than installing it globally):
+If you explicitly need to bundle the plugin inside a specific repository or want to customize it locally:
 
-#### 1. In a new project, copy the YAAM files:
-```bash
-# Core execution scripts
-cp /path/to/yaam/server.py /new/repo/
-cp /path/to/yaam/reconciler.py /new/repo/
-cp /path/to/yaam/db.py /new/repo/
-cp /path/to/yaam/parser.py /new/repo/
-cp /path/to/yaam/logger.py /new/repo/
-cp /path/to/yaam/requirements.txt /new/repo/
-cp /path/to/yaam/install.py /new/repo/
+1. **Copy YAAM files into your project root:**
+   ```bash
+   # Core execution scripts
+   cp /path/to/yaam/server.py /new/repo/
+   cp /path/to/yaam/reconciler.py /new/repo/
+   cp /path/to/yaam/db.py /new/repo/
+   cp /path/to/yaam/parser.py /new/repo/
+   cp /path/to/yaam/logger.py /new/repo/
+   cp /path/to/yaam/requirements.txt /new/repo/
+   cp /path/to/yaam/install.py /new/repo/
 
-# Configs & Skills
-cp -R /path/to/yaam/.agents /new/repo/
-cp /path/to/yaam/.mcp.json /new/repo/
-```
+   # Configs & Skills
+   cp -R /path/to/yaam/.agents /new/repo/
+   cp /path/to/yaam/.mcp.json /new/repo/
+   ```
 
-#### 2. Run the installer locally:
-Run the installer with the `--local` (or `-l`) flag to restrict configurations strictly to this directory:
-```bash
-chmod +x install.py
-./install.py --local
-```
-* **How it works:** This builds the local `.venv`, installs requirements, and initializes the local database at `.agents/memory.lbug` without modifying your global settings.
+2. **Run the installer locally:**
+   ```bash
+   chmod +x install.py
+   ./install.py --local
+   ```
+   *This initializes a local `.venv` and database at `.agents/memory.lbug` without modifying global files.*
 
 ---
 
@@ -75,7 +74,7 @@ chmod +x install.py
   ```
   /prompt use_yaam_memory
   ```
-* **Antigravity CLI:** Automatically loads the onboarding markdown skill from `.agents/skills/yaam-memory-manager/SKILL.md` (or through the global symlink).
+* **Antigravity CLI:** Automatically loads the onboarding markdown skill from `.agents/skills/yaam-memory-manager/SKILL.md`.
 
 ### 2. Core Workflows (For Agents)
 
