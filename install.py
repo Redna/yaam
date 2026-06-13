@@ -99,6 +99,53 @@ def configure_antigravity_cli():
     except Exception as e:
         print(f"Warning: Could not link global skill: {e}", file=sys.stderr)
 
+def configure_plugin_manifests():
+    print("--> Updating plugin manifests with absolute paths...")
+    
+    # 1. Update plugin.json
+    plugin_json_path = os.path.join(REPO_ROOT, "plugin.json")
+    if os.path.exists(plugin_json_path):
+        try:
+            with open(plugin_json_path, "r") as f:
+                data = json.load(f)
+            
+            # Update mcpServers
+            if "mcpServers" in data and "yaam_memory" in data["mcpServers"]:
+                data["mcpServers"]["yaam_memory"]["command"] = VENV_PYTHON
+                data["mcpServers"]["yaam_memory"]["args"] = [os.path.join(REPO_ROOT, "server.py")]
+                
+            # Update hooks
+            if "hooks" in data and "PostToolUse" in data["hooks"]:
+                for hook in data["hooks"]["PostToolUse"]:
+                    if hook.get("type") == "command" and "reconciler.py" in hook.get("command", ""):
+                        hook["command"] = f"{VENV_PYTHON} {os.path.join(REPO_ROOT, 'reconciler.py')}"
+            
+            with open(plugin_json_path, "w") as f:
+                json.dump(data, f, indent=2)
+            print("Successfully updated plugin.json with absolute paths.")
+        except Exception as e:
+            print(f"Warning: Could not update plugin.json: {e}", file=sys.stderr)
+            
+    # 2. Update .agents/hooks.json
+    agents_hooks_path = os.path.join(REPO_ROOT, ".agents", "hooks.json")
+    if os.path.exists(agents_hooks_path):
+        try:
+            with open(agents_hooks_path, "r") as f:
+                data = json.load(f)
+                
+            if "yaam-reconciler" in data and "PostToolUse" in data["yaam-reconciler"]:
+                for group in data["yaam-reconciler"]["PostToolUse"]:
+                    if "hooks" in group:
+                        for hook in group["hooks"]:
+                            if hook.get("type") == "command" and "reconciler.py" in hook.get("command", ""):
+                                hook["command"] = f"{VENV_PYTHON} {os.path.join(REPO_ROOT, 'reconciler.py')}"
+                                
+            with open(agents_hooks_path, "w") as f:
+                json.dump(data, f, indent=2)
+            print("Successfully updated .agents/hooks.json with absolute paths.")
+        except Exception as e:
+            print(f"Warning: Could not update .agents/hooks.json: {e}", file=sys.stderr)
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Install and configure YAAM memory engine.")
@@ -106,6 +153,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     setup_python_env()
+    configure_plugin_manifests()
     if not args.local:
         configure_claude_code()
         configure_antigravity_cli()
