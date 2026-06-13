@@ -8,11 +8,13 @@
     }
   },
   "hooks": {
-    "AfterTool": {
-      "command": "/home/anima/yaam/.venv/bin/python3",
-      "args": [
-        "/home/anima/yaam/reconciler.py"
-      ]
-    }
+    "AfterTool": [
+      {
+        "command": "/home/anima/yaam/.venv/bin/python3",
+        "args": [
+          "/home/anima/yaam/reconciler.py"
+        ]
+      }
+    ]
   }
 }

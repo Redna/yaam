@@ -55,5 +55,16 @@ class TestServer(unittest.TestCase):
         resp = server.graph_explore("CREATE (n:Entity {id: 'hack'})")
         self.assertIn("ERROR: Write operations forbidden", resp)
 
+    def test_mcp_resource_and_prompt(self):
+        # Test get_skill_blueprint resource
+        blueprint = server.get_skill_blueprint()
+        self.assertNotIn("Error reading skill blueprint", blueprint)
+        self.assertIn("YAAM Memory Manager", blueprint)
+
+        # Test use_yaam_memory prompt
+        prompt_content = server.use_yaam_memory()
+        self.assertIn("You are equipped with YAAM", prompt_content)
+        self.assertIn("workspace_initialize", prompt_content)
+
 if __name__ == "__main__":
     unittest.main()

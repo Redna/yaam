@@ -1,0 +1,16 @@
+{
+  "yaam-reconciler": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/anima/yaam/.venv/bin/python3 /home/anima/yaam/reconciler.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -7,7 +7,9 @@ ENV/
 .env
 
 # LadybugDB files
+*.lbug
 *.lbug/
+memory.lbug
 memory.lbug/
 
 # YAAM internals

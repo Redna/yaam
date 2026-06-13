@@ -25,6 +25,12 @@ def graph_explore(query: str) -> str:
     """
     # Force any stray stdout from libraries to stderr
     with redirect_stdout(sys.stderr):
+        try:
+            from reconciler import reconcile
+            reconcile()
+        except Exception as e:
+            logger.error(f"Passive reconciliation failed: {e}")
+
         clean_query = query.strip()
         
         # Guardrail 1: Enforce Read-Only Mutation Blocks (using whole word matching)
@@ -58,7 +64,7 @@ def graph_explore(query: str) -> str:
                 with open(output_file, "w", encoding="utf-8") as f:
                     f.write(f"Source Query: {query}\n" + "="*40 + "\n")
                     for r in rows:
-                        f.write(f"{str(r)}\n")
+                         f.write(f"{str(r)}\n")
                 return (f"SUCCESS: Query returned {len(rows)} rows. "
                         f"Results spooled to: '{output_file}'.")
             
@@ -70,6 +76,12 @@ def graph_explore(query: str) -> str:
 def workspace_initialize(name: str, description: str) -> str:
     """Initializes a new workspace for task tracking."""
     with redirect_stdout(sys.stderr):
+        try:
+            from reconciler import reconcile
+            reconcile()
+        except Exception as e:
+            logger.error(f"Passive reconciliation failed: {e}")
+
         log_event("workspace_initialize", {"name": name, "description": description})
         try:
             conn = get_connection()
@@ -84,6 +96,12 @@ def workspace_initialize(name: str, description: str) -> str:
 def workspace_append_note(workspace_name: str, content: str) -> str:
     """Appends a new note to the scratchpad of a workspace."""
     with redirect_stdout(sys.stderr):
+        try:
+            from reconciler import reconcile
+            reconcile()
+        except Exception as e:
+            logger.error(f"Passive reconciliation failed: {e}")
+
         note_id = f"note_{int(time.time() * 1000)}"
         ts = int(time.time())
         log_event("workspace_append_note", {"workspace_name": workspace_name, "content": content})
@@ -102,6 +120,31 @@ def workspace_append_note(workspace_name: str, content: str) -> str:
             return f"Note added to workspace '{workspace_name}'."
         except Exception as e:
             return f"Error: {str(e)}"
+
+@mcp.resource("skills://yaam-memory-manager")
+def get_skill_blueprint() -> str:
+    """Provides the cognitive blueprint / guide for YAAM memory manager."""
+    try:
+        skill_path = "/home/anima/yaam/.agents/skills/yaam-memory-manager/SKILL.md"
+        if os.path.exists(skill_path):
+            with open(skill_path, "r", encoding="utf-8") as f:
+                return f.read()
+        return "Skill blueprint file not found."
+    except Exception as e:
+        return f"Error reading skill blueprint: {str(e)}"
+
+@mcp.prompt()
+def use_yaam_memory() -> str:
+    """Instructions and guidance on how to use YAAM memory engine in this workspace."""
+    try:
+        skill_path = "/home/anima/yaam/.agents/skills/yaam-memory-manager/SKILL.md"
+        if os.path.exists(skill_path):
+            with open(skill_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return f"You are equipped with YAAM (Yet Another Agent Memory). Please follow these instructions to manage task context and memory:\n\n{content}"
+    except Exception:
+        pass
+    return "Please initialize the task using workspace_initialize and record insights with workspace_append_note."
 
 if __name__ == "__main__":
     # Disable the banner which breaks the MCP protocol on stdout
