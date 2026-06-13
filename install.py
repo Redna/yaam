@@ -100,7 +100,15 @@ def configure_antigravity_cli():
         print(f"Warning: Could not link global skill: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Install and configure YAAM memory engine.")
+    parser.add_argument("--local", "-l", action="store_true", help="Perform only project-local setup (skip global configurations)")
+    args = parser.parse_args()
+
     setup_python_env()
-    configure_claude_code()
-    configure_antigravity_cli()
-    print("\n[SUCCESS] YAAM Plugin setup complete and configured cross-agent!")
+    if not args.local:
+        configure_claude_code()
+        configure_antigravity_cli()
+    else:
+        print("--> Skipping global configurations (project-local setup).")
+    print("\n[SUCCESS] YAAM Plugin setup complete!")
