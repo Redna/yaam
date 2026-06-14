@@ -37,7 +37,180 @@ def get_all_files():
             files.append(filepath)
     return files
 
+def resolve_module_to_path(module_name):
+    """Resolves an imported module name to a relative file path in the workspace."""
+    parts = module_name.split('.')
+    path_candidate = os.path.join(*parts) + ".py"
+    if os.path.exists(path_candidate):
+        return path_candidate
+    dir_candidate = os.path.join(*parts)
+    init_candidate = os.path.join(dir_candidate, "__init__.py")
+    if os.path.exists(init_candidate):
+        return init_candidate
+    return None
+
+def cleanup_stale_entities(conn, path, parsed_ids, ts):
+    """Marks functions and classes no longer declared in a modified file as deleted."""
+    prefix = f"{path}::"
+    db_entities = []
+    try:
+        res = conn.execute(
+            "MATCH (e:Entity) WHERE e.id STARTS WITH $prefix AND e.type IN ['Function', 'Class'] RETURN e.id",
+            {"prefix": prefix}
+        )
+        db_entities = [row[0] for row in res.get_all()]
+    except Exception:
+        pass
+        
+    for ent_id in db_entities:
+        if ent_id not in parsed_ids:
+            conn.execute(
+                "MATCH (e:Entity {id: $eid}) SET e.status = 'deleted', e.last_modified = $ts_val",
+                {"eid": ent_id, "ts_val": ts}
+            )
+
 from parser import extract_entities
+
+def process_file_entities(conn, path, entities, ts):
+    """Creates, links, and updates file, class, method, and call graph entities."""
+    parsed_ids = set()
+    
+    # 1. Handle File Imports
+    for imp_module in entities.get("imports", []):
+        target_path = resolve_module_to_path(imp_module)
+        if target_path and target_path != path:
+            conn.execute(
+                "MERGE (target:Entity {id: $target_id}) SET target.type = 'File'",
+                {"target_id": target_path}
+            )
+            conn.execute(
+                "MATCH (src:Entity {id: $src_id}), (dst:Entity {id: $dst_id}) MERGE (src)-[:LINKED_TO {relationship_type: 'IMPORTS'}]->(dst)",
+                {"src_id": path, "dst_id": target_path}
+            )
+            
+    # 2. Create top-level functions
+    for func_name, func_info in entities.get("top_level_functions", {}).items():
+        func_id = f"{path}::{func_name}"
+        parsed_ids.add(func_id)
+        metadata = json.dumps({"line": func_info["line"]})
+        conn.execute(
+            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val, f.metadata = $meta_val",
+            {"fid": func_id, "ts_val": ts, "meta_val": metadata}
+        )
+        conn.execute(
+            "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
+            {"pid": path, "fid": func_id}
+        )
+        
+    # 3. Create classes and their methods
+    for class_name, class_info in entities.get("classes", {}).items():
+        class_id = f"{path}::{class_name}"
+        parsed_ids.add(class_id)
+        class_meta = json.dumps({"line": class_info["line"]})
+        conn.execute(
+            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val, c.metadata = $meta_val",
+            {"cid": class_id, "ts_val": ts, "meta_val": class_meta}
+        )
+        conn.execute(
+            "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
+            {"pid": path, "cid": class_id}
+        )
+        
+        # Class Inheritance
+        for base_class in class_info.get("superclasses", []):
+            super_id = None
+            if base_class in entities["classes"]:
+                super_id = f"{path}::{base_class}"
+            else:
+                try:
+                    res = conn.execute(
+                        "MATCH (c:Entity {type: 'Class'}) WHERE c.id ENDS WITH $suffix RETURN c.id",
+                        {"suffix": f"::{base_class}"}
+                    )
+                    if res.has_next():
+                        super_id = res.get_next()[0]
+                except Exception:
+                    pass
+            if super_id:
+                conn.execute(
+                    "MATCH (sub:Entity {id: $sub_id}), (sup:Entity {id: $sup_id}) MERGE (sub)-[:LINKED_TO {relationship_type: 'INHERITS_FROM'}]->(sup)",
+                    {"sub_id": class_id, "sup_id": super_id}
+                )
+        
+        # Class Methods
+        for method_name, method_info in class_info.get("methods", {}).items():
+            method_id = f"{path}::{class_name}::{method_name}"
+            parsed_ids.add(method_id)
+            method_meta = json.dumps({"line": method_info["line"]})
+            conn.execute(
+                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val, m.metadata = $meta_val",
+                {"mid": method_id, "ts_val": ts, "meta_val": method_meta}
+            )
+            conn.execute(
+                "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
+                {"cid": class_id, "mid": method_id}
+            )
+
+    # 4. Method and Function calls (Call Graph resolution)
+    for func_name, func_info in entities.get("top_level_functions", {}).items():
+        func_id = f"{path}::{func_name}"
+        for call_target in func_info.get("calls", []):
+            target_id = None
+            if call_target in entities["top_level_functions"]:
+                target_id = f"{path}::{call_target}"
+            else:
+                try:
+                    res = conn.execute(
+                        "MATCH (f:Entity {type: 'Function'}) WHERE f.id ENDS WITH $suffix RETURN f.id",
+                        {"suffix": f"::{call_target}"}
+                    )
+                    if res.has_next():
+                        target_id = res.get_next()[0]
+                except Exception:
+                    pass
+            if target_id:
+                conn.execute(
+                    "MERGE (target:Entity {id: $target_id}) SET target.type = 'Function'",
+                    {"target_id": target_id}
+                )
+                conn.execute(
+                    "MATCH (caller:Entity {id: $caller_id}), (callee:Entity {id: $callee_id}) MERGE (caller)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee)",
+                    {"caller_id": func_id, "callee_id": target_id}
+                )
+                
+    for class_name, class_info in entities.get("classes", {}).items():
+        for method_name, method_info in class_info.get("methods", {}).items():
+            method_id = f"{path}::{class_name}::{method_name}"
+            for call_target in method_info.get("calls", []):
+                target_id = None
+                if call_target.startswith("self."):
+                    sibling_name = call_target.split('.', 1)[1]
+                    if sibling_name in class_info["methods"]:
+                        target_id = f"{path}::{class_name}::{sibling_name}"
+                elif call_target in entities["top_level_functions"]:
+                    target_id = f"{path}::{call_target}"
+                else:
+                    try:
+                        res = conn.execute(
+                            "MATCH (f:Entity {type: 'Function'}) WHERE f.id ENDS WITH $suffix RETURN f.id",
+                            {"suffix": f"::{call_target}"}
+                        )
+                        if res.has_next():
+                            target_id = res.get_next()[0]
+                    except Exception:
+                        pass
+                if target_id:
+                    conn.execute(
+                        "MERGE (target:Entity {id: $target_id}) SET target.type = 'Function'",
+                        {"target_id": target_id}
+                    )
+                    conn.execute(
+                        "MATCH (caller:Entity {id: $caller_id}), (callee:Entity {id: $callee_id}) MERGE (caller)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee)",
+                        {"caller_id": method_id, "callee_id": target_id}
+                    )
+
+    # 5. Run GC for stale entities in this file
+    cleanup_stale_entities(conn, path, parsed_ids, ts)
 
 def reconcile(full=False):
     """Updates the Entity table based on filesystem changes or performs a full scan."""
@@ -55,44 +228,7 @@ def reconcile(full=False):
             if path.endswith(".py"):
                 try:
                     entities = extract_entities(path)
-                    
-                    # Create and link top-level functions
-                    for func_name, line_num in entities["top_level_functions"].items():
-                        func_id = f"{path}::{func_name}"
-                        metadata = json.dumps({"line": line_num})
-                        conn.execute(
-                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val, f.metadata = $meta_val",
-                            {"fid": func_id, "ts_val": ts, "meta_val": metadata}
-                        )
-                        conn.execute(
-                            "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
-                            {"pid": path, "fid": func_id}
-                        )
-                    
-                    # Create and link classes and their methods
-                    for class_name, class_info in entities["classes"].items():
-                        class_id = f"{path}::{class_name}"
-                        class_meta = json.dumps({"line": class_info["line"]})
-                        conn.execute(
-                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val, c.metadata = $meta_val",
-                            {"cid": class_id, "ts_val": ts, "meta_val": class_meta}
-                        )
-                        conn.execute(
-                            "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
-                            {"pid": path, "cid": class_id}
-                        )
-                        
-                        for method_name, method_line in class_info["methods"].items():
-                            method_id = f"{path}::{class_name}::{method_name}"
-                            method_meta = json.dumps({"line": method_line})
-                            conn.execute(
-                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val, m.metadata = $meta_val",
-                                {"mid": method_id, "ts_val": ts, "meta_val": method_meta}
-                            )
-                            conn.execute(
-                                "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
-                                {"cid": class_id, "mid": method_id}
-                            )
+                    process_file_entities(conn, path, entities, ts)
                 except Exception as e:
                     import sys
                     print(f"Error parsing functions and classes in {path}: {e}", file=sys.stderr)
@@ -139,42 +275,7 @@ def reconcile(full=False):
             if entity_status == "active" and path.endswith(".py"):
                 try:
                     entities = extract_entities(path)
-                    
-                    for func_name, line_num in entities["top_level_functions"].items():
-                        func_id = f"{path}::{func_name}"
-                        metadata = json.dumps({"line": line_num})
-                        conn.execute(
-                            "MERGE (f:Entity {id: $fid}) SET f.type = 'Function', f.status = 'active', f.last_modified = $ts_val, f.metadata = $meta_val",
-                            {"fid": func_id, "ts_val": ts, "meta_val": metadata}
-                        )
-                        conn.execute(
-                            "MATCH (file:Entity {id: $pid}), (func:Entity {id: $fid}) MERGE (func)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
-                            {"pid": path, "fid": func_id}
-                        )
-                    
-                    for class_name, class_info in entities["classes"].items():
-                        class_id = f"{path}::{class_name}"
-                        class_meta = json.dumps({"line": class_info["line"]})
-                        conn.execute(
-                            "MERGE (c:Entity {id: $cid}) SET c.type = 'Class', c.status = 'active', c.last_modified = $ts_val, c.metadata = $meta_val",
-                            {"cid": class_id, "ts_val": ts, "meta_val": class_meta}
-                        )
-                        conn.execute(
-                            "MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)",
-                            {"pid": path, "cid": class_id}
-                        )
-                        
-                        for method_name, method_line in class_info["methods"].items():
-                            method_id = f"{path}::{class_name}::{method_name}"
-                            method_meta = json.dumps({"line": method_line})
-                            conn.execute(
-                                "MERGE (m:Entity {id: $mid}) SET m.type = 'Function', m.status = 'active', m.last_modified = $ts_val, m.metadata = $meta_val",
-                                {"mid": method_id, "ts_val": ts, "meta_val": method_meta}
-                            )
-                            conn.execute(
-                                "MATCH (cls:Entity {id: $cid}), (method:Entity {id: $mid}) MERGE (method)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(cls)",
-                                {"cid": class_id, "mid": method_id}
-                            )
+                    process_file_entities(conn, path, entities, ts)
                 except Exception as e:
                     import sys
                     print(f"Error parsing functions and classes in {path}: {e}", file=sys.stderr)
@@ -192,6 +293,5 @@ if __name__ == "__main__":
     full_sync = "--full" in sys.argv
     reconcile(full=full_sync)
     # Output valid hook decision for Gemini CLI
-    import json
     if not sys.stdin.isatty():
         print(json.dumps({"decision": "allow"}))
