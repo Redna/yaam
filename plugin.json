@@ -4,15 +4,17 @@
   "description": "Yet Another Agent Memory plugin for managing task workspaces and tracking structural changes.",
   "mcpServers": {
     "yaam_memory": {
-      "command": "python3",
-      "args": ["server.py"]
+      "command": "/home/anima/yaam/.venv/bin/python3",
+      "args": [
+        "/home/anima/yaam/server.py"
+      ]
     }
   },
   "hooks": {
     "PostToolUse": [
       {
         "type": "command",
-        "command": "python3 reconciler.py",
+        "command": "/home/anima/yaam/.venv/bin/python3 /home/anima/yaam/reconciler.py",
         "timeout": 30
       }
     ]

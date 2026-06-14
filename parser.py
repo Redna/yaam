@@ -25,10 +25,15 @@ def extract_entities(file_path):
             for child in node.children:
                 if child.type == 'dotted_name':
                     entities["imports"].append(child.text.decode('utf-8'))
+                elif child.type == 'aliased_import':
+                    for sub in child.children:
+                        if sub.type == 'dotted_name':
+                            entities["imports"].append(sub.text.decode('utf-8'))
         elif node.type == 'import_from_statement':
-            module_node = node.child_by_field_name('module')
-            if module_node:
-                entities["imports"].append(module_node.text.decode('utf-8'))
+            for child in node.children:
+                if child.type == 'dotted_name':
+                    entities["imports"].append(child.text.decode('utf-8'))
+                    break
         elif node.type == 'class_definition':
             name_node = node.child_by_field_name('name')
             if name_node:
