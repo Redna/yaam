@@ -60,7 +60,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
       const dirname = path.dirname(filename);
       const reconcilerPath = path.resolve(
         dirname,
-        "../.agents/skills/yaam-memory-manager/scripts/reconciler.ts"
+        "../skills/yaam-memory-manager/scripts/reconciler.ts"
       );
       const config = loadYaamSettings();
       const cmd = `npx tsx "${reconcilerPath}"${full ? " --full" : ""} < /dev/null`;
@@ -124,7 +124,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
         const dirname = path.dirname(filename);
         const scriptPath = path.resolve(
           dirname,
-          "../.agents/skills/yaam-memory-manager/scripts/graph_explore.ts"
+          "../skills/yaam-memory-manager/scripts/graph_explore.ts"
         );
         const { stdout, stderr } = await execFilePromise("npx", ["tsx", scriptPath, params.query]);
         return { content: [{ type: "text", text: stdout || stderr }], details: undefined };
@@ -149,7 +149,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
         const dirname = path.dirname(filename);
         const scriptPath = path.resolve(
           dirname,
-          "../.agents/skills/yaam-memory-manager/scripts/workspace_initialize.ts"
+          "../skills/yaam-memory-manager/scripts/workspace_initialize.ts"
         );
         const { stdout, stderr } = await execFilePromise("npx", [
           "tsx",
@@ -181,7 +181,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
         const dirname = path.dirname(filename);
         const scriptPath = path.resolve(
           dirname,
-          "../.agents/skills/yaam-memory-manager/scripts/workspace_append_note.ts"
+          "../skills/yaam-memory-manager/scripts/workspace_append_note.ts"
         );
         const { stdout, stderr } = await execFilePromise("npx", [
           "tsx",
