@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/anima/yaam/.venv/bin/python3 /home/anima/yaam/reconciler.py",
+            "command": "npx tsx /home/anima/yaam/.agents/skills/yaam-memory-manager/scripts/reconciler.ts",
             "timeout": 30
           }
         ]

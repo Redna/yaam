@@ -11,7 +11,10 @@ ENV/
 *.lbug/
 memory.lbug
 memory.lbug/
+*.lbug.wal
+*.lbug.wal/
 
 # YAAM internals
 .chunks/
 history.jsonl
+node_modules/

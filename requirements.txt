@@ -1,6 +1,0 @@
-mcp
-mcp[server]
-fastmcp
-ladybug
-tree-sitter
-tree-sitter-python
