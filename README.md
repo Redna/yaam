@@ -2,13 +2,15 @@
 
 YAAM is a lightweight, 2-layered agent memory system designed to maintain continuity and structural awareness across different AI coding agents. It separates your physical file structures/AST (Layer 0) from the cognitive agent reasoning states/workspaces (Layer 1).
 
-This engine is written **100% in TypeScript**, using the native TypeScript Compiler API for AST analysis, and utilizes **LadybugDB** as its underlying graph database. It supports direct CLI script executions and lifecycle hooks (e.g. `pi.dev` extensions).
+This engine is written **100% in TypeScript**, using the native TypeScript Compiler API for TS/JS AST analysis, and the Pyright Language Server via stdio JSON-RPC for Python codebase analysis. It utilizes **LadybugDB** as its underlying graph database and supports direct CLI script executions and lifecycle hooks (e.g. `pi.dev` extensions).
 
 ---
 
 ## How it Works
 
-* **Layer 0 (Physical Topology):** Automatically tracked files, class declarations, method and function definitions, and call graphs. These are extracted natively using the TypeScript Compiler API (`ts.createSourceFile`).
+* **Layer 0 (Physical Topology):** Automatically tracked files, class declarations, method and function definitions, and call/inheritance graphs.
+  * **TypeScript/JavaScript**: Extracted natively using the programmatic TypeScript Language Service API.
+  * **Python**: Extracted using the `pyright-langserver` via stdio JSON-RPC queries.
 * **Layer 1 (Cognitive Context):** User/Agent-defined workspaces and chronological scratchpads that capture design rationale, insights, and decisions.
 * **Automated Sync Hooks**: Runs incremental physical synchronization automatically after tool use (via post-tool hooks) and at turn/agent boundaries (via the `pi.dev` extension hooks).
 

@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
 import { fileURLToPath } from 'url';
+import { LspClient } from './lsp_client.js';
 
 function getGitStatus(): { status: string; path: string }[] {
   try {
@@ -49,6 +50,10 @@ interface EntityRange {
   id: string;
   startPos: number;
   endPos: number;
+  pyRange?: {
+    start: { line: number; character: number };
+    end: { line: number; character: number };
+  };
 }
 
 interface ParsedEntity {
@@ -59,7 +64,11 @@ interface ParsedEntity {
   endLine: number;
   startPos: number;
   endPos: number;
-  superclasses?: { name: string; pos: number }[];
+  superclasses?: ({ name: string; pos: number } | { name: string; line: number; col: number })[];
+  pyRange?: {
+    start: { line: number; character: number };
+    end: { line: number; character: number };
+  };
 }
 
 interface UnresolvedCall {
@@ -68,6 +77,196 @@ interface UnresolvedCall {
   name: string;
   line: number;
   col: number;
+}
+
+function isPositionInRange(
+  pos: { line: number; character: number },
+  range: { start: { line: number; character: number }; end: { line: number; character: number } }
+): boolean {
+  if (pos.line < range.start.line || pos.line > range.end.line) return false;
+  if (pos.line === range.start.line && pos.character < range.start.character) return false;
+  if (pos.line === range.end.line && pos.character > range.end.character) return false;
+  return true;
+}
+
+function findEnclosingFunction(
+  pos: { line: number; character: number },
+  functions: ParsedEntity[]
+): ParsedEntity | null {
+  let bestFunc: ParsedEntity | null = null;
+  let smallestSpan = Infinity;
+  for (const func of functions) {
+    const range = func.pyRange;
+    if (range && isPositionInRange(pos, range)) {
+      const span = range.end.line - range.start.line;
+      if (span < smallestSpan) {
+        smallestSpan = span;
+        bestFunc = func;
+      }
+    }
+  }
+  return bestFunc;
+}
+
+function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] = []): ParsedEntity[] {
+  const result: ParsedEntity[] = [];
+  for (const sym of symbols) {
+    if (sym.kind === 5) { // Class
+      const currentPath = [...parentPath, sym.name];
+      const classId = `${filePath}::${currentPath.join('::')}`;
+      result.push({
+        id: classId,
+        name: sym.name,
+        type: 'Class',
+        startLine: sym.range.start.line + 1,
+        endLine: sym.range.end.line + 1,
+        startPos: 0,
+        endPos: 0,
+        pyRange: sym.range
+      });
+      if (sym.children) {
+        result.push(...traverseSymbols(sym.children, filePath, currentPath));
+      }
+    } else if (sym.kind === 6 || sym.kind === 12) { // Method or Function
+      const currentPath = [...parentPath, sym.name];
+      const funcId = `${filePath}::${currentPath.join('::')}`;
+      result.push({
+        id: funcId,
+        name: sym.name,
+        type: 'Function',
+        startLine: sym.range.start.line + 1,
+        endLine: sym.range.end.line + 1,
+        startPos: 0,
+        endPos: 0,
+        pyRange: sym.range
+      });
+      if (sym.children) {
+        result.push(...traverseSymbols(sym.children, filePath, currentPath));
+      }
+    } else {
+      if (sym.children) {
+        result.push(...traverseSymbols(sym.children, filePath, parentPath));
+      }
+    }
+  }
+  return result;
+}
+
+async function extractPythonEntities(
+  filePath: string,
+  pyClient: LspClient
+): Promise<{
+  classes: ParsedEntity[];
+  functions: ParsedEntity[];
+  imports: string[];
+  unresolvedCalls: UnresolvedCall[];
+  ranges: EntityRange[];
+}> {
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const uri = `file://${path.resolve(filePath)}`;
+  
+  const symbols = await pyClient.sendRequest('textDocument/documentSymbol', {
+    textDocument: { uri }
+  });
+
+  const classes: ParsedEntity[] = [];
+  const functions: ParsedEntity[] = [];
+  const imports: string[] = [];
+  const unresolvedCalls: UnresolvedCall[] = [];
+  const ranges: EntityRange[] = [];
+
+  if (symbols && Array.isArray(symbols)) {
+    const parsed = traverseSymbols(symbols, filePath);
+    for (const ent of parsed) {
+      if (ent.type === 'Class') {
+        classes.push(ent);
+      } else {
+        functions.push(ent);
+      }
+      ranges.push({
+        id: ent.id,
+        startPos: 0,
+        endPos: 0,
+        pyRange: ent.pyRange
+      });
+    }
+  }
+
+  const lines = content.split('\n');
+  for (const cls of classes) {
+    const range = cls.pyRange;
+    if (range) {
+      const startLineIdx = range.start.line;
+      if (startLineIdx < lines.length) {
+        const line = lines[startLineIdx];
+        const classMatch = line.match(/class\s+(\w+)\s*\(([^)]+)\)/);
+        if (classMatch) {
+          const superclassesStr = classMatch[2];
+          const baseOffset = line.indexOf(superclassesStr);
+          const parts = superclassesStr.split(',');
+          let currentOffset = baseOffset;
+          const superclasses: any[] = [];
+          for (const part of parts) {
+            const trimmed = part.trim();
+            if (trimmed) {
+              const partIndex = part.indexOf(trimmed);
+              const startChar = currentOffset + partIndex;
+              superclasses.push({
+                name: trimmed,
+                line: startLineIdx,
+                col: startChar
+              });
+            }
+            currentOffset += part.length + 1;
+          }
+          cls.superclasses = superclasses;
+        }
+      }
+    }
+  }
+
+  for (const line of lines) {
+    const importMatch1 = line.match(/^\s*import\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)/);
+    const importMatch2 = line.match(/^\s*from\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\s+import/);
+    if (importMatch1) {
+      imports.push(importMatch1[1]);
+    } else if (importMatch2) {
+      imports.push(importMatch2[1]);
+    }
+  }
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    if (/^\s*(def|class)\b/.test(line)) {
+      continue;
+    }
+    const regex = /\b([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\b\s*\(/g;
+    let match;
+    while ((match = regex.exec(line)) !== null) {
+      const callName = match[1];
+      const matchIndex = match.index;
+      
+      let targetCol = matchIndex;
+      const lastDot = callName.lastIndexOf('.');
+      if (lastDot !== -1) {
+        targetCol += lastDot + 1;
+      }
+      
+      const pos = { line: lineIdx, character: targetCol };
+      const enclosingFunc = findEnclosingFunction(pos, functions);
+      if (enclosingFunc) {
+        unresolvedCalls.push({
+          callerId: enclosingFunc.id,
+          pos: 0,
+          name: callName,
+          line: lineIdx,
+          col: targetCol
+        });
+      }
+    }
+  }
+
+  return { classes, functions, imports, unresolvedCalls, ranges };
 }
 
 function extractTSEntities(filePath: string, sourceFile: ts.SourceFile) {
@@ -226,12 +425,29 @@ async function processFileEntities(
   // 1. Handle File Imports
   for (const impPath of entities.imports) {
     let targetPath: string | null = null;
-    if (impPath.startsWith('.')) {
-      const resolved = path.join(path.dirname(filePath), impPath);
-      for (const ext of ['.ts', '.js']) {
-        if (fs.existsSync(resolved + ext)) {
-          targetPath = resolved + ext;
+    if (filePath.endsWith('.py')) {
+      const relativeResolved = path.join(path.dirname(filePath), impPath.replace(/\./g, '/'));
+      const absoluteResolved = path.join(process.cwd(), impPath.replace(/\./g, '/'));
+      const candidatePaths = [
+        relativeResolved + '.py',
+        path.join(relativeResolved, '__init__.py'),
+        absoluteResolved + '.py',
+        path.join(absoluteResolved, '__init__.py')
+      ];
+      for (const candidate of candidatePaths) {
+        if (fs.existsSync(candidate)) {
+          targetPath = path.relative(process.cwd(), candidate);
           break;
+        }
+      }
+    } else {
+      if (impPath.startsWith('.')) {
+        const resolved = path.join(path.dirname(filePath), impPath);
+        for (const ext of ['.ts', '.js']) {
+          if (fs.existsSync(resolved + ext)) {
+            targetPath = resolved + ext;
+            break;
+          }
         }
       }
     }
@@ -323,6 +539,7 @@ async function trackAccessedFile(conn: any, toolName: string, toolInput: any) {
 async function reconcile(full = false) {
   const { db, conn } = getConn();
   const nowTs = Math.floor(Date.now() / 1000);
+  let pyClient: LspClient | null = null;
 
   try {
     await setupDatabase();
@@ -331,11 +548,11 @@ async function reconcile(full = false) {
     let diskFiles: string[] = [];
     if (full) {
       diskFiles = getAllFiles();
-      filesToReconcile = diskFiles.filter(p => p.endsWith('.ts') || p.endsWith('.js'));
+      filesToReconcile = diskFiles.filter(p => p.endsWith('.ts') || p.endsWith('.js') || p.endsWith('.py'));
     } else {
       const statusMap = getGitStatus();
       filesToReconcile = statusMap
-        .filter(item => item.status !== 'D' && (item.path.endsWith('.ts') || item.path.endsWith('.js')))
+        .filter(item => item.status !== 'D' && (item.path.endsWith('.ts') || item.path.endsWith('.js') || item.path.endsWith('.py')))
         .map(item => item.path);
     }
 
@@ -398,6 +615,28 @@ async function reconcile(full = false) {
     const documentRegistry = ts.createDocumentRegistry();
     const service = ts.createLanguageService(servicesHost, documentRegistry);
 
+    // Initialize Pyright Language Server if Python files are present
+    const pyFiles = allDiskFiles.filter(p => p.endsWith('.py'));
+    if (pyFiles.length > 0) {
+      console.log("Launching Pyright Language Server...");
+      pyClient = new LspClient('npx', ['--package=pyright', 'pyright-langserver', '--stdio'], process.cwd());
+      await pyClient.initialize(process.cwd());
+      for (const pyFile of pyFiles) {
+        try {
+          const content = fs.readFileSync(pyFile, 'utf-8');
+          pyClient.sendNotification('textDocument/didOpen', {
+            textDocument: {
+              uri: `file://${path.resolve(pyFile)}`,
+              languageId: 'python',
+              version: 1,
+              text: content
+            }
+          });
+        } catch (e) {}
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
     const parsedCache = new Map<string, {
       classes: ParsedEntity[];
       functions: ParsedEntity[];
@@ -408,17 +647,30 @@ async function reconcile(full = false) {
 
     for (const filePath of filesToReconcile) {
       try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
-        const result = extractTSEntities(filePath, sourceFile);
+        if (filePath.endsWith('.py')) {
+          if (pyClient) {
+            const result = await extractPythonEntities(filePath, pyClient);
+            parsedCache.set(filePath, {
+              classes: result.classes,
+              functions: result.functions,
+              imports: result.imports,
+              unresolvedCalls: result.unresolvedCalls,
+            });
+            entitiesInFiles.set(filePath, result.ranges);
+          }
+        } else {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+          const result = extractTSEntities(filePath, sourceFile);
 
-        parsedCache.set(filePath, {
-          classes: result.classes,
-          functions: result.functions,
-          imports: result.imports,
-          unresolvedCalls: result.unresolvedCalls,
-        });
-        entitiesInFiles.set(filePath, result.ranges);
+          parsedCache.set(filePath, {
+            classes: result.classes,
+            functions: result.functions,
+            imports: result.imports,
+            unresolvedCalls: result.unresolvedCalls,
+          });
+          entitiesInFiles.set(filePath, result.ranges);
+        }
       } catch (e) {
         console.error(`Error parsing ${filePath}:`, e);
       }
@@ -505,28 +757,72 @@ async function reconcile(full = false) {
       // 1. Resolve Calls
       for (const call of fileData.unresolvedCalls) {
         try {
-          const defs = service.getDefinitionAtPosition(absPath, call.pos);
-          if (defs && defs.length > 0) {
-            const def = defs[0];
-            const relTarget = path.relative(process.cwd(), def.fileName);
-            if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
-              const targets = entitiesInFiles.get(relTarget) || [];
-              let bestTarget: EntityRange | null = null;
-              let smallestSpan = Infinity;
-              for (const t of targets) {
-                if (def.textSpan.start >= t.startPos && def.textSpan.start <= t.endPos) {
-                  const span = t.endPos - t.startPos;
-                  if (span < smallestSpan) {
-                    smallestSpan = span;
-                    bestTarget = t;
+          let defs: any = null;
+          if (filePath.endsWith('.py')) {
+            if (pyClient) {
+              defs = await pyClient.sendRequest('textDocument/definition', {
+                textDocument: { uri: `file://${absPath}` },
+                position: { line: call.line, character: call.col }
+              });
+            }
+          } else {
+            defs = service.getDefinitionAtPosition(absPath, call.pos);
+          }
+
+          if (defs) {
+            const defLocations = Array.isArray(defs) ? defs : [defs];
+            if (defLocations.length > 0) {
+              const def = defLocations[0];
+              if (filePath.endsWith('.py')) {
+                if (def.uri.startsWith('file://')) {
+                  const targetAbsPath = fileURLToPath(def.uri);
+                  const relTarget = path.relative(process.cwd(), targetAbsPath);
+                  if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
+                    const targets = entitiesInFiles.get(relTarget) || [];
+                    let bestTarget: EntityRange | null = null;
+                    let smallestSpan = Infinity;
+                    const defStart = def.range.start;
+                    for (const t of targets) {
+                      const range = t.pyRange;
+                      if (range && isPositionInRange(defStart, range)) {
+                        const span = range.end.line - range.start.line;
+                        if (span < smallestSpan) {
+                          smallestSpan = span;
+                          bestTarget = t;
+                        }
+                      }
+                    }
+                    if (bestTarget) {
+                      resolvedCalls.push({
+                        callerId: call.callerId,
+                        targetId: bestTarget.id,
+                      });
+                    }
                   }
                 }
-              }
-              if (bestTarget) {
-                resolvedCalls.push({
-                  callerId: call.callerId,
-                  targetId: bestTarget.id,
-                });
+              } else {
+                const tsDef = def as ts.DefinitionInfo;
+                const relTarget = path.relative(process.cwd(), tsDef.fileName);
+                if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
+                  const targets = entitiesInFiles.get(relTarget) || [];
+                  let bestTarget: EntityRange | null = null;
+                  let smallestSpan = Infinity;
+                  for (const t of targets) {
+                    if (tsDef.textSpan.start >= t.startPos && tsDef.textSpan.start <= t.endPos) {
+                      const span = t.endPos - t.startPos;
+                      if (span < smallestSpan) {
+                        smallestSpan = span;
+                        bestTarget = t;
+                      }
+                    }
+                  }
+                  if (bestTarget) {
+                    resolvedCalls.push({
+                      callerId: call.callerId,
+                      targetId: bestTarget.id,
+                    });
+                  }
+                }
               }
             }
           }
@@ -538,28 +834,74 @@ async function reconcile(full = false) {
         if (cls.superclasses) {
           for (const superclass of cls.superclasses) {
             try {
-              const defs = service.getDefinitionAtPosition(absPath, superclass.pos);
-              if (defs && defs.length > 0) {
-                const def = defs[0];
-                const relTarget = path.relative(process.cwd(), def.fileName);
-                if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
-                  const targets = entitiesInFiles.get(relTarget) || [];
-                  let bestTarget: EntityRange | null = null;
-                  let smallestSpan = Infinity;
-                  for (const t of targets) {
-                    if (def.textSpan.start >= t.startPos && def.textSpan.start <= t.endPos) {
-                      const span = t.endPos - t.startPos;
-                      if (span < smallestSpan) {
-                        smallestSpan = span;
-                        bestTarget = t;
+              let defs: any = null;
+              if (filePath.endsWith('.py')) {
+                if (pyClient) {
+                  const sClass = superclass as any;
+                  defs = await pyClient.sendRequest('textDocument/definition', {
+                    textDocument: { uri: `file://${absPath}` },
+                    position: { line: sClass.line, character: sClass.col }
+                  });
+                }
+              } else {
+                const sClass = superclass as { name: string; pos: number };
+                defs = service.getDefinitionAtPosition(absPath, sClass.pos);
+              }
+
+              if (defs) {
+                const defLocations = Array.isArray(defs) ? defs : [defs];
+                if (defLocations.length > 0) {
+                  const def = defLocations[0];
+                  if (filePath.endsWith('.py')) {
+                    if (def.uri.startsWith('file://')) {
+                      const targetAbsPath = fileURLToPath(def.uri);
+                      const relTarget = path.relative(process.cwd(), targetAbsPath);
+                      if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
+                        const targets = entitiesInFiles.get(relTarget) || [];
+                        let bestTarget: EntityRange | null = null;
+                        let smallestSpan = Infinity;
+                        const defStart = def.range.start;
+                        for (const t of targets) {
+                          const range = t.pyRange;
+                          if (range && isPositionInRange(defStart, range)) {
+                            const span = range.end.line - range.start.line;
+                            if (span < smallestSpan) {
+                              smallestSpan = span;
+                              bestTarget = t;
+                            }
+                          }
+                        }
+                        if (bestTarget) {
+                          resolvedInherits.push({
+                            subId: cls.id,
+                            supId: bestTarget.id,
+                          });
+                        }
                       }
                     }
-                  }
-                  if (bestTarget) {
-                    resolvedInherits.push({
-                      subId: cls.id,
-                      supId: bestTarget.id,
-                    });
+                  } else {
+                    const tsDef = def as ts.DefinitionInfo;
+                    const relTarget = path.relative(process.cwd(), tsDef.fileName);
+                    if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
+                      const targets = entitiesInFiles.get(relTarget) || [];
+                      let bestTarget: EntityRange | null = null;
+                      let smallestSpan = Infinity;
+                      for (const t of targets) {
+                        if (tsDef.textSpan.start >= t.startPos && tsDef.textSpan.start <= t.endPos) {
+                          const span = t.endPos - t.startPos;
+                          if (span < smallestSpan) {
+                            smallestSpan = span;
+                            bestTarget = t;
+                          }
+                        }
+                      }
+                      if (bestTarget) {
+                        resolvedInherits.push({
+                          subId: cls.id,
+                          supId: bestTarget.id,
+                        });
+                      }
+                    }
                   }
                 }
               }
@@ -594,6 +936,11 @@ async function reconcile(full = false) {
     }
 
   } finally {
+    if (pyClient) {
+      try {
+        pyClient.stop();
+      } catch (e) {}
+    }
     await conn.close();
     await db.close();
   }
