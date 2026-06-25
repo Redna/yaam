@@ -2,84 +2,70 @@
 
 YAAM is a lightweight, 2-layered agent memory system designed to maintain continuity and structural awareness across different AI coding agents. It separates your physical file structures/AST (Layer 0) from the cognitive agent reasoning states/workspaces (Layer 1).
 
-This engine is optimized for **cross-agent compatibility**, supporting both **Claude Code** and **Antigravity CLI** seamlessly.
+This engine is written **100% in TypeScript**, using the native TypeScript Compiler API for AST analysis, and utilizes **LadybugDB** as its underlying graph database. It supports direct CLI script executions and lifecycle hooks (e.g. `pi.dev` extensions).
 
 ---
 
 ## How it Works
 
-* **Layer 0 (Physical Topology):** Automatically tracked files, function declarations, and Git changes. 
-* **Layer 1 (Cognitive Context):** User/Agent-defined workspaces and chronological scratchpads that capture design rationale and decisions.
-* **Passive Reconciliation:** For agents that do not support native client-side lifecycle hooks (like Claude Code), YAAM automatically runs git-status physical synchronization internally on the server before executing any memory tools.
+* **Layer 0 (Physical Topology):** Automatically tracked files, class declarations, method and function definitions, and call graphs. These are extracted natively using the TypeScript Compiler API (`ts.createSourceFile`).
+* **Layer 1 (Cognitive Context):** User/Agent-defined workspaces and chronological scratchpads that capture design rationale, insights, and decisions.
+* **Automated Sync Hooks**: Runs incremental physical synchronization automatically after tool use (via post-tool hooks) and at turn/agent boundaries (via the `pi.dev` extension hooks).
 
 ---
 
-## Installation Guide
+## Installation & Setup
 
-To achieve zero-friction setup without nesting Git repositories, use the following one-liner commands.
+Set up the project dependencies using standard Node.js package managers:
 
-### Option 1: Global Plugin Mode (Recommended - Cleanest Setup)
-
-In this mode, the YAAM codebase is stored in a single, central directory on your machine. No plugin source files are copied or cloned into your active project repositories.
-
-#### A. Claude Code (via `/plugin install`)
-Install the plugin globally using your private repository SSH URL:
 ```bash
-/plugin install git@github.com:Redna/yaam.git
-```
-* **How it works:** Claude Code clones this repository once into its global user plugins directory. The server runs globally but operates relative to whichever local workspace folder you open Claude in.
-
-#### B. Antigravity CLI (via plugins folder)
-Run this one-liner to clone the repository once directly into the Antigravity global plugins directory and run the installation script:
-```bash
-git clone git@github.com:Redna/yaam.git ~/.gemini/antigravity-cli/plugins/yaam-memory && cd ~/.gemini/antigravity-cli/plugins/yaam-memory && ./install.sh
+# Install dependencies (LadybugDB, TS, tsx compiler runner)
+npm install
 ```
 
 ---
 
-### Option 2: Project-Local Mode (No Repository Nesting)
+## Agent Integration & Customizations
 
-If you need the YAAM files directly inside a specific project repository, run one of these single commands from your target repository root:
+This workspace is configured with customizations loaded by the agent:
 
-#### A. Piping via Git SSH (Zero Token Setup)
-If you have SSH authentication set up on your machine, this command pulls the installer via SSH, pipes it to bash, and extracts the repository locally:
-```bash
-git archive --remote=git@github.com:Redna/yaam.git main install.sh | tar -xO install.sh | bash -s -- --local
-```
-
-#### B. Piping via HTTPS Curl (Token Required)
-If you prefer using `curl`, you can use a GitHub Personal Access Token (PAT):
-```bash
-curl -H "Authorization: token $GITHUB_TOKEN" -sSL https://raw.githubusercontent.com/Redna/yaam/main/install.sh | bash -s -- --local
-```
+* **Workspace Customizations Root**: `.agents/` (contains `AGENTS.md` rules and the onboarding skill).
+* **Onboarding Skill**: Loaded from `.agents/skills/yaam-memory-manager/SKILL.md`.
+* **Agent Hooks**:
+  * **Gemini/Antigravity**: Configured in `.gemini/settings.json` under `AfterTool` hooks to trigger `npx tsx reconciler.ts`.
+  * **Other Agent Runners**: Configured in `.agents/hooks.json` under `PostToolUse` hooks.
+  * **pi.dev Extension**: The extension in `.pi/extensions/yaam/index.ts` subscribes to `turn_end` and `agent_end` events to automatically execute the reconciler in the background.
 
 ---
 
-## Agent Usage Guide
+## Usage Guide (For Agents)
 
-### 1. Instructions and Onboarding
-* **Claude Code:** Ask Claude to load the instructions using:
+Agents interact with the memory engine using local CLI scripts executed with Node.js/tsx.
+
+### 1. Initialize a Workspace
+When beginning a new feature or refactor, initialize a task tracking workspace:
+```bash
+npx tsx .agents/skills/yaam-memory-manager/scripts/workspace_initialize.ts --name "<workspace-name>" --description "<description>"
+```
+
+### 2. Append Key Insights
+Record "Why" decisions and architectural learnings to the active workspace scratchpad:
+```bash
+npx tsx .agents/skills/yaam-memory-manager/scripts/workspace_append_note.ts --workspace "<workspace-name>" --content "<insight>"
+```
+
+### 3. Explore Code & Memory Relationships
+Query the database using read-only Cypher queries to understand code linkages or recall past thoughts:
+```bash
+npx tsx .agents/skills/yaam-memory-manager/scripts/graph_explore.ts "MATCH (n:Entity) RETURN n.type, count(n)"
+```
+
+### 4. Run Manual Sync
+If manual codebase reconciliation is needed, execute the reconciler script:
+```bash
+npx tsx .agents/skills/yaam-memory-manager/scripts/reconciler.ts
+```
+* Use `--full` to force a complete codebase scan:
+  ```bash
+  npx tsx .agents/skills/yaam-memory-manager/scripts/reconciler.ts --full
   ```
-  /prompt use_yaam_memory
-  ```
-* **Antigravity CLI:** Automatically loads the onboarding markdown skill from `.agents/skills/yaam-memory-manager/SKILL.md`.
-
-### 2. Core Workflows (For Agents)
-
-#### Task Initialization
-Initialize a workspace when starting a new task:
-```cypher
-workspace_initialize(name="refactor-auth", description="Refactoring authentication layer")
-```
-
-#### Recording Key Rationale
-Capture "Why" decisions and architectural learnings:
-```cypher
-workspace_append_note(workspace_name="refactor-auth", content="Switched to JWT token storage to support cross-agent sessions.")
-```
-
-#### Exploring Memory Relationships
-Query the physical and cognitive graph database using Cypher:
-```cypher
-graph_explore("MATCH (w:Workspace {workspace_name: 'refactor-auth'})-[:HAS_SCRATCHPAD]->(s:Scratchpad) RETURN s.content, s.created_at ORDER BY s.created_at DESC")
-```
