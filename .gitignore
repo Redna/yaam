@@ -18,3 +18,5 @@ memory.lbug/
 .chunks/
 history.jsonl
 node_modules/
+.pi/
+

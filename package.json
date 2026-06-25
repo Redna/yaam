@@ -26,6 +26,7 @@
     "@earendil-works/pi-coding-agent": "^0.80.2",
     "@types/node": "^20.14.9",
     "tsx": "^4.15.7",
+    "typebox": "^1.1.38",
     "typescript": "^5.5.2"
   },
   "peerDependencies": {
