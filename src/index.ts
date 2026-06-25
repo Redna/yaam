@@ -23,8 +23,8 @@ export default function yaamExtension(pi: ExtensionAPI) {
     }
   }
 
-  // Hook into turn_end to automatically run incremental reconciliation
-  pi.on("turn_end", async (event: any, ctx: any) => {
+  // Hook into tool_result to automatically run incremental reconciliation
+  pi.on("tool_result", async (event: any, ctx: any) => {
     await runReconciler(false);
   });
 
