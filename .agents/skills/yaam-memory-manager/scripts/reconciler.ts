@@ -45,30 +45,37 @@ function getAllFiles(dir = '.'): string[] {
   return files;
 }
 
+interface EntityRange {
+  id: string;
+  startPos: number;
+  endPos: number;
+}
+
 interface ParsedEntity {
   id: string;
   name: string;
   type: 'Class' | 'Function';
   startLine: number;
   endLine: number;
-  superclasses?: string[];
+  startPos: number;
+  endPos: number;
+  superclasses?: { name: string; pos: number }[];
 }
 
-interface ParsedCall {
+interface UnresolvedCall {
   callerId: string;
+  pos: number;
   name: string;
   line: number;
   col: number;
 }
 
-function extractTSEntities(filePath: string) {
-  const fileContent = fs.readFileSync(filePath, 'utf-8');
-  const sourceFile = ts.createSourceFile(filePath, fileContent, ts.ScriptTarget.Latest, true);
-
+function extractTSEntities(filePath: string, sourceFile: ts.SourceFile) {
   const classes: ParsedEntity[] = [];
   const functions: ParsedEntity[] = [];
   const imports: string[] = [];
-  const calls: ParsedCall[] = [];
+  const unresolvedCalls: UnresolvedCall[] = [];
+  const ranges: EntityRange[] = [];
 
   let currentClass: string | null = null;
   let currentFunction: string | null = null;
@@ -86,14 +93,19 @@ function extractTSEntities(filePath: string) {
       }
     } else if (ts.isClassDeclaration(node) && node.name) {
       const className = node.name.text;
-      const { line: startLine } = getLineAndChar(node.getStart(sourceFile));
-      const { line: endLine } = getLineAndChar(node.getEnd());
+      const startPos = node.getStart(sourceFile);
+      const endPos = node.getEnd();
+      const { line: startLine } = getLineAndChar(startPos);
+      const { line: endLine } = getLineAndChar(endPos);
       
-      const superclasses: string[] = [];
+      const superclasses: { name: string; pos: number }[] = [];
       if (node.heritageClauses) {
         for (const clause of node.heritageClauses) {
           for (const typeNode of clause.types) {
-            superclasses.push(typeNode.expression.getText(sourceFile));
+            superclasses.push({
+              name: typeNode.expression.getText(sourceFile),
+              pos: typeNode.expression.getStart(sourceFile)
+            });
           }
         }
       }
@@ -105,8 +117,11 @@ function extractTSEntities(filePath: string) {
         type: 'Class',
         startLine,
         endLine,
+        startPos,
+        endPos,
         superclasses
       });
+      ranges.push({ id: classId, startPos, endPos });
 
       const oldClass = currentClass;
       currentClass = className;
@@ -115,8 +130,10 @@ function extractTSEntities(filePath: string) {
       return;
     } else if (ts.isMethodDeclaration(node) && node.name && currentClass) {
       const methodName = node.name.getText(sourceFile);
-      const { line: startLine } = getLineAndChar(node.getStart(sourceFile));
-      const { line: endLine } = getLineAndChar(node.getEnd());
+      const startPos = node.getStart(sourceFile);
+      const endPos = node.getEnd();
+      const { line: startLine } = getLineAndChar(startPos);
+      const { line: endLine } = getLineAndChar(endPos);
       const methodId = `${filePath}::${currentClass}::${methodName}`;
 
       functions.push({
@@ -124,8 +141,11 @@ function extractTSEntities(filePath: string) {
         name: methodName,
         type: 'Function',
         startLine,
-        endLine
+        endLine,
+        startPos,
+        endPos
       });
+      ranges.push({ id: methodId, startPos, endPos });
 
       const oldFunc = currentFunction;
       currentFunction = methodId;
@@ -134,8 +154,10 @@ function extractTSEntities(filePath: string) {
       return;
     } else if (ts.isFunctionDeclaration(node) && node.name) {
       const funcName = node.name.text;
-      const { line: startLine } = getLineAndChar(node.getStart(sourceFile));
-      const { line: endLine } = getLineAndChar(node.getEnd());
+      const startPos = node.getStart(sourceFile);
+      const endPos = node.getEnd();
+      const { line: startLine } = getLineAndChar(startPos);
+      const { line: endLine } = getLineAndChar(endPos);
       const funcId = `${filePath}::${funcName}`;
 
       functions.push({
@@ -143,8 +165,11 @@ function extractTSEntities(filePath: string) {
         name: funcName,
         type: 'Function',
         startLine,
-        endLine
+        endLine,
+        startPos,
+        endPos
       });
+      ranges.push({ id: funcId, startPos, endPos });
 
       const oldFunc = currentFunction;
       currentFunction = funcId;
@@ -154,9 +179,11 @@ function extractTSEntities(filePath: string) {
     } else if (ts.isCallExpression(node) && currentFunction) {
       const expression = node.expression;
       const callName = expression.getText(sourceFile);
-      const { line, col } = getLineAndChar(expression.getStart(sourceFile));
-      calls.push({
+      const startPos = expression.getStart(sourceFile);
+      const { line, col } = getLineAndChar(startPos);
+      unresolvedCalls.push({
         callerId: currentFunction,
+        pos: startPos,
         name: callName,
         line,
         col
@@ -167,10 +194,10 @@ function extractTSEntities(filePath: string) {
   }
 
   visit(sourceFile);
-  return { classes, functions, imports, calls };
+  return { classes, functions, imports, unresolvedCalls, ranges };
 }
 
-async function cleanupStaleEntities(conn: any, filePath: string, parsedIds: Set<string>, ts: number) {
+async function cleanupStaleEntities(conn: any, filePath: string, parsedIds: Set<string>, timestamp: number) {
   const prefix = `${filePath}::`;
   let dbEntities: string[] = [];
   try {
@@ -183,7 +210,7 @@ async function cleanupStaleEntities(conn: any, filePath: string, parsedIds: Set<
   for (const entId of dbEntities) {
     if (!parsedIds.has(entId)) {
       const prep = await conn.prepare("MATCH (e:Entity {id: $eid}) SET e.status = 'deleted', e.last_modified = $ts_val");
-      await conn.execute(prep, { eid: entId, ts_val: ts });
+      await conn.execute(prep, { eid: entId, ts_val: timestamp });
     }
   }
 }
@@ -191,10 +218,8 @@ async function cleanupStaleEntities(conn: any, filePath: string, parsedIds: Set<
 async function processFileEntities(
   conn: any,
   filePath: string,
-  entities: ReturnType<typeof extractTSEntities>,
-  ts: number,
-  funcLookup: Map<string, string[]>,
-  classLookup: Map<string, string[]>
+  entities: { classes: ParsedEntity[]; functions: ParsedEntity[]; imports: string[] },
+  timestamp: number
 ) {
   const parsedIds = new Set<string>();
 
@@ -224,22 +249,9 @@ async function processFileEntities(
     parsedIds.add(c.id);
     const metadata = JSON.stringify({ line: c.startLine });
     const prep1 = await conn.prepare("MERGE (cls:Entity {id: $cid}) SET cls.type = 'Class', cls.status = 'active', cls.last_modified = $ts_val, cls.metadata = $meta_val");
-    await conn.execute(prep1, { cid: c.id, ts_val: ts, meta_val: metadata });
+    await conn.execute(prep1, { cid: c.id, ts_val: timestamp, meta_val: metadata });
     const prep2 = await conn.prepare("MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)");
     await conn.execute(prep2, { pid: filePath, cid: c.id });
-
-    if (c.superclasses) {
-      for (const baseClass of c.superclasses) {
-        let superId = null;
-        if (classLookup.has(baseClass)) {
-          superId = classLookup.get(baseClass)![0];
-        }
-        if (superId) {
-          const prepInherit = await conn.prepare("MATCH (sub:Entity {id: $sub_id}), (sup:Entity {id: $sup_id}) MERGE (sub)-[:LINKED_TO {relationship_type: 'INHERITS_FROM'}]->(sup)");
-          await conn.execute(prepInherit, { sub_id: c.id, sup_id: superId });
-        }
-      }
-    }
   }
 
   // 3. Functions / Methods
@@ -247,7 +259,7 @@ async function processFileEntities(
     parsedIds.add(f.id);
     const metadata = JSON.stringify({ line: f.startLine });
     const prep1 = await conn.prepare("MERGE (func:Entity {id: $fid}) SET func.type = 'Function', func.status = 'active', func.last_modified = $ts_val, func.metadata = $meta_val");
-    await conn.execute(prep1, { fid: f.id, ts_val: ts, meta_val: metadata });
+    await conn.execute(prep1, { fid: f.id, ts_val: timestamp, meta_val: metadata });
 
     const parts = f.id.split('::');
     if (parts.length > 2) {
@@ -260,35 +272,7 @@ async function processFileEntities(
     }
   }
 
-  // 4. Resolve Calls (Call Graph)
-  for (const call of entities.calls) {
-    let targetId: string | null = null;
-
-    const parts = call.callerId.split('::');
-    if (parts.length > 2) {
-      const classId = `${parts[0]}::${parts[1]}`;
-      if (call.name.startsWith('this.')) {
-        const methodName = call.name.substring(5);
-        targetId = `${classId}::${methodName}`;
-      }
-    }
-
-    if (!targetId) {
-      const lastName = call.name.split('.').pop() || '';
-      if (funcLookup.has(lastName)) {
-        targetId = funcLookup.get(lastName)![0];
-      }
-    }
-
-    if (targetId) {
-      const prep1 = await conn.prepare("MERGE (target:Entity {id: $target_id}) SET target.type = 'Function'");
-      await conn.execute(prep1, { target_id: targetId });
-      const prep2 = await conn.prepare("MATCH (caller:Entity {id: $caller_id}), (callee:Entity {id: $callee_id}) MERGE (caller)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee)");
-      await conn.execute(prep2, { caller_id: call.callerId, callee_id: targetId });
-    }
-  }
-
-  await cleanupStaleEntities(conn, filePath, parsedIds, ts);
+  await cleanupStaleEntities(conn, filePath, parsedIds, timestamp);
 }
 
 async function trackAccessedFile(conn: any, toolName: string, toolInput: any) {
@@ -316,12 +300,12 @@ async function trackAccessedFile(conn: any, toolName: string, toolInput: any) {
 
   if (!wsName) return;
 
-  const ts = Math.floor(Date.now() / 1000);
+  const timestamp = Math.floor(Date.now() / 1000);
   try {
     const prep1 = await conn.prepare("MERGE (e:Entity {id: $eid}) SET e.type = 'File'");
     await conn.execute(prep1, { eid: relPath });
     const prep2 = await conn.prepare("MATCH (w:Workspace {workspace_name: $ws}), (e:Entity {id: $eid}) MERGE (w)-[:MAPPED_TO {created_at: $ts_val, is_stale: false}]->(e)");
-    await conn.execute(prep2, { ws: wsName, eid: relPath, ts_val: ts });
+    await conn.execute(prep2, { ws: wsName, eid: relPath, ts_val: timestamp });
 
     const prepClasses = await conn.prepare("MATCH (c:Entity {type: 'Class'})-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(f:Entity {id: $fid}) RETURN c.id");
     const resClasses = await conn.execute(prepClasses, { fid: relPath });
@@ -329,7 +313,7 @@ async function trackAccessedFile(conn: any, toolName: string, toolInput: any) {
     for (const row of classRows) {
       const cid = row['c.id'];
       const prepMap = await conn.prepare("MATCH (w:Workspace {workspace_name: $ws}), (e:Entity {id: $eid}) MERGE (w)-[:MAPPED_TO {created_at: $ts_val, is_stale: false}]->(e)");
-      await conn.execute(prepMap, { ws: wsName, eid: cid, ts_val: ts });
+      await conn.execute(prepMap, { ws: wsName, eid: cid, ts_val: timestamp });
     }
   } catch (e) {
     console.error("Error mapping workspace to file:", e);
@@ -338,7 +322,7 @@ async function trackAccessedFile(conn: any, toolName: string, toolInput: any) {
 
 async function reconcile(full = false) {
   const { db, conn } = getConn();
-  const ts = Math.floor(Date.now() / 1000);
+  const nowTs = Math.floor(Date.now() / 1000);
 
   try {
     await setupDatabase();
@@ -367,40 +351,74 @@ async function reconcile(full = false) {
       existingClasses = (await (resClass as any).getAll()).map((r: any) => r['c.id']);
     } catch (e) {}
 
-    const reconcilePrefixes = filesToReconcile.map(p => `${p}::`);
-    const isReconciling = (id: string) => reconcilePrefixes.some(pref => id.startsWith(pref));
+    // Initialize TypeScript Language Service (Programmatic LSP)
+    const allDiskFiles = getAllFiles();
+    const tsFiles = allDiskFiles.filter(p => p.endsWith('.ts') || p.endsWith('.js'));
 
-    const funcLookup = new Map<string, string[]>();
-    for (const fid of existingFuncs) {
-      if (isReconciling(fid)) continue;
-      const shortName = fid.split('::').pop() || '';
-      if (!funcLookup.has(shortName)) funcLookup.set(shortName, []);
-      funcLookup.get(shortName)!.push(fid);
+    const filesMap = new Map<string, { version: number, content: string }>();
+    for (const file of tsFiles) {
+      try {
+        filesMap.set(path.resolve(file), { version: 0, content: fs.readFileSync(file, 'utf-8') });
+      } catch (e) {}
     }
 
-    const classLookup = new Map<string, string[]>();
-    for (const cid of existingClasses) {
-      if (isReconciling(cid)) continue;
-      const shortName = cid.split('::').pop() || '';
-      if (!classLookup.has(shortName)) classLookup.set(shortName, []);
-      classLookup.get(shortName)!.push(cid);
-    }
+    const servicesHost: ts.LanguageServiceHost = {
+      getScriptFileNames: () => Array.from(filesMap.keys()),
+      getScriptVersion: (fileName) => {
+        const entry = filesMap.get(path.resolve(fileName));
+        return entry ? String(entry.version) : "0";
+      },
+      getScriptSnapshot: (fileName) => {
+        const norm = path.resolve(fileName);
+        if (!filesMap.has(norm)) {
+          if (fs.existsSync(norm)) {
+            filesMap.set(norm, { version: 0, content: fs.readFileSync(norm, 'utf-8') });
+          } else {
+            return undefined;
+          }
+        }
+        return ts.ScriptSnapshot.fromString(filesMap.get(norm)!.content);
+      },
+      getCurrentDirectory: () => process.cwd(),
+      getCompilationSettings: () => ({
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.ESNext,
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+        allowJs: true,
+        checkJs: true,
+      }),
+      getDefaultLibFileName: (options) => ts.getDefaultLibFilePath(options),
+      fileExists: ts.sys.fileExists,
+      readFile: ts.sys.readFile,
+      readDirectory: ts.sys.readDirectory,
+      directoryExists: ts.sys.directoryExists,
+      getDirectories: ts.sys.getDirectories,
+    };
 
-    const parsedCache = new Map<string, ReturnType<typeof extractTSEntities>>();
+    const documentRegistry = ts.createDocumentRegistry();
+    const service = ts.createLanguageService(servicesHost, documentRegistry);
+
+    const parsedCache = new Map<string, {
+      classes: ParsedEntity[];
+      functions: ParsedEntity[];
+      imports: string[];
+      unresolvedCalls: UnresolvedCall[];
+    }>();
+    const entitiesInFiles = new Map<string, EntityRange[]>();
 
     for (const filePath of filesToReconcile) {
       try {
-        const entities = extractTSEntities(filePath);
-        parsedCache.set(filePath, entities);
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+        const result = extractTSEntities(filePath, sourceFile);
 
-        for (const sym of entities.functions) {
-          if (!funcLookup.has(sym.name)) funcLookup.set(sym.name, []);
-          funcLookup.get(sym.name)!.push(sym.id);
-        }
-        for (const sym of entities.classes) {
-          if (!classLookup.has(sym.name)) classLookup.set(sym.name, []);
-          classLookup.get(sym.name)!.push(sym.id);
-        }
+        parsedCache.set(filePath, {
+          classes: result.classes,
+          functions: result.functions,
+          imports: result.imports,
+          unresolvedCalls: result.unresolvedCalls,
+        });
+        entitiesInFiles.set(filePath, result.ranges);
       } catch (e) {
         console.error(`Error parsing ${filePath}:`, e);
       }
@@ -411,12 +429,12 @@ async function reconcile(full = false) {
       for (let i = 0; i < diskFiles.length; i++) {
         const filePath = diskFiles[i];
         const prep = await conn.prepare("MERGE (e:Entity {id: $path_val}) SET e.type = 'File', e.status = 'active', e.last_modified = $ts_val");
-        await conn.execute(prep, { path_val: filePath, ts_val: ts });
+        await conn.execute(prep, { path_val: filePath, ts_val: nowTs });
 
         if (parsedCache.has(filePath)) {
           const entities = parsedCache.get(filePath)!;
           try {
-            await processFileEntities(conn, filePath, entities, ts, funcLookup, classLookup);
+            await processFileEntities(conn, filePath, entities, nowTs);
           } catch (e) {
             console.error(`Error processing ${filePath}:`, e);
           }
@@ -443,13 +461,13 @@ async function reconcile(full = false) {
         for (let i = 0; i < allToDelete.length; i += chunkSize) {
           const chunk = allToDelete.slice(i, i + chunkSize);
           const prep = await conn.prepare("MATCH (e:Entity) WHERE e.id IN $chunk SET e.status = 'deleted', e.last_modified = $ts_val");
-          await conn.execute(prep, { chunk, ts_val: ts });
+          await conn.execute(prep, { chunk, ts_val: nowTs });
         }
 
         for (let i = 0; i < staleFiles.length; i += chunkSize) {
           const chunk = staleFiles.slice(i, i + chunkSize);
           const prep = await conn.prepare("MATCH (e:Entity {type: 'File'}) WHERE e.id IN $chunk SET e.status = 'deleted', e.last_modified = $ts_val");
-          await conn.execute(prep, { chunk, ts_val: ts });
+          await conn.execute(prep, { chunk, ts_val: nowTs });
         }
       }
     } else {
@@ -459,12 +477,12 @@ async function reconcile(full = false) {
         const entityStatus = item.status === 'D' ? 'deleted' : 'active';
 
         const prep = await conn.prepare("MERGE (e:Entity {id: $path_val}) SET e.type = 'File', e.status = $status_val, e.last_modified = $ts_val");
-        await conn.execute(prep, { path_val: filePath, status_val: entityStatus, ts_val: ts });
+        await conn.execute(prep, { path_val: filePath, status_val: entityStatus, ts_val: nowTs });
 
         if (entityStatus === 'active' && parsedCache.has(filePath)) {
           const entities = parsedCache.get(filePath)!;
           try {
-            await processFileEntities(conn, filePath, entities, ts, funcLookup, classLookup);
+            await processFileEntities(conn, filePath, entities, nowTs);
           } catch (e) {
             console.error(`Error processing ${filePath}:`, e);
           }
@@ -472,10 +490,109 @@ async function reconcile(full = false) {
 
         if (entityStatus === 'deleted') {
           const prepInvalidate = await conn.prepare("MATCH (w:Workspace)-[r:MAPPED_TO]->(e:Entity) WHERE e.id = $path_val OR e.id STARTS WITH $path_prefix SET r.is_stale = true, r.invalidated_at = $ts_val");
-          await conn.execute(prepInvalidate, { path_val: filePath, path_prefix: `${filePath}::`, ts_val: ts });
+          await conn.execute(prepInvalidate, { path_val: filePath, path_prefix: `${filePath}::`, ts_val: nowTs });
         }
       }
     }
+
+    // Resolve calls and inheritance via Language Service (LSP)
+    const resolvedCalls: { callerId: string; targetId: string }[] = [];
+    const resolvedInherits: { subId: string; supId: string }[] = [];
+
+    for (const [filePath, fileData] of parsedCache.entries()) {
+      const absPath = path.resolve(filePath);
+      
+      // 1. Resolve Calls
+      for (const call of fileData.unresolvedCalls) {
+        try {
+          const defs = service.getDefinitionAtPosition(absPath, call.pos);
+          if (defs && defs.length > 0) {
+            const def = defs[0];
+            const relTarget = path.relative(process.cwd(), def.fileName);
+            if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
+              const targets = entitiesInFiles.get(relTarget) || [];
+              let bestTarget: EntityRange | null = null;
+              let smallestSpan = Infinity;
+              for (const t of targets) {
+                if (def.textSpan.start >= t.startPos && def.textSpan.start <= t.endPos) {
+                  const span = t.endPos - t.startPos;
+                  if (span < smallestSpan) {
+                    smallestSpan = span;
+                    bestTarget = t;
+                  }
+                }
+              }
+              if (bestTarget) {
+                resolvedCalls.push({
+                  callerId: call.callerId,
+                  targetId: bestTarget.id,
+                });
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      // 2. Resolve Inheritance
+      for (const cls of fileData.classes) {
+        if (cls.superclasses) {
+          for (const superclass of cls.superclasses) {
+            try {
+              const defs = service.getDefinitionAtPosition(absPath, superclass.pos);
+              if (defs && defs.length > 0) {
+                const def = defs[0];
+                const relTarget = path.relative(process.cwd(), def.fileName);
+                if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
+                  const targets = entitiesInFiles.get(relTarget) || [];
+                  let bestTarget: EntityRange | null = null;
+                  let smallestSpan = Infinity;
+                  for (const t of targets) {
+                    if (def.textSpan.start >= t.startPos && def.textSpan.start <= t.endPos) {
+                      const span = t.endPos - t.startPos;
+                      if (span < smallestSpan) {
+                        smallestSpan = span;
+                        bestTarget = t;
+                      }
+                    }
+                  }
+                  if (bestTarget) {
+                    resolvedInherits.push({
+                      subId: cls.id,
+                      supId: bestTarget.id,
+                    });
+                  }
+                }
+              }
+            } catch (e) {}
+          }
+        }
+      }
+    }
+
+    // Write Resolved Calls to Database
+    console.log(`Writing ${resolvedCalls.length} resolved call relationships...`);
+    for (const call of resolvedCalls) {
+      try {
+        const prep1 = await conn.prepare("MERGE (target:Entity {id: $target_id}) SET target.type = 'Function'");
+        await conn.execute(prep1, { target_id: call.targetId });
+        const prep2 = await conn.prepare("MATCH (caller:Entity {id: $caller_id}), (callee:Entity {id: $callee_id}) MERGE (caller)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee)");
+        await conn.execute(prep2, { caller_id: call.callerId, callee_id: call.targetId });
+      } catch (e) {
+        console.error(`Error saving call link: ${call.callerId} -> ${call.targetId}`, e);
+      }
+    }
+
+    // Write Resolved Inheritance to Database
+    console.log(`Writing ${resolvedInherits.length} resolved inherits relationships...`);
+    for (const link of resolvedInherits) {
+      try {
+        const prepInherit = await conn.prepare("MATCH (sub:Entity {id: $sub_id}), (sup:Entity {id: $sup_id}) MERGE (sub)-[:LINKED_TO {relationship_type: 'INHERITS_FROM'}]->(sup)");
+        await conn.execute(prepInherit, { sub_id: link.subId, sup_id: link.supId });
+      } catch (e) {
+        console.error(`Error saving inherits link: ${link.subId} -> ${link.supId}`, e);
+      }
+    }
+
   } finally {
     await conn.close();
     await db.close();
