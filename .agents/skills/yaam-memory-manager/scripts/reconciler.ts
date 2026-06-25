@@ -79,6 +79,70 @@ interface UnresolvedCall {
   col: number;
 }
 
+interface LspLangConfig {
+  languageId: string;
+  command: string;
+  args: string[];
+  callRegex: RegExp;
+  importRegexes: RegExp[];
+  defKeywords?: string[];
+  extractSuperclasses?: (line: string, startLineIdx: number) => { name: string; line: number; col: number }[];
+  resolveImport?: (filePath: string, impPath: string) => string | null;
+}
+
+const LSP_LANGUAGES: Record<string, LspLangConfig> = {
+  '.py': {
+    languageId: 'python',
+    command: 'npx',
+    args: ['--package=pyright', 'pyright-langserver', '--stdio'],
+    callRegex: /\b([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\b\s*\(/g,
+    importRegexes: [
+      /^\s*import\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)/,
+      /^\s*from\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\s+import/
+    ],
+    defKeywords: ['def', 'class'],
+    extractSuperclasses: (line: string, startLineIdx: number) => {
+      const classMatch = line.match(/class\s+(\w+)\s*\(([^)]+)\)/);
+      if (!classMatch) return [];
+      const superclassesStr = classMatch[2];
+      const baseOffset = line.indexOf(superclassesStr);
+      const parts = superclassesStr.split(',');
+      let currentOffset = baseOffset;
+      const superclasses: any[] = [];
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed) {
+          const partIndex = part.indexOf(trimmed);
+          const startChar = currentOffset + partIndex;
+          superclasses.push({
+            name: trimmed,
+            line: startLineIdx,
+            col: startChar
+          });
+        }
+        currentOffset += part.length + 1;
+      }
+      return superclasses;
+    },
+    resolveImport: (filePath: string, impPath: string) => {
+      const relativeResolved = path.join(path.dirname(filePath), impPath.replace(/\./g, '/'));
+      const absoluteResolved = path.join(process.cwd(), impPath.replace(/\./g, '/'));
+      const candidatePaths = [
+        relativeResolved + '.py',
+        path.join(relativeResolved, '__init__.py'),
+        absoluteResolved + '.py',
+        path.join(absoluteResolved, '__init__.py')
+      ];
+      for (const candidate of candidatePaths) {
+        if (fs.existsSync(candidate)) {
+          return path.relative(process.cwd(), candidate);
+        }
+      }
+      return null;
+    }
+  }
+};
+
 function isPositionInRange(
   pos: { line: number; character: number },
   range: { start: { line: number; character: number }; end: { line: number; character: number } }
@@ -152,9 +216,10 @@ function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] 
   return result;
 }
 
-async function extractPythonEntities(
+async function extractLspEntities(
   filePath: string,
-  pyClient: LspClient
+  lspClient: LspClient,
+  config: LspLangConfig
 ): Promise<{
   classes: ParsedEntity[];
   functions: ParsedEntity[];
@@ -165,7 +230,7 @@ async function extractPythonEntities(
   const content = fs.readFileSync(filePath, 'utf-8');
   const uri = `file://${path.resolve(filePath)}`;
   
-  const symbols = await pyClient.sendRequest('textDocument/documentSymbol', {
+  const symbols = await lspClient.sendRequest('textDocument/documentSymbol', {
     textDocument: { uri }
   });
 
@@ -193,54 +258,36 @@ async function extractPythonEntities(
   }
 
   const lines = content.split('\n');
-  for (const cls of classes) {
-    const range = cls.pyRange;
-    if (range) {
-      const startLineIdx = range.start.line;
-      if (startLineIdx < lines.length) {
-        const line = lines[startLineIdx];
-        const classMatch = line.match(/class\s+(\w+)\s*\(([^)]+)\)/);
-        if (classMatch) {
-          const superclassesStr = classMatch[2];
-          const baseOffset = line.indexOf(superclassesStr);
-          const parts = superclassesStr.split(',');
-          let currentOffset = baseOffset;
-          const superclasses: any[] = [];
-          for (const part of parts) {
-            const trimmed = part.trim();
-            if (trimmed) {
-              const partIndex = part.indexOf(trimmed);
-              const startChar = currentOffset + partIndex;
-              superclasses.push({
-                name: trimmed,
-                line: startLineIdx,
-                col: startChar
-              });
-            }
-            currentOffset += part.length + 1;
-          }
-          cls.superclasses = superclasses;
+  if (config.extractSuperclasses) {
+    for (const cls of classes) {
+      const range = cls.pyRange;
+      if (range) {
+        const startLineIdx = range.start.line;
+        if (startLineIdx < lines.length) {
+          const line = lines[startLineIdx];
+          cls.superclasses = config.extractSuperclasses(line, startLineIdx);
         }
       }
     }
   }
 
   for (const line of lines) {
-    const importMatch1 = line.match(/^\s*import\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)/);
-    const importMatch2 = line.match(/^\s*from\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\s+import/);
-    if (importMatch1) {
-      imports.push(importMatch1[1]);
-    } else if (importMatch2) {
-      imports.push(importMatch2[1]);
+    for (const regex of config.importRegexes) {
+      const match = line.match(regex);
+      if (match) {
+        imports.push(match[1]);
+        break;
+      }
     }
   }
 
   for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
     const line = lines[lineIdx];
-    if (/^\s*(def|class)\b/.test(line)) {
+    const skipRegex = config.defKeywords ? new RegExp(`^\\s*(${config.defKeywords.join('|')})\\b`) : null;
+    if (skipRegex && skipRegex.test(line)) {
       continue;
     }
-    const regex = /\b([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\b\s*\(/g;
+    const regex = new RegExp(config.callRegex.source, config.callRegex.flags);
     let match;
     while ((match = regex.exec(line)) !== null) {
       const callName = match[1];
@@ -425,21 +472,10 @@ async function processFileEntities(
   // 1. Handle File Imports
   for (const impPath of entities.imports) {
     let targetPath: string | null = null;
-    if (filePath.endsWith('.py')) {
-      const relativeResolved = path.join(path.dirname(filePath), impPath.replace(/\./g, '/'));
-      const absoluteResolved = path.join(process.cwd(), impPath.replace(/\./g, '/'));
-      const candidatePaths = [
-        relativeResolved + '.py',
-        path.join(relativeResolved, '__init__.py'),
-        absoluteResolved + '.py',
-        path.join(absoluteResolved, '__init__.py')
-      ];
-      for (const candidate of candidatePaths) {
-        if (fs.existsSync(candidate)) {
-          targetPath = path.relative(process.cwd(), candidate);
-          break;
-        }
-      }
+    const ext = path.extname(filePath);
+    const config = LSP_LANGUAGES[ext];
+    if (config && config.resolveImport) {
+      targetPath = config.resolveImport(filePath, impPath);
     } else {
       if (impPath.startsWith('.')) {
         const resolved = path.join(path.dirname(filePath), impPath);
@@ -539,7 +575,7 @@ async function trackAccessedFile(conn: any, toolName: string, toolInput: any) {
 async function reconcile(full = false) {
   const { db, conn } = getConn();
   const nowTs = Math.floor(Date.now() / 1000);
-  let pyClient: LspClient | null = null;
+  const activeLspClients = new Map<string, LspClient>();
 
   try {
     await setupDatabase();
@@ -548,11 +584,11 @@ async function reconcile(full = false) {
     let diskFiles: string[] = [];
     if (full) {
       diskFiles = getAllFiles();
-      filesToReconcile = diskFiles.filter(p => p.endsWith('.ts') || p.endsWith('.js') || p.endsWith('.py'));
+      filesToReconcile = diskFiles.filter(p => p.endsWith('.ts') || p.endsWith('.js') || Object.keys(LSP_LANGUAGES).some(ext => p.endsWith(ext)));
     } else {
       const statusMap = getGitStatus();
       filesToReconcile = statusMap
-        .filter(item => item.status !== 'D' && (item.path.endsWith('.ts') || item.path.endsWith('.js') || item.path.endsWith('.py')))
+        .filter(item => item.status !== 'D' && (item.path.endsWith('.ts') || item.path.endsWith('.js') || Object.keys(LSP_LANGUAGES).some(ext => item.path.endsWith(ext))))
         .map(item => item.path);
     }
 
@@ -615,25 +651,37 @@ async function reconcile(full = false) {
     const documentRegistry = ts.createDocumentRegistry();
     const service = ts.createLanguageService(servicesHost, documentRegistry);
 
-    // Initialize Pyright Language Server if Python files are present
-    const pyFiles = allDiskFiles.filter(p => p.endsWith('.py'));
-    if (pyFiles.length > 0) {
-      console.log("Launching Pyright Language Server...");
-      pyClient = new LspClient('npx', ['--package=pyright', 'pyright-langserver', '--stdio'], process.cwd());
-      await pyClient.initialize(process.cwd());
-      for (const pyFile of pyFiles) {
+    // Initialize active LSP clients for extensions present in reconciliation set
+    for (const file of filesToReconcile) {
+      const ext = path.extname(file);
+      const config = LSP_LANGUAGES[ext];
+      if (config && !activeLspClients.has(ext)) {
+        console.log(`Launching LSP Server for ${ext} (${config.languageId})...`);
+        const client = new LspClient(config.command, config.args, process.cwd());
+        await client.initialize(process.cwd());
+        activeLspClients.set(ext, client);
+      }
+    }
+
+    // Send didOpen notification to appropriate LSP clients for all matching workspace files
+    for (const [ext, client] of activeLspClients.entries()) {
+      const matchingDiskFiles = allDiskFiles.filter(p => p.endsWith(ext));
+      for (const diskFile of matchingDiskFiles) {
         try {
-          const content = fs.readFileSync(pyFile, 'utf-8');
-          pyClient.sendNotification('textDocument/didOpen', {
+          const content = fs.readFileSync(diskFile, 'utf-8');
+          client.sendNotification('textDocument/didOpen', {
             textDocument: {
-              uri: `file://${path.resolve(pyFile)}`,
-              languageId: 'python',
+              uri: `file://${path.resolve(diskFile)}`,
+              languageId: LSP_LANGUAGES[ext].languageId,
               version: 1,
               text: content
             }
           });
         } catch (e) {}
       }
+    }
+
+    if (activeLspClients.size > 0) {
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
@@ -647,17 +695,19 @@ async function reconcile(full = false) {
 
     for (const filePath of filesToReconcile) {
       try {
-        if (filePath.endsWith('.py')) {
-          if (pyClient) {
-            const result = await extractPythonEntities(filePath, pyClient);
-            parsedCache.set(filePath, {
-              classes: result.classes,
-              functions: result.functions,
-              imports: result.imports,
-              unresolvedCalls: result.unresolvedCalls,
-            });
-            entitiesInFiles.set(filePath, result.ranges);
-          }
+        const ext = path.extname(filePath);
+        const config = LSP_LANGUAGES[ext];
+        const lspClient = activeLspClients.get(ext);
+
+        if (config && lspClient) {
+          const result = await extractLspEntities(filePath, lspClient, config);
+          parsedCache.set(filePath, {
+            classes: result.classes,
+            functions: result.functions,
+            imports: result.imports,
+            unresolvedCalls: result.unresolvedCalls,
+          });
+          entitiesInFiles.set(filePath, result.ranges);
         } else {
           const content = fs.readFileSync(filePath, 'utf-8');
           const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
@@ -753,18 +803,18 @@ async function reconcile(full = false) {
 
     for (const [filePath, fileData] of parsedCache.entries()) {
       const absPath = path.resolve(filePath);
+      const ext = path.extname(filePath);
+      const lspClient = activeLspClients.get(ext);
       
       // 1. Resolve Calls
       for (const call of fileData.unresolvedCalls) {
         try {
           let defs: any = null;
-          if (filePath.endsWith('.py')) {
-            if (pyClient) {
-              defs = await pyClient.sendRequest('textDocument/definition', {
-                textDocument: { uri: `file://${absPath}` },
-                position: { line: call.line, character: call.col }
-              });
-            }
+          if (lspClient) {
+            defs = await lspClient.sendRequest('textDocument/definition', {
+              textDocument: { uri: `file://${absPath}` },
+              position: { line: call.line, character: call.col }
+            });
           } else {
             defs = service.getDefinitionAtPosition(absPath, call.pos);
           }
@@ -773,7 +823,7 @@ async function reconcile(full = false) {
             const defLocations = Array.isArray(defs) ? defs : [defs];
             if (defLocations.length > 0) {
               const def = defLocations[0];
-              if (filePath.endsWith('.py')) {
+              if (lspClient) {
                 if (def.uri.startsWith('file://')) {
                   const targetAbsPath = fileURLToPath(def.uri);
                   const relTarget = path.relative(process.cwd(), targetAbsPath);
@@ -835,14 +885,12 @@ async function reconcile(full = false) {
           for (const superclass of cls.superclasses) {
             try {
               let defs: any = null;
-              if (filePath.endsWith('.py')) {
-                if (pyClient) {
-                  const sClass = superclass as any;
-                  defs = await pyClient.sendRequest('textDocument/definition', {
-                    textDocument: { uri: `file://${absPath}` },
-                    position: { line: sClass.line, character: sClass.col }
-                  });
-                }
+              if (lspClient) {
+                const sClass = superclass as any;
+                defs = await lspClient.sendRequest('textDocument/definition', {
+                  textDocument: { uri: `file://${absPath}` },
+                  position: { line: sClass.line, character: sClass.col }
+                });
               } else {
                 const sClass = superclass as { name: string; pos: number };
                 defs = service.getDefinitionAtPosition(absPath, sClass.pos);
@@ -852,7 +900,7 @@ async function reconcile(full = false) {
                 const defLocations = Array.isArray(defs) ? defs : [defs];
                 if (defLocations.length > 0) {
                   const def = defLocations[0];
-                  if (filePath.endsWith('.py')) {
+                  if (lspClient) {
                     if (def.uri.startsWith('file://')) {
                       const targetAbsPath = fileURLToPath(def.uri);
                       const relTarget = path.relative(process.cwd(), targetAbsPath);
@@ -936,9 +984,9 @@ async function reconcile(full = false) {
     }
 
   } finally {
-    if (pyClient) {
+    for (const client of activeLspClients.values()) {
       try {
-        pyClient.stop();
+        client.stop();
       } catch (e) {}
     }
     await conn.close();
