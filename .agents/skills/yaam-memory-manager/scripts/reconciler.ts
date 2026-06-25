@@ -90,58 +90,146 @@ interface LspLangConfig {
   resolveImport?: (filePath: string, impPath: string) => string | null;
 }
 
-const LSP_LANGUAGES: Record<string, LspLangConfig> = {
-  '.py': {
-    languageId: 'python',
-    command: 'npx',
-    args: ['--package=pyright', 'pyright-langserver', '--stdio'],
-    callRegex: /\b([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\b\s*\(/g,
-    importRegexes: [
-      /^\s*import\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)/,
-      /^\s*from\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\s+import/
-    ],
-    defKeywords: ['def', 'class'],
-    extractSuperclasses: (line: string, startLineIdx: number) => {
-      const classMatch = line.match(/class\s+(\w+)\s*\(([^)]+)\)/);
-      if (!classMatch) return [];
-      const superclassesStr = classMatch[2];
-      const baseOffset = line.indexOf(superclassesStr);
-      const parts = superclassesStr.split(',');
-      let currentOffset = baseOffset;
-      const superclasses: any[] = [];
-      for (const part of parts) {
-        const trimmed = part.trim();
-        if (trimmed) {
-          const partIndex = part.indexOf(trimmed);
-          const startChar = currentOffset + partIndex;
-          superclasses.push({
-            name: trimmed,
-            line: startLineIdx,
-            col: startChar
-          });
-        }
-        currentOffset += part.length + 1;
+function loadSettings(): {
+  frequency: string;
+  languages: Record<string, { extensions: string[]; command: string; args: string[] }>;
+} {
+  const defaults = {
+    frequency: 'incremental',
+    languages: {
+      python: {
+        extensions: ['.py'],
+        command: 'npx',
+        args: ['--package=pyright', 'pyright-langserver', '--stdio']
       }
-      return superclasses;
-    },
-    resolveImport: (filePath: string, impPath: string) => {
-      const relativeResolved = path.join(path.dirname(filePath), impPath.replace(/\./g, '/'));
-      const absoluteResolved = path.join(process.cwd(), impPath.replace(/\./g, '/'));
-      const candidatePaths = [
-        relativeResolved + '.py',
-        path.join(relativeResolved, '__init__.py'),
-        absoluteResolved + '.py',
-        path.join(absoluteResolved, '__init__.py')
-      ];
-      for (const candidate of candidatePaths) {
-        if (fs.existsSync(candidate)) {
-          return path.relative(process.cwd(), candidate);
+    }
+  };
+
+  let merged = { ...defaults };
+
+  const paths = [
+    path.join(process.env.HOME || '', '.pi', 'agent', 'settings.json'),
+    path.join(process.cwd(), '.pi', 'settings.json')
+  ];
+
+  for (const settingsPath of paths) {
+    if (fs.existsSync(settingsPath)) {
+      try {
+        const raw = fs.readFileSync(settingsPath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed.yaam) {
+          merged = {
+            ...merged,
+            ...parsed.yaam,
+            languages: {
+              ...(merged.languages || {}),
+              ...(parsed.yaam.languages || {})
+            }
+          };
         }
-      }
-      return null;
+      } catch (e) {}
     }
   }
-};
+
+  if (process.env.YAAM_SETTINGS) {
+    try {
+      const parsed = JSON.parse(process.env.YAAM_SETTINGS);
+      if (parsed) {
+        merged = {
+          ...merged,
+          ...parsed,
+          languages: {
+            ...(merged.languages || {}),
+            ...(parsed.languages || {})
+          }
+        };
+      }
+    } catch (e) {}
+  }
+
+  return merged;
+}
+
+function getLspLanguages(): Record<string, LspLangConfig> {
+  const settings = loadSettings();
+  const registry: Record<string, LspLangConfig> = {};
+
+  const defaultTemplates: Record<string, Partial<LspLangConfig>> = {
+    'python': {
+      callRegex: /\b([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\b\s*\(/g,
+      importRegexes: [
+        /^\s*import\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)/,
+        /^\s*from\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\s+import/
+      ],
+      defKeywords: ['def', 'class'],
+      extractSuperclasses: (line: string, startLineIdx: number) => {
+        const classMatch = line.match(/class\s+(\w+)\s*\(([^)]+)\)/);
+        if (!classMatch) return [];
+        const superclassesStr = classMatch[2];
+        const baseOffset = line.indexOf(superclassesStr);
+        const parts = superclassesStr.split(',');
+        let currentOffset = baseOffset;
+        const superclasses: any[] = [];
+        for (const part of parts) {
+          const trimmed = part.trim();
+          if (trimmed) {
+            const partIndex = part.indexOf(trimmed);
+            const startChar = currentOffset + partIndex;
+            superclasses.push({
+              name: trimmed,
+              line: startLineIdx,
+              col: startChar
+            });
+          }
+          currentOffset += part.length + 1;
+        }
+        return superclasses;
+      },
+      resolveImport: (filePath: string, impPath: string) => {
+        const relativeResolved = path.join(path.dirname(filePath), impPath.replace(/\./g, '/'));
+        const absoluteResolved = path.join(process.cwd(), impPath.replace(/\./g, '/'));
+        const candidatePaths = [
+          relativeResolved + '.py',
+          path.join(relativeResolved, '__init__.py'),
+          absoluteResolved + '.py',
+          path.join(absoluteResolved, '__init__.py')
+        ];
+        for (const candidate of candidatePaths) {
+          if (fs.existsSync(candidate)) {
+            return path.relative(process.cwd(), candidate);
+          }
+        }
+        return null;
+      }
+    }
+  };
+
+  if (settings.languages) {
+    for (const [langName, langConfig] of Object.entries(settings.languages)) {
+      const template = defaultTemplates[langName] || {
+        callRegex: /\b([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\b\s*\(/g,
+        importRegexes: [],
+      };
+
+      for (const ext of langConfig.extensions) {
+        registry[ext] = {
+          languageId: langName,
+          command: langConfig.command,
+          args: langConfig.args,
+          callRegex: template.callRegex!,
+          importRegexes: template.importRegexes || [],
+          defKeywords: template.defKeywords,
+          extractSuperclasses: template.extractSuperclasses,
+          resolveImport: template.resolveImport
+        };
+      }
+    }
+  }
+
+  return registry;
+}
+
+const LSP_LANGUAGES = getLspLanguages();
 
 function isPositionInRange(
   pos: { line: number; character: number },

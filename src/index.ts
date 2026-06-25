@@ -2,22 +2,74 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as path from "path";
 import { exec } from "child_process";
 import * as util from "util";
+import { fileURLToPath } from "url";
 
 const execPromise = util.promisify(exec);
 
 export default function yaamExtension(pi: ExtensionAPI) {
+  const epi = pi as any;
+
+  // Register configuration schema for TUI
+  epi.settings.register({
+    namespace: "yaam",
+    schema: {
+      type: "object",
+      properties: {
+        frequency: {
+          type: "string",
+          enum: ["incremental", "boundaries", "disabled"],
+          default: "incremental",
+          description: "Reconciliation frequency: incremental (after tool use), boundaries (end of turns), or disabled"
+        },
+        languages: {
+          type: "object",
+          description: "Language Server configurations by language name",
+          additionalProperties: {
+            type: "object",
+            properties: {
+              extensions: {
+                type: "array",
+                items: { type: "string" }
+              },
+              command: { type: "string" },
+              args: {
+                type: "array",
+                items: { type: "string" }
+              }
+            },
+            required: ["extensions", "command", "args"]
+          }
+        }
+      }
+    },
+    defaults: {
+      frequency: "incremental",
+      languages: {
+        python: {
+          extensions: [".py"],
+          command: "npx",
+          args: ["--package=pyright", "pyright-langserver", "--stdio"]
+        }
+      }
+    }
+  });
+
   async function runReconciler(full: boolean = false) {
     try {
-      const reconcilerPath = path.join(
-        process.cwd(),
-        ".agents",
-        "skills",
-        "yaam-memory-manager",
-        "scripts",
-        "reconciler.ts"
+      const filename = fileURLToPath(import.meta.url);
+      const dirname = path.dirname(filename);
+      const reconcilerPath = path.resolve(
+        dirname,
+        "../.agents/skills/yaam-memory-manager/scripts/reconciler.ts"
       );
+      const config = epi.settings.get("yaam");
       const cmd = `npx tsx "${reconcilerPath}"${full ? " --full" : ""} < /dev/null`;
-      await execPromise(cmd);
+      await execPromise(cmd, {
+        env: {
+          ...process.env,
+          YAAM_SETTINGS: JSON.stringify(config)
+        }
+      });
     } catch (e) {
       console.error("YAAM reconciler failed:", e);
     }
@@ -25,11 +77,17 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
   // Hook into tool_result to automatically run incremental reconciliation
   pi.on("tool_result", async (event: any, ctx: any) => {
-    await runReconciler(false);
+    const config = epi.settings.get("yaam") || {};
+    if (config.frequency === "incremental") {
+      await runReconciler(false);
+    }
   });
 
   // Hook into agent_end to automatically run full reconciliation
   pi.on("agent_end", async (event: any, ctx: any) => {
-    await runReconciler(true);
+    const config = epi.settings.get("yaam") || {};
+    if (config.frequency !== "disabled") {
+      await runReconciler(true);
+    }
   });
 }
