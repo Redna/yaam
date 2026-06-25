@@ -54,7 +54,10 @@ export default function yaamExtension(pi: ExtensionAPI) {
     }
   });
 
-  async function runReconciler(full: boolean = false) {
+  async function runReconciler(full: boolean = false, ctx?: any) {
+    if (ctx && ctx.ui && typeof ctx.ui.setStatus === "function") {
+      ctx.ui.setStatus("yaam", "Syncing 🔄");
+    }
     try {
       const filename = fileURLToPath(import.meta.url);
       const dirname = path.dirname(filename);
@@ -70,16 +73,35 @@ export default function yaamExtension(pi: ExtensionAPI) {
           YAAM_SETTINGS: JSON.stringify(config)
         }
       });
+      if (ctx && ctx.ui && typeof ctx.ui.setStatus === "function") {
+        ctx.ui.setStatus("yaam", "Synced ✅");
+      }
     } catch (e) {
       console.error("YAAM reconciler failed:", e);
+      if (ctx && ctx.ui && typeof ctx.ui.setStatus === "function") {
+        ctx.ui.setStatus("yaam", "Sync Error ❌");
+      }
     }
   }
+
+  // Initialize status on session and turn starts
+  pi.on("turn_start", async (event: any, ctx: any) => {
+    if (ctx && ctx.ui && typeof ctx.ui.setStatus === "function") {
+      ctx.ui.setStatus("yaam", "Idle 💤");
+    }
+  });
+
+  pi.on("session_start", async (event: any, ctx: any) => {
+    if (ctx && ctx.ui && typeof ctx.ui.setStatus === "function") {
+      ctx.ui.setStatus("yaam", "Idle 💤");
+    }
+  });
 
   // Hook into tool_result to automatically run incremental reconciliation
   pi.on("tool_result", async (event: any, ctx: any) => {
     const config = epi.settings.get("yaam") || {};
     if (config.frequency === "incremental") {
-      await runReconciler(false);
+      await runReconciler(false, ctx);
     }
   });
 
@@ -87,7 +109,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
   pi.on("agent_end", async (event: any, ctx: any) => {
     const config = epi.settings.get("yaam") || {};
     if (config.frequency !== "disabled") {
-      await runReconciler(true);
+      await runReconciler(true, ctx);
     }
   });
 }
