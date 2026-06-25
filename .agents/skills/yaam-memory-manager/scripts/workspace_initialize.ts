@@ -1,8 +1,12 @@
-import { getConn, setupDatabase } from './db';
+import { getConn, setupDatabase } from './db.js';
 import { Command } from 'commander';
 import { exec } from 'child_process';
 import * as path from 'path';
 import * as util from 'util';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const execPromise = util.promisify(exec);
 

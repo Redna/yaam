@@ -1,9 +1,13 @@
-import { getConn, setupDatabase } from './db';
+import { getConn, setupDatabase } from './db.js';
 import { Command } from 'commander';
 import { exec } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as util from 'util';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const execPromise = util.promisify(exec);
 
@@ -44,7 +48,7 @@ async function main() {
 
       const { db, conn } = getConn();
       try {
-        const queryResult = await conn.query(constrainedQuery);
+        const queryResult = (await conn.query(constrainedQuery)) as any;
         const rows = await queryResult.getAll();
 
         if (rows.length === 0) {
@@ -59,7 +63,7 @@ async function main() {
           }
           const outputFile = path.join(tmpDir, 'query_out.txt');
           const fileContent = `Source Query: ${query}\n${"=".repeat(40)}\n` + 
-            rows.map(r => JSON.stringify(r)).join("\n");
+            rows.map((r: any) => JSON.stringify(r)).join("\n");
           fs.writeFileSync(outputFile, fileContent, "utf-8");
           console.log(`SUCCESS: Query returned ${rows.length} rows. Results spooled to: '${outputFile}'.`);
           return;

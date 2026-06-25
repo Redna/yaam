@@ -1,9 +1,19 @@
 {
-  "name": "yaam-extension",
+  "name": "pi-yaam",
   "version": "1.0.0",
   "description": "Yet Another Agent Memory pi.dev extension and Antigravity skill",
-  "main": ".pi/extensions/yaam/index.ts",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
     "graph_explore": "tsx .agents/skills/yaam-memory-manager/scripts/graph_explore.ts",
     "workspace_initialize": "tsx .agents/skills/yaam-memory-manager/scripts/workspace_initialize.ts",
     "workspace_append_note": "tsx .agents/skills/yaam-memory-manager/scripts/workspace_append_note.ts"
@@ -13,8 +23,12 @@
     "commander": "^12.1.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.2",
     "@types/node": "^20.14.9",
     "tsx": "^4.15.7",
     "typescript": "^5.5.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0 || ^0.75.0 || ^0.78.0 || ^0.79.0"
   }
 }

@@ -1,9 +1,10 @@
-import { getConn, setupDatabase } from './db';
+import { getConn, setupDatabase } from './db.js';
 import { Command } from 'commander';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
+import { fileURLToPath } from 'url';
 
 function getGitStatus(): { status: string; path: string }[] {
   try {
@@ -359,11 +360,11 @@ async function reconcile(full = false) {
     try {
       const prepFunc = await conn.prepare("MATCH (f:Entity {type: 'Function', status: 'active'}) RETURN f.id");
       const resFunc = await conn.execute(prepFunc);
-      existingFuncs = (await resFunc.getAll()).map((r: any) => r['f.id']);
+      existingFuncs = (await (resFunc as any).getAll()).map((r: any) => r['f.id']);
 
       const prepClass = await conn.prepare("MATCH (c:Entity {type: 'Class', status: 'active'}) RETURN c.id");
       const resClass = await conn.execute(prepClass);
-      existingClasses = (await resClass.getAll()).map((r: any) => r['c.id']);
+      existingClasses = (await (resClass as any).getAll()).map((r: any) => r['c.id']);
     } catch (e) {}
 
     const reconcilePrefixes = filesToReconcile.map(p => `${p}::`);
@@ -426,7 +427,7 @@ async function reconcile(full = false) {
       try {
         const prep = await conn.prepare("MATCH (e:Entity {type: 'File'}) RETURN e.id");
         const res = await conn.execute(prep);
-        dbFiles = (await res.getAll()).map((r: any) => r['e.id']);
+        dbFiles = (await (res as any).getAll()).map((r: any) => r['e.id']);
       } catch (e) {}
 
       const diskFilesSet = new Set(diskFiles);
@@ -527,6 +528,7 @@ async function main() {
   }
 }
 
-if (require.main === module) {
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMain) {
   main();
 }

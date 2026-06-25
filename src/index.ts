@@ -5,7 +5,7 @@ import * as util from "util";
 
 const execPromise = util.promisify(exec);
 
-export default function (pi: ExtensionAPI) {
+export default function yaamExtension(pi: ExtensionAPI) {
   async function runReconciler(full: boolean = false) {
     try {
       const reconcilerPath = path.join(
@@ -24,12 +24,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Hook into turn_end to automatically run incremental reconciliation
-  pi.on("turn_end", async (event, ctx) => {
+  pi.on("turn_end", async (event: any, ctx: any) => {
     await runReconciler(false);
   });
 
   // Hook into agent_end to automatically run full reconciliation
-  pi.on("agent_end", async (event, ctx) => {
+  pi.on("agent_end", async (event: any, ctx: any) => {
     await runReconciler(true);
   });
 }
