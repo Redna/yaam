@@ -5,7 +5,7 @@
         "command": "npx",
         "args": [
           "tsx",
-          "/home/anima/yaam/.agents/skills/yaam-memory-manager/scripts/reconciler.ts"
+          "/home/anima/yaam/skills/yaam-memory-manager/scripts/reconciler.ts"
         ]
       }
     ]
