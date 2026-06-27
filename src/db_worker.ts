@@ -38,7 +38,9 @@ async function safeOpenDatabase(dbPath: string): Promise<any> {
     }
   }
 
-  return new ladybug.Database(dbPath);
+  // Default buffer pool is ~8TB which causes Mmap failures.
+  // 256MB is plenty for YAAM's graph size.
+  return new ladybug.Database(dbPath, 256 * 1024 * 1024);
 }
 
 process.on('message', async (msg: any) => {
@@ -92,7 +94,11 @@ process.on('message', async (msg: any) => {
     }
   } catch (err: any) {
     if (process.connected && process.send) {
-      try { process.send({ id: msg.id, success: false, error: err.message || String(err) }); } catch (e) { process.exit(1); }
+      try { 
+        process.send({ id: msg.id, success: false, error: err.message || String(err) }, (e) => {
+          if (e) process.exit(1);
+        }); 
+      } catch (e) { process.exit(1); }
     } else {
       process.exit(1);
     }
@@ -102,7 +108,11 @@ process.on('message', async (msg: any) => {
 // Helper for safe sends
 function safeSend(payload: any) {
   if (process.connected && process.send) {
-    try { process.send(payload); } catch (e) { process.exit(1); }
+    try { 
+      process.send(payload, (e) => {
+        if (e) process.exit(1);
+      }); 
+    } catch (e) { process.exit(1); }
   } else {
     process.exit(1);
   }

@@ -111,6 +111,16 @@ export class ConnectionManager {
       }
     });
 
+    this.worker.on('error', (err: Error) => {
+      // IPC channel errors (EPIPE, etc.) — don't let these crash the process
+      this.worker = null;
+      const e = new Error(`Worker IPC error: ${err.message}`);
+      for (const req of this.pendingRequests.values()) {
+        req.reject(e);
+      }
+      this.pendingRequests.clear();
+    });
+
     this.worker.on('exit', (code, signal) => {
       this.worker = null;
       const err = new Error(`Worker exited with code ${code} signal ${signal}`);
@@ -126,7 +136,17 @@ export class ConnectionManager {
       if (!this.worker) this.startWorker();
       const id = this.msgId++;
       this.pendingRequests.set(id, { resolve, reject });
-      this.worker!.send({ ...msg, id });
+      try {
+        this.worker!.send({ ...msg, id }, (err) => {
+          if (err) {
+            this.pendingRequests.delete(id);
+            reject(err);
+          }
+        });
+      } catch (e) {
+        this.pendingRequests.delete(id);
+        reject(e);
+      }
     });
   }
 
@@ -164,6 +184,10 @@ export class ConnectionManager {
           const result = await fn(connProxy);
           
           await this.sendRequest({ action: 'close' });
+          // Kill worker to release its buffer pool mmap. If the worker
+          // is reused, stale mmap pages from the previous DB cause IO
+          // exceptions on the next open.
+          this.killWorker();
           return result;
         } catch (e: any) {
           const errMsg = String(e).toLowerCase();
@@ -172,11 +196,13 @@ export class ConnectionManager {
           
           if (!isLockError && !isCrash) {
             try { await this.sendRequest({ action: 'close' }); } catch {}
+            this.killWorker();
             throw e;
           }
           
           lastError = e;
           try { await this.sendRequest({ action: 'close' }); } catch {}
+          this.killWorker();
           
           const delay = Math.min(50 * Math.pow(2, attempt), 2000);
           await sleep(delay);
@@ -185,6 +211,15 @@ export class ConnectionManager {
       throw lastError || new Error("Failed to acquire DB lock after max retries");
     } finally {
       this.mutex.unlock();
+    }
+  }
+
+  /** Kill the worker process to release its buffer pool. */
+  private killWorker(): void {
+    if (this.worker) {
+      try { this.worker.kill('SIGTERM'); } catch {}
+      this.worker = null;
+      this.pendingRequests.clear();
     }
   }
 }

@@ -71,7 +71,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
     const toolInput = (event as any).input;
 
     // Schedule background reconcile + file tracking (non-blocking)
-    if (["read", "write", "edit", "bash"].includes(toolName)) {
+    if (["write", "edit", "bash"].includes(toolName)) {
       startStatusPolling(ctx);
       reconciler.scheduleIncremental(connMgr, { toolName, toolInput });
     }

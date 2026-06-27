@@ -813,7 +813,24 @@ export class Reconciler {
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       // ─── Phase 1: Parse (NO DB LOCK) ──────────────────────────────
-      const result = await this.parseCodebase(mode === 'full', fileAccess);
+      const dbFileTimestamps = new Map<string, number>();
+      if (mode === 'full') {
+        try {
+          await connMgr.withConnection(async (conn) => {
+            try {
+              const res = await conn.query("MATCH (e:Entity {type: 'File'}) RETURN e.id, e.last_modified");
+              const rows = await res.getAll();
+              for (const row of rows) {
+                dbFileTimestamps.set(row['e.id'], Number(row['e.last_modified']));
+              }
+            } catch (e) {
+              console.error("Failed to load db file timestamps", e);
+            }
+          });
+        } catch {}
+      }
+
+      const result = await this.parseCodebase(mode === 'full', fileAccess, dbFileTimestamps);
 
       // ─── Phase 2: Commit (BRIEF DB LOCK with backoff) ──────────────
       await connMgr.withConnection(async (conn) => {
@@ -833,19 +850,30 @@ export class Reconciler {
 
   private async parseCodebase(
     full: boolean,
-    fileAccess: { toolName: string; toolInput: any } | null
+    fileAccess: { toolName: string; toolInput: any } | null,
+    dbFileTimestamps: Map<string, number>
   ): Promise<ReconcileResult> {
     let filesToReconcile: string[] = [];
     const diskFiles = getAllFiles();
     const gitStatus = await getGitStatus();
 
     if (full) {
-      filesToReconcile = diskFiles.filter(
-        (p) =>
-          p.endsWith('.ts') ||
-          p.endsWith('.js') ||
-          Object.keys(LSP_LANGUAGES).some((ext) => p.endsWith(ext))
-      );
+      filesToReconcile = diskFiles.filter((p) => {
+        if (!(p.endsWith('.ts') || p.endsWith('.js') || Object.keys(LSP_LANGUAGES).some((ext) => p.endsWith(ext)))) {
+          return false;
+        }
+        try {
+          const stat = fs.statSync(p);
+          const mtimeSec = Math.floor(stat.mtimeMs / 1000);
+          const dbTime = dbFileTimestamps.get(p);
+          if (dbTime && mtimeSec <= dbTime) {
+            return false;
+          }
+          return true;
+        } catch {
+          return true;
+        }
+      });
     } else {
       filesToReconcile = gitStatus
         .filter(
