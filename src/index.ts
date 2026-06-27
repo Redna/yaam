@@ -88,7 +88,41 @@ export default function yaamExtension(pi: ExtensionAPI) {
     name: "yaam_graph_explore",
     label: "YAAM Graph Explore",
     description:
-      "Executes a read-only Cypher query to explore code relationships (Layer 0) and agent memories (Layer 1) in LadybugDB.",
+      `Executes a read-only Cypher query to explore code relationships (Layer 0)
+and agent memories (Layer 1) in LadybugDB.
+
+SCHEMA:
+  Nodes:    Entity(id, type, status, last_modified, metadata)
+            Workspace(workspace_name, description, status, closed_at)
+            Scratchpad(id, content, created_at)
+  Edges:    -[:LINKED_TO {relationship_type}]->     (Entity → Entity)
+            -[:MAPPED_TO {created_at, is_stale}]->  (Workspace → Entity)
+            -[:HAS_SCRATCHPAD]->                    (Workspace → Scratchpad)
+
+  Entity.type = "File" | "Function" | "Class"
+  Entity.id format: "path/to/file.ts" or "path/to/file.ts::functionName"
+  Entity.metadata = JSON string like {"line": 42} (Functions/Classes only)
+  LINKED_TO.relationship_type = "CALLS" | "DECLARED_IN" | "IMPORTS" | "INHERITS_FROM"
+
+EXAMPLES:
+  -- Find all functions in a file:
+  MATCH (f:Entity)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file:Entity {type: 'File'})
+  WHERE file.id CONTAINS 'db.ts' RETURN f.id
+
+  -- Trace who calls a function (reverse call graph):
+  MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity)
+  WHERE callee.id CONTAINS 'getConn' RETURN caller.id
+
+  -- Multi-hop impact analysis:
+  MATCH path = (src:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}*1..3]->(dst:Entity)
+  WHERE src.id CONTAINS 'reconcile' RETURN src.id, dst.id, length(path)
+
+PITFALLS:
+  - \`type(r)\` does NOT work. Use \`r.relationship_type\` instead.
+  - Property access is strict: accessing \`n.prop\` throws a Binder exception
+    if \`prop\` doesn't exist on ALL matched nodes. Use \`keys(n)\` to discover
+    available properties first.
+  - Results > 20 rows are spooled to \`.chunks/memory_dumps/query_out.txt\`.`,
     promptSnippet: "Query YAAM memory graph with Cypher (read-only)",
     promptGuidelines: [
       "Use yaam_graph_explore to query the YAAM memory graph before making architectural changes. It tracks files, functions, classes, call graphs, inheritance, and workspace scratchpads.",
@@ -120,7 +154,41 @@ export default function yaamExtension(pi: ExtensionAPI) {
     name: "yaam_workspace_initialize",
     label: "YAAM Workspace Initialize",
     description:
-      "Initializes a new workspace context in YAAM memory for task tracking. Deactivates any existing active workspace.",
+      `Executes a read-only Cypher query to explore code relationships (Layer 0)
+and agent memories (Layer 1) in LadybugDB.
+
+SCHEMA:
+  Nodes:    Entity(id, type, status, last_modified, metadata)
+            Workspace(workspace_name, description, status, closed_at)
+            Scratchpad(id, content, created_at)
+  Edges:    -[:LINKED_TO {relationship_type}]->     (Entity → Entity)
+            -[:MAPPED_TO {created_at, is_stale}]->  (Workspace → Entity)
+            -[:HAS_SCRATCHPAD]->                    (Workspace → Scratchpad)
+
+  Entity.type = "File" | "Function" | "Class"
+  Entity.id format: "path/to/file.ts" or "path/to/file.ts::functionName"
+  Entity.metadata = JSON string like {"line": 42} (Functions/Classes only)
+  LINKED_TO.relationship_type = "CALLS" | "DECLARED_IN" | "IMPORTS" | "INHERITS_FROM"
+
+EXAMPLES:
+  -- Find all functions in a file:
+  MATCH (f:Entity)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file:Entity {type: 'File'})
+  WHERE file.id CONTAINS 'db.ts' RETURN f.id
+
+  -- Trace who calls a function (reverse call graph):
+  MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity)
+  WHERE callee.id CONTAINS 'getConn' RETURN caller.id
+
+  -- Multi-hop impact analysis:
+  MATCH path = (src:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}*1..3]->(dst:Entity)
+  WHERE src.id CONTAINS 'reconcile' RETURN src.id, dst.id, length(path)
+
+PITFALLS:
+  - \`type(r)\` does NOT work. Use \`r.relationship_type\` instead.
+  - Property access is strict: accessing \`n.prop\` throws a Binder exception
+    if \`prop\` doesn't exist on ALL matched nodes. Use \`keys(n)\` to discover
+    available properties first.
+  - Results > 20 rows are spooled to \`.chunks/memory_dumps/query_out.txt\`.`,
     promptSnippet: "Initialize a YAAM workspace for task tracking",
     promptGuidelines: [
       "Use yaam_workspace_initialize at the start of a new feature or refactor to create a task context for recording decisions.",
@@ -158,7 +226,41 @@ export default function yaamExtension(pi: ExtensionAPI) {
     name: "yaam_workspace_append_note",
     label: "YAAM Workspace Append Note",
     description:
-      "Appends a new insight or note to the active workspace scratchpad in YAAM memory.",
+      `Executes a read-only Cypher query to explore code relationships (Layer 0)
+and agent memories (Layer 1) in LadybugDB.
+
+SCHEMA:
+  Nodes:    Entity(id, type, status, last_modified, metadata)
+            Workspace(workspace_name, description, status, closed_at)
+            Scratchpad(id, content, created_at)
+  Edges:    -[:LINKED_TO {relationship_type}]->     (Entity → Entity)
+            -[:MAPPED_TO {created_at, is_stale}]->  (Workspace → Entity)
+            -[:HAS_SCRATCHPAD]->                    (Workspace → Scratchpad)
+
+  Entity.type = "File" | "Function" | "Class"
+  Entity.id format: "path/to/file.ts" or "path/to/file.ts::functionName"
+  Entity.metadata = JSON string like {"line": 42} (Functions/Classes only)
+  LINKED_TO.relationship_type = "CALLS" | "DECLARED_IN" | "IMPORTS" | "INHERITS_FROM"
+
+EXAMPLES:
+  -- Find all functions in a file:
+  MATCH (f:Entity)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file:Entity {type: 'File'})
+  WHERE file.id CONTAINS 'db.ts' RETURN f.id
+
+  -- Trace who calls a function (reverse call graph):
+  MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity)
+  WHERE callee.id CONTAINS 'getConn' RETURN caller.id
+
+  -- Multi-hop impact analysis:
+  MATCH path = (src:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}*1..3]->(dst:Entity)
+  WHERE src.id CONTAINS 'reconcile' RETURN src.id, dst.id, length(path)
+
+PITFALLS:
+  - \`type(r)\` does NOT work. Use \`r.relationship_type\` instead.
+  - Property access is strict: accessing \`n.prop\` throws a Binder exception
+    if \`prop\` doesn't exist on ALL matched nodes. Use \`keys(n)\` to discover
+    available properties first.
+  - Results > 20 rows are spooled to \`.chunks/memory_dumps/query_out.txt\`.`,
     promptSnippet: "Record an insight or decision to YAAM workspace",
     promptGuidelines: [
       "Use yaam_workspace_append_note to record 'why' decisions and architectural rationale, not just 'what' was done.",

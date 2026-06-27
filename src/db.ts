@@ -184,10 +184,8 @@ export class ConnectionManager {
           const result = await fn(connProxy);
           
           await this.sendRequest({ action: 'close' });
-          // Kill worker to release its buffer pool mmap. If the worker
-          // is reused, stale mmap pages from the previous DB cause IO
-          // exceptions on the next open.
-          this.killWorker();
+          // Reuse worker for next call — no fork overhead.
+          // Worker is only killed on error (see catch blocks below).
           return result;
         } catch (e: any) {
           const errMsg = String(e).toLowerCase();
@@ -196,12 +194,16 @@ export class ConnectionManager {
           
           if (!isLockError && !isCrash) {
             try { await this.sendRequest({ action: 'close' }); } catch {}
+            // Non-retryable error (IO exception, corrupt DB, etc.).
+            // Kill worker so next call gets a fresh process with clean
+            // buffer pool — stale mmap pages cause cascading corruption.
             this.killWorker();
             throw e;
           }
           
           lastError = e;
           try { await this.sendRequest({ action: 'close' }); } catch {}
+          // Worker may be in a bad state after a crash/lock — restart it.
           this.killWorker();
           
           const delay = Math.min(50 * Math.pow(2, attempt), 2000);
@@ -214,10 +216,14 @@ export class ConnectionManager {
     }
   }
 
-  /** Kill the worker process to release its buffer pool. */
+  /** Kill the worker process to release its buffer pool.
+   * SIGKILL is used because SIGTERM doesn't reliably kill forked
+   * processes that have an active IPC channel. This is safe because
+   * killWorker() is only called AFTER the 'close' response confirms
+   * that CHECKPOINT + conn.close() + db.close() have all completed. */
   private killWorker(): void {
     if (this.worker) {
-      try { this.worker.kill('SIGTERM'); } catch {}
+      try { this.worker.kill('SIGKILL'); } catch {}
       this.worker = null;
       this.pendingRequests.clear();
     }

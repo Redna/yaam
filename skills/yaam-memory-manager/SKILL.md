@@ -27,63 +27,81 @@ The reconciler runs in the background (fire-and-forget):
 When starting a new feature or bug fix, always initialize a workspace to group your thoughts.
 - **Tool:** `yaam_workspace_initialize(name, description)`
 - **Guideline:** Use descriptive names like `auth-fix` or `ui-refactor`.
+- **Note:** This deactivates any previously active workspace. Only one workspace can be active at a time.
 
 ### 2. Recording Insights
 As you discover nuances or make decisions, record them in the scratchpad.
 - **Tool:** `yaam_workspace_append_note(workspace, content)`
-- **Guideline:** Record "why" decisions, not just "what" was done.
+- **Guideline:** Record "why" decisions, not just "what" was done. Notes persist across sessions.
 
 ### 3. Exploring Relationships
 To understand how code components are linked, query the graph.
 - **Tool:** `yaam_graph_explore(query)`
-- **Example Queries:**
-
-```cypher
--- Entity counts
-MATCH (n:Entity) RETURN n.type, count(n) AS count ORDER BY count DESC
-
--- Import dependencies
-MATCH (src:Entity {type: 'File'})-[:LINKED_TO {relationship_type: 'IMPORTS'}]->(dst:Entity {type: 'File'}) RETURN src.id, dst.id
-
--- Call graph
-MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity) RETURN caller.id, callee.id
-
--- Inheritance
-MATCH (sub:Entity)-[:LINKED_TO {relationship_type: 'INHERITS_FROM'}]->(sup:Entity) RETURN sub.id, sup.id
-
--- Files tracked to active workspace
-MATCH (w:Workspace {status: 'active'})-[:MAPPED_TO]->(e:Entity) RETURN e.id, e.type
-```
+- The tool description includes an inline schema and examples for quick reference.
+- Detailed query patterns are documented below in **Query Cookbook**.
 
 ### 4. Checking Status
 Run the `/yaam` command to see entity counts, active workspace, recent notes, and reconciler state.
 
-## Graph Schema
+## Complete Graph Schema
 
-### Node Tables
-| Table | Key | Description |
-|-------|-----|-------------|
-| `Entity` | `id` | Files, Functions, Classes |
-| `Workspace` | `workspace_name` | Task contexts |
-| `Scratchpad` | `id` | Notes/insights |
+### Node Properties
 
-### Relationship Tables
-| Table | Description |
-|-------|-------------|
-| `LINKED_TO` | `relationship_type`: CALLS, DECLARED_IN, IMPORTS, INHERITS_FROM |
-| `MAPPED_TO` | Workspace → Entity (file tracking) |
-| `HAS_SCRATCHPAD` | Workspace → Scratchpad |
+**Entity** — code constructs (files, functions, classes)
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | string | Hierarchical path identifier (see ID Format below) |
+| `type` | string | `"File"`, `"Function"`, or `"Class"` |
+| `status` | string | `"active"` (entity exists in codebase) |
+| `last_modified` | int | Unix timestamp of last reconciliation |
+| `metadata` | string (JSON) | `{"line": N}` for Functions/Classes; `null` for Files |
+
+**Workspace** — task contexts
+| Property | Type | Description |
+|----------|------|-------------|
+| `workspace_name` | string | Unique identifier (e.g. `"auth-fix"`) |
+| `description` | string | Human-readable task description |
+| `status` | string | `"active"` or `"inactive"` |
+| `closed_at` | timestamp | When workspace was closed; `null` if still open |
+
+**Scratchpad** — notes/insights
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | string | Unique identifier |
+| `content` | string | The note text |
+| `created_at` | timestamp | When the note was written |
+
+### Relationship Properties
+
+**`LINKED_TO`** — Entity → Entity (code relationships)
+| Property | Type | Description |
+|----------|------|-------------|
+| `relationship_type` | string | `"CALLS"`, `"DECLARED_IN"`, `"IMPORTS"`, `"INHERITS_FROM"` |
+
+> This is the ONLY property on `LINKED_TO` edges. Do not access other properties on these edges.
+
+**`MAPPED_TO`** — Workspace → Entity (files tracked to a workspace)
+| Property | Type | Description |
+|----------|------|-------------|
+| `created_at` | timestamp | When the mapping was established |
+| `invalidated_at` | timestamp | When the mapping became stale; `null` if still valid |
+| `is_stale` | bool | Whether this mapping is stale |
+
+**`HAS_SCRATCHPAD`** — Workspace → Scratchpad
+> No properties on these edges.
 
 ### Entity ID Format
+
 | Type | Format | Example |
 |------|--------|---------|
 | File | `<path>` | `src/index.ts` |
 | Function | `<file>::<function>` | `src/db.ts::sleep` |
 | Method | `<file>::<Class>::<method>` | `src/db.ts::ConnectionManager::withConnection` |
+| Callback | `<file>::<parent>::<callback>` | `src/db.ts::main::action() callback` |
 | Class | `<file>::<Class>` | `test_py/a.py::DerivedClass` |
 
-## Guardrails
-- **Read-Only:** `yaam_graph_explore` is strictly read-only. Write operations (CREATE, MERGE, SET, DELETE, etc.) are blocked.
-- **Context Protection:** Results > 20 rows are spooled to `.chunks/memory_dumps/query_out.txt`. Read that file if directed.
-- **Memory Decay:** Older notes lose relevance. Focus on the most recent context returned by retrieval tools.
-- **Multi-Agent:** Multiple agents share the same database. Lock contention is handled via exponential backoff.
+> Nested callbacks and closures are tracked hierarchically: `file::outerFn::innerFn::callback`. This lets you trace callback scope chains.
+
+## Query Cookbook
+
+### Entity Discovery
