@@ -738,14 +738,6 @@ export class Reconciler {
 
   constructor() {
     process.on('exit', () => this.shutdownLspClients());
-    process.on('SIGINT', () => {
-      this.shutdownLspClients();
-      process.exit(1);
-    });
-    process.on('SIGTERM', () => {
-      this.shutdownLspClients();
-      process.exit(1);
-    });
   }
 
   get isRunning(): boolean {
@@ -871,22 +863,17 @@ export class Reconciler {
 
     const filesMap = new Map<string, { version: number; content: string }>();
 
+    const absTsFiles = tsFiles.map(f => path.resolve(f));
+
     const servicesHost: ts.LanguageServiceHost = {
-      getScriptFileNames: () => tsFiles.map(f => path.resolve(f)),
-      getScriptVersion: (fileName) => {
-        const entry = filesMap.get(path.resolve(fileName));
-        return entry ? String(entry.version) : '0';
-      },
+      getScriptFileNames: () => absTsFiles,
+      getScriptVersion: (fileName) => '0',
       getScriptSnapshot: (fileName) => {
         const norm = path.resolve(fileName);
-        if (!filesMap.has(norm)) {
-          if (fs.existsSync(norm)) {
-            filesMap.set(norm, { version: 0, content: fs.readFileSync(norm, 'utf-8') });
-          } else {
-            return undefined;
-          }
+        if (fs.existsSync(norm)) {
+          return ts.ScriptSnapshot.fromString(fs.readFileSync(norm, 'utf-8'));
         }
-        return ts.ScriptSnapshot.fromString(filesMap.get(norm)!.content);
+        return undefined;
       },
       getCurrentDirectory: () => process.cwd(),
       getCompilationSettings: () => ({
