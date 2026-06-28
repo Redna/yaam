@@ -80,6 +80,10 @@ export class ConnectionProxy {
 
 export class ConnectionManager {
   private dbPath: string;
+  /** Project root directory, captured at construction time.
+   * Used as a stable anchor for project-relative paths (spool files, etc.)
+   * since process.cwd() can shift during the session. */
+  readonly projectRoot: string;
   private mutex = new Mutex();
   private worker: ChildProcess | null = null;
   private msgId = 1;
@@ -87,6 +91,7 @@ export class ConnectionManager {
 
   constructor(dbPath?: string) {
     this.dbPath = dbPath || path.join(process.cwd(), 'memory.lbug');
+    this.projectRoot = path.dirname(this.dbPath);
   }
 
   private startWorker() {

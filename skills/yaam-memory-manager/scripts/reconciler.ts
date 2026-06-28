@@ -1,4 +1,4 @@
-import { getConn, setupDatabase } from './db.js';
+import { getConn, setupDatabase, DB_PATH } from './db.js';
 import { Command } from 'commander';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
@@ -6,6 +6,9 @@ import * as path from 'path';
 import * as ts from 'typescript';
 import { fileURLToPath } from 'url';
 import { LspClient } from './lsp_client.js';
+
+/** Project root, derived from DB_PATH (stable, not dependent on process.cwd()). */
+const PROJECT_ROOT = path.dirname(DB_PATH);
 
 function getGitStatus(): { status: string; path: string }[] {
   try {
@@ -22,7 +25,7 @@ function getGitStatus(): { status: string; path: string }[] {
   }
 }
 
-function getAllFiles(dir = '.'): string[] {
+function getAllFiles(dir = PROJECT_ROOT): string[] {
   const ignoredDirs = new Set([
     '.git', '.venv', '__pycache__', '.pytest_cache', '.claude', '.gemini', 
     'node_modules', 'llm_logs', 'xray_data', 'reports', 'docs', '.agents', '.pi'
@@ -38,7 +41,7 @@ function getAllFiles(dir = '.'): string[] {
           traverse(itemPath);
         }
       } else {
-        files.push(path.relative('.', itemPath));
+        files.push(path.relative(PROJECT_ROOT, itemPath));
       }
     }
   }
@@ -56,6 +59,17 @@ interface EntityRange {
   };
 }
 
+interface RichMeta {
+  signature?: string;
+  isAsync?: boolean;
+  isExported?: boolean;
+  isStatic?: boolean;
+  isAbstract?: boolean;
+  params?: { name: string; type?: string; default?: string }[];
+  returnType?: string;
+  docComment?: string;
+}
+
 interface ParsedEntity {
   id: string;
   name: string;
@@ -69,6 +83,7 @@ interface ParsedEntity {
     start: { line: number; character: number };
     end: { line: number; character: number };
   };
+  richMeta?: RichMeta;
 }
 
 interface UnresolvedCall {
@@ -109,7 +124,7 @@ function loadSettings(): {
 
   const paths = [
     path.join(process.env.HOME || '', '.pi', 'agent', 'settings.json'),
-    path.join(process.cwd(), '.pi', 'settings.json')
+    path.join(PROJECT_ROOT, '.pi', 'settings.json')
   ];
 
   for (const settingsPath of paths) {
@@ -187,7 +202,7 @@ function getLspLanguages(): Record<string, LspLangConfig> {
       },
       resolveImport: (filePath: string, impPath: string) => {
         const relativeResolved = path.join(path.dirname(filePath), impPath.replace(/\./g, '/'));
-        const absoluteResolved = path.join(process.cwd(), impPath.replace(/\./g, '/'));
+        const absoluteResolved = path.join(PROJECT_ROOT, impPath.replace(/\./g, '/'));
         const candidatePaths = [
           relativeResolved + '.py',
           path.join(relativeResolved, '__init__.py'),
@@ -196,7 +211,7 @@ function getLspLanguages(): Record<string, LspLangConfig> {
         ];
         for (const candidate of candidatePaths) {
           if (fs.existsSync(candidate)) {
-            return path.relative(process.cwd(), candidate);
+            return path.relative(PROJECT_ROOT, candidate);
           }
         }
         return null;
@@ -263,6 +278,7 @@ function findEnclosingFunction(
 function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] = []): ParsedEntity[] {
   const result: ParsedEntity[] = [];
   for (const sym of symbols) {
+    const richMeta: RichMeta | undefined = sym.detail ? { signature: sym.detail } : undefined;
     if (sym.kind === 5) { // Class
       const currentPath = [...parentPath, sym.name];
       const classId = `${filePath}::${currentPath.join('::')}`;
@@ -274,7 +290,8 @@ function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] 
         endLine: sym.range.end.line + 1,
         startPos: 0,
         endPos: 0,
-        pyRange: sym.range
+        pyRange: sym.range,
+        richMeta
       });
       if (sym.children) {
         result.push(...traverseSymbols(sym.children, filePath, currentPath));
@@ -290,7 +307,8 @@ function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] 
         endLine: sym.range.end.line + 1,
         startPos: 0,
         endPos: 0,
-        pyRange: sym.range
+        pyRange: sym.range,
+        richMeta
       });
       if (sym.children) {
         result.push(...traverseSymbols(sym.children, filePath, currentPath));
@@ -359,6 +377,62 @@ async function extractLspEntities(
     }
   }
 
+  // Extract rich metadata from source lines for Python entities
+  for (const ent of [...classes, ...functions]) {
+    const range = ent.pyRange;
+    if (!range) continue;
+    const defLineIdx = range.start.line;
+    if (defLineIdx >= lines.length) continue;
+    const defLine = lines[defLineIdx];
+
+    if (!ent.richMeta) ent.richMeta = {};
+
+    // Detect async
+    if (/^\s*async\s+def\b/.test(defLine)) {
+      ent.richMeta.isAsync = true;
+    }
+
+    // Detect decorators (check lines above the def)
+    for (let i = defLineIdx - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (line.startsWith('@')) {
+        if (line.includes('staticmethod')) ent.richMeta.isStatic = true;
+        if (line.includes('classmethod')) ent.richMeta.isStatic = false;
+      } else if (line === '' || line.startsWith('#')) {
+        continue;
+      } else {
+        break;
+      }
+    }
+
+    // Extract docstring (first string literal after def)
+    for (let i = defLineIdx + 1; i < Math.min(defLineIdx + 10, lines.length); i++) {
+      const line = lines[i].trim();
+      if (line === '' || line.startsWith('#')) continue;
+      const tripleMatch = line.match(/^["']{3}([\s\S]*?)["']{3}$/);
+      if (tripleMatch) {
+        ent.richMeta.docComment = tripleMatch[1].trim() || undefined;
+        break;
+      }
+      const startMatch = line.match(/^["']{3}(.*)$/);
+      if (startMatch) {
+        const parts: string[] = [];
+        if (startMatch[1].trim()) parts.push(startMatch[1].trim());
+        for (let j = i + 1; j < Math.min(i + 50, lines.length); j++) {
+          const endMatch = lines[j].match(/^(.*?)["']{3}$/);
+          if (endMatch) {
+            if (endMatch[1].trim()) parts.push(endMatch[1].trim());
+            break;
+          }
+          parts.push(lines[j].trim());
+        }
+        ent.richMeta.docComment = parts.join('\n').trim() || undefined;
+        break;
+      }
+      break;
+    }
+  }
+
   for (const line of lines) {
     for (const regex of config.importRegexes) {
       const match = line.match(regex);
@@ -402,6 +476,69 @@ async function extractLspEntities(
   }
 
   return { classes, functions, imports, unresolvedCalls, ranges };
+}
+
+function extractTsDocComment(node: ts.Node): string | undefined {
+  const docs = ts.getJSDocCommentsAndTags(node);
+  const parts: string[] = [];
+  for (const doc of docs) {
+    if (ts.isJSDoc(doc)) {
+      if (typeof doc.comment === 'string') {
+        parts.push(doc.comment);
+      } else if (Array.isArray(doc.comment)) {
+        for (const part of doc.comment) {
+          parts.push(part.text);
+        }
+      }
+    }
+  }
+  return parts.length > 0 ? parts.join('\n').trim() : undefined;
+}
+
+function extractTsFunctionMeta(
+  node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration,
+  sourceFile: ts.SourceFile
+): RichMeta {
+  const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+  const isAsync = modifiers?.some(m => m.kind === ts.SyntaxKind.AsyncKeyword) ?? false;
+  const isStatic = modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword) ?? false;
+  const isAbstract = modifiers?.some(m => m.kind === ts.SyntaxKind.AbstractKeyword) ?? false;
+  const isExported = modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+
+  const params = node.parameters.map(p => ({
+    name: p.name.getText(sourceFile),
+    type: p.type ? p.type.getText(sourceFile) : undefined,
+    default: p.initializer ? p.initializer.getText(sourceFile) : undefined,
+  }));
+
+  const returnType = node.type ? node.type.getText(sourceFile) : undefined;
+
+  const name = node.name ? node.name.getText(sourceFile) : (ts.isConstructorDeclaration(node) ? 'constructor' : 'anonymous');
+  const paramList = params.map(p => {
+    let s = p.name;
+    if (p.type) s += `: ${p.type}`;
+    if (p.default) s += ` = ${p.default}`;
+    return s;
+  }).join(', ');
+  const signature = `${isAsync ? 'async ' : ''}${name}(${paramList})${returnType ? `: ${returnType}` : ''}`;
+
+  const docComment = extractTsDocComment(node);
+
+  return { signature, isAsync, isExported, isStatic, isAbstract, params, returnType, docComment };
+}
+
+function extractTsClassMeta(node: ts.ClassDeclaration, sourceFile: ts.SourceFile): RichMeta {
+  const modifiers = ts.getModifiers(node) ?? [];
+  const isExported = modifiers.some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+  const isAbstract = modifiers.some(m => m.kind === ts.SyntaxKind.AbstractKeyword);
+
+  const name = node.name?.text ?? 'anonymous';
+  const heritage = node.heritageClauses?.map(h => h.getText(sourceFile)).join(' ') ?? '';
+  const signature = `class ${name}${heritage ? ' ' + heritage : ''}`;
+
+  const docComment = extractTsDocComment(node);
+
+  return { signature, isExported, isAbstract, docComment };
 }
 
 function extractTSEntities(filePath: string, sourceFile: ts.SourceFile) {
@@ -453,7 +590,8 @@ function extractTSEntities(filePath: string, sourceFile: ts.SourceFile) {
         endLine,
         startPos,
         endPos,
-        superclasses
+        superclasses,
+        richMeta: extractTsClassMeta(node, sourceFile)
       });
       ranges.push({ id: classId, startPos, endPos });
 
@@ -477,7 +615,8 @@ function extractTSEntities(filePath: string, sourceFile: ts.SourceFile) {
         startLine,
         endLine,
         startPos,
-        endPos
+        endPos,
+        richMeta: extractTsFunctionMeta(node, sourceFile)
       });
       ranges.push({ id: methodId, startPos, endPos });
 
@@ -501,7 +640,8 @@ function extractTSEntities(filePath: string, sourceFile: ts.SourceFile) {
         startLine,
         endLine,
         startPos,
-        endPos
+        endPos,
+        richMeta: extractTsFunctionMeta(node, sourceFile)
       });
       ranges.push({ id: funcId, startPos, endPos });
 
@@ -587,7 +727,11 @@ async function processFileEntities(
   // 2. Class definitions
   for (const c of entities.classes) {
     parsedIds.add(c.id);
-    const metadata = JSON.stringify({ line: c.startLine });
+    const metadata = JSON.stringify({
+      line: c.startLine,
+      endLine: c.endLine,
+      ...c.richMeta,
+    });
     const prep1 = await conn.prepare("MERGE (cls:Entity {id: $cid}) SET cls.type = 'Class', cls.status = 'active', cls.last_modified = $ts_val, cls.metadata = $meta_val");
     await conn.execute(prep1, { cid: c.id, ts_val: timestamp, meta_val: metadata });
     const prep2 = await conn.prepare("MATCH (file:Entity {id: $pid}), (cls:Entity {id: $cid}) MERGE (cls)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)");
@@ -597,7 +741,11 @@ async function processFileEntities(
   // 3. Functions / Methods
   for (const f of entities.functions) {
     parsedIds.add(f.id);
-    const metadata = JSON.stringify({ line: f.startLine });
+    const metadata = JSON.stringify({
+      line: f.startLine,
+      endLine: f.endLine,
+      ...f.richMeta,
+    });
     const prep1 = await conn.prepare("MERGE (func:Entity {id: $fid}) SET func.type = 'Function', func.status = 'active', func.last_modified = $ts_val, func.metadata = $meta_val");
     await conn.execute(prep1, { fid: f.id, ts_val: timestamp, meta_val: metadata });
 
@@ -625,7 +773,7 @@ async function trackAccessedFile(conn: any, toolName: string, toolInput: any) {
 
   if (!filePath) return;
 
-  const relPath = path.relative(process.cwd(), filePath);
+  const relPath = path.relative(PROJECT_ROOT, filePath);
   if (relPath.startsWith('..')) return;
 
   let wsName = null;
@@ -720,7 +868,7 @@ async function reconcile(full = false) {
         }
         return ts.ScriptSnapshot.fromString(filesMap.get(norm)!.content);
       },
-      getCurrentDirectory: () => process.cwd(),
+      getCurrentDirectory: () => PROJECT_ROOT,
       getCompilationSettings: () => ({
         target: ts.ScriptTarget.ES2022,
         module: ts.ModuleKind.ESNext,
@@ -745,8 +893,8 @@ async function reconcile(full = false) {
       const config = LSP_LANGUAGES[ext];
       if (config && !activeLspClients.has(ext)) {
         console.log(`Launching LSP Server for ${ext} (${config.languageId})...`);
-        const client = new LspClient(config.command, config.args, process.cwd());
-        await client.initialize(process.cwd());
+        const client = new LspClient(config.command, config.args, PROJECT_ROOT);
+        await client.initialize(PROJECT_ROOT);
         activeLspClients.set(ext, client);
       }
     }
@@ -914,7 +1062,7 @@ async function reconcile(full = false) {
               if (lspClient) {
                 if (def.uri.startsWith('file://')) {
                   const targetAbsPath = fileURLToPath(def.uri);
-                  const relTarget = path.relative(process.cwd(), targetAbsPath);
+                  const relTarget = path.relative(PROJECT_ROOT, targetAbsPath);
                   if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                     const targets = entitiesInFiles.get(relTarget) || [];
                     let bestTarget: EntityRange | null = null;
@@ -940,7 +1088,7 @@ async function reconcile(full = false) {
                 }
               } else {
                 const tsDef = def as ts.DefinitionInfo;
-                const relTarget = path.relative(process.cwd(), tsDef.fileName);
+                const relTarget = path.relative(PROJECT_ROOT, tsDef.fileName);
                 if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                   const targets = entitiesInFiles.get(relTarget) || [];
                   let bestTarget: EntityRange | null = null;
@@ -991,7 +1139,7 @@ async function reconcile(full = false) {
                   if (lspClient) {
                     if (def.uri.startsWith('file://')) {
                       const targetAbsPath = fileURLToPath(def.uri);
-                      const relTarget = path.relative(process.cwd(), targetAbsPath);
+                      const relTarget = path.relative(PROJECT_ROOT, targetAbsPath);
                       if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                         const targets = entitiesInFiles.get(relTarget) || [];
                         let bestTarget: EntityRange | null = null;
@@ -1017,7 +1165,7 @@ async function reconcile(full = false) {
                     }
                   } else {
                     const tsDef = def as ts.DefinitionInfo;
-                    const relTarget = path.relative(process.cwd(), tsDef.fileName);
+                    const relTarget = path.relative(PROJECT_ROOT, tsDef.fileName);
                     if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                       const targets = entitiesInFiles.get(relTarget) || [];
                       let bestTarget: EntityRange | null = null;

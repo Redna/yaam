@@ -47,7 +47,8 @@ export async function appendNote(
 export async function trackAccessedFile(
   toolName: string,
   toolInput: any,
-  conn: any
+  conn: any,
+  projectRoot: string
 ): Promise<void> {
   let filePath = '';
 
@@ -61,7 +62,7 @@ export async function trackAccessedFile(
 
   if (!filePath) return;
 
-  const relPath = path.relative(process.cwd(), path.resolve(filePath));
+  const relPath = path.relative(projectRoot, path.resolve(filePath));
   if (relPath.startsWith('..')) return;
 
   // Find active workspace

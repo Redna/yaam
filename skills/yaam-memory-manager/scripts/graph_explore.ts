@@ -1,4 +1,4 @@
-import { getConn, setupDatabase } from './db.js';
+import { getConn, setupDatabase, DB_PATH } from './db.js';
 import { Command } from 'commander';
 import { exec } from 'child_process';
 import * as path from 'path';
@@ -57,7 +57,7 @@ async function main() {
         }
 
         if (rows.length > 20) {
-          const tmpDir = path.join(process.cwd(), '.chunks', 'memory_dumps');
+          const tmpDir = path.join(path.dirname(DB_PATH), '.chunks', 'memory_dumps');
           if (!fs.existsSync(tmpDir)) {
             fs.mkdirSync(tmpDir, { recursive: true });
           }

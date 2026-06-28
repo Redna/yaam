@@ -33,7 +33,7 @@ export interface ExploreResult {
   spooledTo?: string;
 }
 
-export async function exploreGraph(query: string, conn: any): Promise<ExploreResult> {
+export async function exploreGraph(query: string, conn: any, baseDir: string): Promise<ExploreResult> {
   const constrained = validateReadQuery(query);
 
   const queryResult = await conn.query(constrained);
@@ -44,7 +44,7 @@ export async function exploreGraph(query: string, conn: any): Promise<ExploreRes
   }
 
   if (rows.length > 20) {
-    const tmpDir = path.join(process.cwd(), '.chunks', 'memory_dumps');
+    const tmpDir = path.join(baseDir, '.chunks', 'memory_dumps');
     if (!fs.existsSync(tmpDir)) {
       fs.mkdirSync(tmpDir, { recursive: true });
     }

@@ -60,6 +60,10 @@ LadybugDB (`@ladybugdb/core` v0.17.1) uses native C++ with mmap for its buffer p
 | Table | Key | Fields |
 |-------|-----|--------|
 | `Entity` | `id` (STRING) | `type`, `status`, `last_modified`, `metadata` |
+
+> **`metadata`** is a JSON string with rich fields for Functions/Classes:
+> `{"line":42,"endLine":96,"signature":"foo(x: string): void","isAsync":true,"isExported":false,"isStatic":false,"params":[...],"returnType":"void","docComment":"..."}`
+> Query with `WHERE metadata CONTAINS '"isAsync":true'` or `WHERE metadata CONTAINS 'Mutex'`.
 | `Workspace` | `workspace_name` (STRING) | `description`, `status`, `closed_at` |
 | `Scratchpad` | `id` (STRING) | `content`, `created_at` |
 

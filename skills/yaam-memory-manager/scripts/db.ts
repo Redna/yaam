@@ -1,7 +1,7 @@
 import ladybug from '@ladybugdb/core';
 import * as path from 'path';
 
-const DB_PATH = path.join(process.cwd(), 'memory.lbug');
+export const DB_PATH = path.join(process.cwd(), 'memory.lbug');
 
 export function getConn() {
   const db = new ladybug.Database(DB_PATH);

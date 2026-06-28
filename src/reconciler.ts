@@ -37,6 +37,17 @@ interface EntityRange {
   pyRange?: { start: { line: number; character: number }; end: { line: number; character: number } };
 }
 
+interface RichMeta {
+  signature?: string;
+  isAsync?: boolean;
+  isExported?: boolean;
+  isStatic?: boolean;
+  isAbstract?: boolean;
+  params?: { name: string; type?: string; default?: string }[];
+  returnType?: string;
+  docComment?: string;
+}
+
 interface ParsedEntity {
   id: string;
   name: string;
@@ -47,6 +58,7 @@ interface ParsedEntity {
   endPos: number;
   superclasses?: ({ name: string; pos: number } | { name: string; line: number; col: number })[];
   pyRange?: { start: { line: number; character: number }; end: { line: number; character: number } };
+  richMeta?: RichMeta;
 }
 
 interface UnresolvedCall {
@@ -103,7 +115,7 @@ interface YaamSettings {
   languages: Record<string, { extensions: string[]; command: string; args: string[] }>;
 }
 
-function loadSettings(): YaamSettings {
+function loadSettings(projectRoot: string): YaamSettings {
   const defaults: YaamSettings = {
     frequency: 'incremental',
     languages: {
@@ -119,9 +131,9 @@ function loadSettings(): YaamSettings {
 
   const paths = [
     path.join(process.env.HOME || '', '.pi', 'agent', 'settings.json'),
-    path.join(process.cwd(), '.pi', 'settings.json'),
-    path.join(process.cwd(), '.gemini', 'settings.json'),
-    path.join(process.cwd(), '.agents', 'settings.json'),
+    path.join(projectRoot, '.pi', 'settings.json'),
+    path.join(projectRoot, '.gemini', 'settings.json'),
+    path.join(projectRoot, '.agents', 'settings.json'),
   ];
 
   for (const settingsPath of paths) {
@@ -156,8 +168,8 @@ function loadSettings(): YaamSettings {
   return merged;
 }
 
-function getLspLanguages(): Record<string, LspLangConfig> {
-  const settings = loadSettings();
+function getLspLanguages(projectRoot: string): Record<string, LspLangConfig> {
+  const settings = loadSettings(projectRoot);
   const registry: Record<string, LspLangConfig> = {};
 
   const defaultTemplates: Record<string, Partial<LspLangConfig>> = {
@@ -189,7 +201,7 @@ function getLspLanguages(): Record<string, LspLangConfig> {
       },
       resolveImport: (filePath: string, impPath: string) => {
         const relativeResolved = path.join(path.dirname(filePath), impPath.replace(/\./g, '/'));
-        const absoluteResolved = path.join(process.cwd(), impPath.replace(/\./g, '/'));
+        const absoluteResolved = path.join(projectRoot, impPath.replace(/\./g, '/'));
         const candidatePaths = [
           relativeResolved + '.py',
           path.join(relativeResolved, '__init__.py'),
@@ -197,7 +209,7 @@ function getLspLanguages(): Record<string, LspLangConfig> {
           path.join(absoluteResolved, '__init__.py'),
         ];
         for (const candidate of candidatePaths) {
-          if (fs.existsSync(candidate)) return path.relative(process.cwd(), candidate);
+          if (fs.existsSync(candidate)) return path.relative(projectRoot, candidate);
         }
         return null;
       },
@@ -251,7 +263,7 @@ const IGNORED_DIRS = new Set([
   'dist', 'build', 'out', '.next', 'coverage', 'lib'
 ]);
 
-function getAllFiles(dir = '.'): string[] {
+function getAllFiles(baseDir: string): string[] {
   const files: string[] = [];
   function traverse(currentDir: string) {
     const list = fs.readdirSync(currentDir);
@@ -261,11 +273,11 @@ function getAllFiles(dir = '.'): string[] {
       if (stat.isDirectory()) {
         if (!IGNORED_DIRS.has(item)) traverse(itemPath);
       } else {
-        files.push(path.relative('.', itemPath));
+        files.push(path.relative(baseDir, itemPath));
       }
     }
   }
-  traverse(dir);
+  traverse(baseDir);
   return files;
 }
 
@@ -300,6 +312,7 @@ function findEnclosingFunction(pos: { line: number; character: number }, functio
 function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] = []): ParsedEntity[] {
   const result: ParsedEntity[] = [];
   for (const sym of symbols) {
+    const richMeta: RichMeta | undefined = sym.detail ? { signature: sym.detail } : undefined;
     if (sym.kind === 5) {
       const currentPath = [...parentPath, sym.name];
       const classId = `${filePath}::${currentPath.join('::')}`;
@@ -307,6 +320,7 @@ function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] 
         id: classId, name: sym.name, type: 'Class',
         startLine: sym.range.start.line + 1, endLine: sym.range.end.line + 1,
         startPos: 0, endPos: 0, pyRange: sym.range,
+        richMeta,
       });
       if (sym.children) result.push(...traverseSymbols(sym.children, filePath, currentPath));
     } else if (sym.kind === 6 || sym.kind === 12) {
@@ -316,6 +330,7 @@ function traverseSymbols(symbols: any[], filePath: string, parentPath: string[] 
         id: funcId, name: sym.name, type: 'Function',
         startLine: sym.range.start.line + 1, endLine: sym.range.end.line + 1,
         startPos: 0, endPos: 0, pyRange: sym.range,
+        richMeta,
       });
       if (sym.children) result.push(...traverseSymbols(sym.children, filePath, currentPath));
     } else {
@@ -368,6 +383,66 @@ async function extractLspEntities(
     }
   }
 
+  // Extract rich metadata from source lines for Python entities
+  for (const ent of [...classes, ...functions]) {
+    const range = ent.pyRange;
+    if (!range) continue;
+    const defLineIdx = range.start.line;
+    if (defLineIdx >= lines.length) continue;
+    const defLine = lines[defLineIdx];
+
+    if (!ent.richMeta) ent.richMeta = {};
+
+    // Detect async
+    if (/^\s*async\s+def\b/.test(defLine)) {
+      ent.richMeta.isAsync = true;
+    }
+
+    // Detect decorators (check lines above the def)
+    for (let i = defLineIdx - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (line.startsWith('@')) {
+        if (line.includes('staticmethod')) ent.richMeta.isStatic = true;
+        if (line.includes('classmethod')) ent.richMeta.isStatic = false;
+        // Keep checking above for more decorators
+      } else if (line === '' || line.startsWith('#')) {
+        continue; // Skip blank lines and comments
+      } else {
+        break; // Hit non-decorator code
+      }
+    }
+
+    // Extract docstring (first string literal after def)
+    for (let i = defLineIdx + 1; i < Math.min(defLineIdx + 10, lines.length); i++) {
+      const line = lines[i].trim();
+      if (line === '' || line.startsWith('#')) continue;
+      // Triple-quoted docstring
+      const tripleMatch = line.match(/^['"]{3}([\s\S]*?)['"]{3}$/);
+      if (tripleMatch) {
+        ent.richMeta.docComment = tripleMatch[1].trim() || undefined;
+        break;
+      }
+      // Start of multi-line triple-quoted string
+      const startMatch = line.match(/^['"]{3}(.*)$/);
+      if (startMatch) {
+        const parts: string[] = [];
+        if (startMatch[1].trim()) parts.push(startMatch[1].trim());
+        for (let j = i + 1; j < Math.min(i + 50, lines.length); j++) {
+          const endMatch = lines[j].match(/^(.*?)['"]{3}$/);
+          if (endMatch) {
+            if (endMatch[1].trim()) parts.push(endMatch[1].trim());
+            break;
+          }
+          parts.push(lines[j].trim());
+        }
+        ent.richMeta.docComment = parts.join('\n').trim() || undefined;
+        break;
+      }
+      // Not a string — stop looking
+      break;
+    }
+  }
+
   for (const line of lines) {
     for (const regex of config.importRegexes) {
       const match = line.match(regex);
@@ -401,6 +476,81 @@ async function extractLspEntities(
   }
 
   return { classes, functions, imports, unresolvedCalls, ranges };
+}
+
+// ─── Rich Metadata Extraction (TS) ──────────────────────────────────────────
+
+/** Extract JSDoc comment text from a TS node. */
+function extractTsDocComment(node: ts.Node): string | undefined {
+  const docs = ts.getJSDocCommentsAndTags(node);
+  const parts: string[] = [];
+  for (const doc of docs) {
+    if (ts.isJSDoc(doc)) {
+      if (typeof doc.comment === 'string') {
+        parts.push(doc.comment);
+      } else if (Array.isArray(doc.comment)) {
+        for (const part of doc.comment) {
+          parts.push(part.text);
+        }
+      }
+    }
+  }
+  return parts.length > 0 ? parts.join('\n').trim() : undefined;
+}
+
+/** Extract rich metadata from a TS function/method/constructor declaration. */
+function extractTsFunctionMeta(
+  node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration,
+  sourceFile: ts.SourceFile
+): RichMeta {
+  const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+  const isAsync = modifiers?.some(m => m.kind === ts.SyntaxKind.AsyncKeyword) ?? false;
+  const isStatic = modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword) ?? false;
+  const isAbstract = modifiers?.some(m => m.kind === ts.SyntaxKind.AbstractKeyword) ?? false;
+  const isExported = modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+
+  // Parameters
+  const params = node.parameters.map(p => ({
+    name: p.name.getText(sourceFile),
+    type: p.type ? p.type.getText(sourceFile) : undefined,
+    default: p.initializer ? p.initializer.getText(sourceFile) : undefined,
+  }));
+
+  // Return type
+  const returnType = node.type ? node.type.getText(sourceFile) : undefined;
+
+  // Signature string
+  const name = node.name ? node.name.getText(sourceFile) : (ts.isConstructorDeclaration(node) ? 'constructor' : 'anonymous');
+  const paramList = params.map(p => {
+    let s = p.name;
+    if (p.type) s += `: ${p.type}`;
+    if (p.default) s += ` = ${p.default}`;
+    return s;
+  }).join(', ');
+  const signature = `${isAsync ? 'async ' : ''}${name}(${paramList})${returnType ? `: ${returnType}` : ''}`;
+
+  // Doc comment
+  const docComment = extractTsDocComment(node);
+
+  return { signature, isAsync, isExported, isStatic, isAbstract, params, returnType, docComment };
+}
+
+/** Extract rich metadata from a TS class declaration. */
+function extractTsClassMeta(
+  node: ts.ClassDeclaration,
+  sourceFile: ts.SourceFile
+): RichMeta {
+  const modifiers = ts.getModifiers(node) ?? [];
+  const isExported = modifiers.some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+  const isAbstract = modifiers.some(m => m.kind === ts.SyntaxKind.AbstractKeyword);
+
+  const name = node.name?.text ?? 'anonymous';
+  const heritage = node.heritageClauses?.map(h => h.getText(sourceFile)).join(' ') ?? '';
+  const signature = `class ${name}${heritage ? ' ' + heritage : ''}`;
+
+  const docComment = extractTsDocComment(node);
+
+  return { signature, isExported, isAbstract, docComment };
 }
 
 /**
@@ -503,17 +653,23 @@ function extractTsServiceEntities(
       const className = node.name.text;
       const classId = `${filePath}::${className}`;
       const cls = classes.find(c => c.id === classId);
-      if (cls && node.heritageClauses) {
-        const superclasses: { name: string; pos: number }[] = [];
-        for (const clause of node.heritageClauses) {
-          for (const typeNode of clause.types) {
-            superclasses.push({
-              name: typeNode.expression.getText(sourceFile),
-              pos: typeNode.expression.getStart(sourceFile),
-            });
+      if (cls) {
+        if (node.heritageClauses) {
+          const superclasses: { name: string; pos: number }[] = [];
+          for (const clause of node.heritageClauses) {
+            for (const typeNode of clause.types) {
+              superclasses.push({
+                name: typeNode.expression.getText(sourceFile),
+                pos: typeNode.expression.getStart(sourceFile),
+              });
+            }
           }
+          cls.superclasses = superclasses;
         }
-        cls.superclasses = superclasses;
+        // Rich metadata
+        if (!cls.richMeta) {
+          cls.richMeta = extractTsClassMeta(node, sourceFile);
+        }
       }
 
     } else if (ts.isCallExpression(node)) {
@@ -537,6 +693,24 @@ function extractTsServiceEntities(
           name: node.expression.getText(sourceFile),
           line: 0, col: 0, // TS resolution uses character offset, not line/col
         });
+      }
+    } else if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node)) {
+      // Extract rich metadata for this function/method/constructor
+      const fn = node as ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration;
+      const nodeStart = fn.getStart(sourceFile);
+      let bestMatch: ParsedEntity | null = null;
+      let smallestSpan = Infinity;
+      for (const func of functions) {
+        if (nodeStart >= func.startPos && nodeStart <= func.endPos) {
+          const span = func.endPos - func.startPos;
+          if (span < smallestSpan) {
+            smallestSpan = span;
+            bestMatch = func;
+          }
+        }
+      }
+      if (bestMatch && !bestMatch.richMeta) {
+        bestMatch.richMeta = extractTsFunctionMeta(fn, sourceFile);
       }
     }
 
@@ -629,7 +803,9 @@ async function processFileEntities(
   filePath: string,
   entities: { classes: ParsedEntity[]; functions: ParsedEntity[]; imports: string[] },
   timestamp: number,
-  stmts: PreparedStatements
+  stmts: PreparedStatements,
+  lspLanguages: Record<string, LspLangConfig>,
+  projectRoot: string
 ) {
   const parsedIds = new Set<string>();
 
@@ -637,11 +813,11 @@ async function processFileEntities(
   for (const impPath of entities.imports) {
     let targetPath: string | null = null;
     const ext = path.extname(filePath);
-    const config = LSP_LANGUAGES[ext];
+    const config = lspLanguages[ext];
     if (config && config.resolveImport) {
       targetPath = config.resolveImport(filePath, impPath);
     } else {
-      targetPath = resolveTsImport(filePath, impPath);
+      targetPath = resolveTsImport(filePath, impPath, projectRoot);
     }
 
     if (targetPath && targetPath !== filePath) {
@@ -653,7 +829,11 @@ async function processFileEntities(
   // 2. Classes
   for (const c of entities.classes) {
     parsedIds.add(c.id);
-    const metadata = JSON.stringify({ line: c.startLine });
+    const metadata = JSON.stringify({
+      line: c.startLine,
+      endLine: c.endLine,
+      ...c.richMeta,
+    });
     await conn.execute(stmts.mergeClassEntity, { cid: c.id, ts_val: timestamp, meta_val: metadata });
     await conn.execute(stmts.mergeDeclaredInClass, { pid: filePath, cid: c.id });
   }
@@ -661,7 +841,11 @@ async function processFileEntities(
   // 3. Functions / Methods
   for (const f of entities.functions) {
     parsedIds.add(f.id);
-    const metadata = JSON.stringify({ line: f.startLine });
+    const metadata = JSON.stringify({
+      line: f.startLine,
+      endLine: f.endLine,
+      ...f.richMeta,
+    });
     await conn.execute(stmts.mergeFuncEntity, { fid: f.id, ts_val: timestamp, meta_val: metadata });
 
     const parts = f.id.split('::');
@@ -675,10 +859,6 @@ async function processFileEntities(
 
   await cleanupStaleEntities(conn, filePath, parsedIds, timestamp, stmts);
 }
-
-// ─── Static config ───────────────────────────────────────────────────────────
-
-const LSP_LANGUAGES = getLspLanguages();
 
 // ─── TypeScript Module Resolution ───────────────────────────────────────────
 
@@ -707,7 +887,7 @@ const TS_MODULE_HOST: ts.ModuleResolutionHost = {
  * Compiler API's module resolution. Handles .js → .ts mapping, index files,
  * and all bundler resolution rules.
  */
-function resolveTsImport(filePath: string, importPath: string): string | null {
+function resolveTsImport(filePath: string, importPath: string, projectRoot: string): string | null {
   if (!importPath.startsWith('.')) return null;
 
   const result = ts.resolveModuleName(
@@ -719,7 +899,7 @@ function resolveTsImport(filePath: string, importPath: string): string | null {
 
   if (result.resolvedModule) {
     const resolved = result.resolvedModule.resolvedFileName;
-    const rel = path.relative(process.cwd(), resolved);
+    const rel = path.relative(projectRoot, resolved);
     if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
       return rel;
     }
@@ -735,6 +915,10 @@ export class Reconciler {
   private pendingMode: 'incremental' | 'full' | null = null;
   private pendingFileAccess: { toolName: string; toolInput: any } | null = null;
   private _progress: ReconcileProgress | null = null;
+  /** Project root, captured from ConnectionManager on first schedule call. */
+  private projectRoot: string = '';
+  /** LSP language configs, initialized lazily with projectRoot. */
+  private lspLanguages: Record<string, LspLangConfig> = {};
 
   constructor() {
     process.on('exit', () => this.shutdownLspClients());
@@ -791,6 +975,13 @@ export class Reconciler {
   private tryRun(connMgr: ConnectionManager): void {
     if (this.running) return; // Will pick up pending when current run finishes
     this.running = true;
+
+    // Capture project root from ConnectionManager (stable, captured at construction).
+    // Initialize LSP languages lazily with the correct project root.
+    if (!this.projectRoot) {
+      this.projectRoot = connMgr.projectRoot;
+      this.lspLanguages = getLspLanguages(this.projectRoot);
+    }
 
     // Fire and forget — runs in background
     this.runReconcile(connMgr).catch((e) => {
@@ -854,12 +1045,12 @@ export class Reconciler {
     dbFileTimestamps: Map<string, number>
   ): Promise<ReconcileResult> {
     let filesToReconcile: string[] = [];
-    const diskFiles = getAllFiles();
+    const diskFiles = getAllFiles(this.projectRoot);
     const gitStatus = await getGitStatus();
 
     if (full) {
       filesToReconcile = diskFiles.filter((p) => {
-        if (!(p.endsWith('.ts') || p.endsWith('.js') || Object.keys(LSP_LANGUAGES).some((ext) => p.endsWith(ext)))) {
+        if (!(p.endsWith('.ts') || p.endsWith('.js') || Object.keys(this.lspLanguages).some((ext) => p.endsWith(ext)))) {
           return false;
         }
         try {
@@ -881,7 +1072,7 @@ export class Reconciler {
             item.status !== 'D' &&
             (item.path.endsWith('.ts') ||
               item.path.endsWith('.js') ||
-              Object.keys(LSP_LANGUAGES).some((ext) => item.path.endsWith(ext)))
+              Object.keys(this.lspLanguages).some((ext) => item.path.endsWith(ext)))
         )
         .map((item) => item.path);
     }
@@ -903,7 +1094,7 @@ export class Reconciler {
         }
         return undefined;
       },
-      getCurrentDirectory: () => process.cwd(),
+      getCurrentDirectory: () => this.projectRoot,
       getCompilationSettings: () => ({
         target: ts.ScriptTarget.ES2022,
         module: ts.ModuleKind.ESNext,
@@ -925,10 +1116,10 @@ export class Reconciler {
     // Initialize LSP clients for files needing LSP analysis
     for (const file of filesToReconcile) {
       const ext = path.extname(file);
-      const config = LSP_LANGUAGES[ext];
+      const config = this.lspLanguages[ext];
       if (config && !this.activeLspClients.has(ext)) {
-        const client = new LspClient(config.command, config.args, process.cwd());
-        await client.initialize(process.cwd());
+        const client = new LspClient(config.command, config.args, this.projectRoot);
+        await client.initialize(this.projectRoot);
         this.activeLspClients.set(ext, client);
       }
     }
@@ -942,7 +1133,7 @@ export class Reconciler {
           client.sendNotification('textDocument/didOpen', {
             textDocument: {
               uri: `file://${path.resolve(diskFile)}`,
-              languageId: LSP_LANGUAGES[ext].languageId,
+              languageId: this.lspLanguages[ext].languageId,
               version: 1,
               text: content,
             },
@@ -967,7 +1158,7 @@ export class Reconciler {
       await yieldToEventLoop();
       try {
         const ext = path.extname(filePath);
-        const config = LSP_LANGUAGES[ext];
+        const config = this.lspLanguages[ext];
         const lspClient = this.activeLspClients.get(ext);
 
         if (config && lspClient) {
@@ -1030,7 +1221,7 @@ export class Reconciler {
               if (lspClient) {
                 if (def.uri?.startsWith('file://')) {
                   const targetAbsPath = fileURLToPath(def.uri);
-                  const relTarget = path.relative(process.cwd(), targetAbsPath);
+                  const relTarget = path.relative(this.projectRoot, targetAbsPath);
                   if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                     const targets = entitiesInFiles.get(relTarget) || [];
                     let bestTarget: EntityRange | null = null;
@@ -1050,7 +1241,7 @@ export class Reconciler {
                 }
               } else {
                 const tsDef = def as ts.DefinitionInfo;
-                const relTarget = path.relative(process.cwd(), tsDef.fileName);
+                const relTarget = path.relative(this.projectRoot, tsDef.fileName);
                 if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                   const targets = entitiesInFiles.get(relTarget) || [];
                   let bestTarget: EntityRange | null = null;
@@ -1096,7 +1287,7 @@ export class Reconciler {
                   if (lspClient) {
                     if (def.uri?.startsWith('file://')) {
                       const targetAbsPath = fileURLToPath(def.uri);
-                      const relTarget = path.relative(process.cwd(), targetAbsPath);
+                      const relTarget = path.relative(this.projectRoot, targetAbsPath);
                       if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                         const targets = entitiesInFiles.get(relTarget) || [];
                         let bestTarget: EntityRange | null = null;
@@ -1116,7 +1307,7 @@ export class Reconciler {
                     }
                   } else {
                     const tsDef = def as ts.DefinitionInfo;
-                    const relTarget = path.relative(process.cwd(), tsDef.fileName);
+                    const relTarget = path.relative(this.projectRoot, tsDef.fileName);
                     if (!relTarget.startsWith('..') && !path.isAbsolute(relTarget)) {
                       const targets = entitiesInFiles.get(relTarget) || [];
                       let bestTarget: EntityRange | null = null;
@@ -1191,7 +1382,7 @@ export class Reconciler {
 
         if (result.parsedCache.has(filePath)) {
           try {
-            await processFileEntities(conn, filePath, result.parsedCache.get(filePath)!, nowTs, stmts);
+            await processFileEntities(conn, filePath, result.parsedCache.get(filePath)!, nowTs, stmts, this.lspLanguages, this.projectRoot);
           } catch (e) {
             console.error(`Error processing ${filePath}:`, e);
           }
@@ -1275,7 +1466,7 @@ export class Reconciler {
 
         if (entityStatus === 'active' && result.parsedCache.has(filePath)) {
           try {
-            await processFileEntities(conn, filePath, result.parsedCache.get(filePath)!, nowTs, stmts);
+            await processFileEntities(conn, filePath, result.parsedCache.get(filePath)!, nowTs, stmts, this.lspLanguages, this.projectRoot);
           } catch (e) {
             console.error(`Error processing ${filePath}:`, e);
           }
@@ -1337,7 +1528,7 @@ export class Reconciler {
 
     if (!filePath) return;
 
-    const relPath = path.relative(process.cwd(), path.resolve(filePath));
+    const relPath = path.relative(this.projectRoot, path.resolve(filePath));
     if (relPath.startsWith('..')) return;
 
     let wsName: string | null = null;
