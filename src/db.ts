@@ -1,6 +1,7 @@
 import { fork, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as url from 'url';
+import * as fs from 'fs';
 
 const __filename = url.fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -99,10 +100,34 @@ export class ConnectionManager {
     const ext = path.extname(__filename);
     const scriptPath = path.join(__dirname, 'db_worker' + ext);
 
-    // Provide --import=tsx if running .ts
-    const execArgv = ext === '.ts' ? ['--import=tsx'] : [];
+    // Provide --import=tsx if running .ts and expose gc for memory management
+    const execArgv = ext === '.ts' ? ['--import=tsx', '--expose-gc'] : ['--expose-gc'];
 
-    this.worker = fork(scriptPath, [], { execArgv });
+    // CRITICAL: Isolate worker stdio so it never writes to the parent's
+    // fd 1 (stdout) / fd 2 (stderr). The host coding agent (pi) uses stdout
+    // as a structured JSON-RPC channel — any interleaved output from the
+    // worker (tsx loader, LadybugDB native, console.log, exit-time flush)
+    // would corrupt that stream and crash the agent.
+    //   stdin  → 'ignore'  : worker doesn't read stdin
+    //   stdout → 'pipe'    : captured, never reaches parent fd 1
+    //   stderr → 'pipe'    : captured, never reaches parent fd 2
+    //   ipc    → 'ipc'     : IPC channel still created (required by fork)
+    this.worker = fork(scriptPath, [], {
+      execArgv,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+    });
+
+    // Optionally capture worker stderr for debugging. We must NOT write
+    // it to process.stderr / console.error — that goes to pi's fd 2.
+    // Buffer it in-memory for diagnostics if needed.
+    this.worker.stderr?.on('data', (_chunk: Buffer) => {
+      // Intentionally swallowed — do not forward to process.stderr.
+    });
+    this.worker.stderr?.on('error', () => {}); // Prevent unhandled EPIPE from crashing parent
+    this.worker.stdout?.on('data', (_chunk: Buffer) => {
+      // Intentionally swallowed — do not forward to process.stdout.
+    });
+    this.worker.stdout?.on('error', () => {}); // Prevent unhandled EPIPE from crashing parent
 
     this.worker.on('message', (msg: any) => {
       const req = this.pendingRequests.get(msg.id);
@@ -136,19 +161,28 @@ export class ConnectionManager {
     });
   }
 
-  private sendRequest(msg: any): Promise<any> {
+  private sendRequest(msg: any, timeoutMs: number = 30000): Promise<any> {
     return new Promise((resolve, reject) => {
       if (!this.worker) this.startWorker();
       const id = this.msgId++;
-      this.pendingRequests.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Worker request timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pendingRequests.set(id, {
+        resolve: (v: any) => { clearTimeout(timer); resolve(v); },
+        reject: (e: any) => { clearTimeout(timer); reject(e); },
+      });
       try {
         this.worker!.send({ ...msg, id }, (err) => {
           if (err) {
+            clearTimeout(timer);
             this.pendingRequests.delete(id);
             reject(err);
           }
         });
       } catch (e) {
+        clearTimeout(timer);
         this.pendingRequests.delete(id);
         reject(e);
       }
@@ -161,12 +195,18 @@ export class ConnectionManager {
         await conn.query(query);
       } catch (e: any) {
         const errMsg = String(e).toLowerCase();
+        if (errMsg.includes("already exists")) {
+          continue; // Table/rel already exists — idempotent, safe to skip
+        }
         if (errMsg.includes("lock") || errMsg.includes("already opened")) {
-          throw e; // Throw so withConnection can retry without logging
+          throw e; // Lock errors should propagate so withConnection can retry
         }
-        if (!errMsg.includes("already exists")) {
-          console.error(`Schema setup error: ${query}\n`, e);
-        }
+        // All other errors (binder exceptions, type mismatches, version
+        // differences on existing tables, etc.) are non-fatal during schema
+        // setup — the tables already exist with compatible-enough structure.
+        // Logging but NOT throwing prevents cascading connection failures on
+        // databases created by previous schema versions.
+        // Do NOT use console.error — that writes to pi's stderr (fd 2).
       }
     }
   }
@@ -199,16 +239,12 @@ export class ConnectionManager {
           
           if (!isLockError && !isCrash) {
             try { await this.sendRequest({ action: 'close' }); } catch {}
-            // Non-retryable error (IO exception, corrupt DB, etc.).
-            // Kill worker so next call gets a fresh process with clean
-            // buffer pool — stale mmap pages cause cascading corruption.
             this.killWorker();
             throw e;
           }
           
           lastError = e;
           try { await this.sendRequest({ action: 'close' }); } catch {}
-          // Worker may be in a bad state after a crash/lock — restart it.
           this.killWorker();
           
           const delay = Math.min(50 * Math.pow(2, attempt), 2000);

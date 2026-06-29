@@ -649,22 +649,27 @@ function extractTsServiceEntities(
       imports.push(node.moduleSpecifier.getText(sourceFile).replace(/['"]/g, ''));
 
     } else if (ts.isClassDeclaration(node) && node.name) {
-      // Attach superclass positions to the Class entity (for inheritance resolution)
-      const className = node.name.text;
-      const classId = `${filePath}::${className}`;
-      const cls = classes.find(c => c.id === classId);
+      // Attach superclass positions to the Class entity (for inheritance resolution).
+      // Match by source position (not constructed ID) to correctly handle nested classes.
+      const nodeStart = node.getStart(sourceFile);
+      const cls = classes.find(c => c.startPos === nodeStart);
       if (cls) {
         if (node.heritageClauses) {
           const superclasses: { name: string; pos: number }[] = [];
           for (const clause of node.heritageClauses) {
-            for (const typeNode of clause.types) {
-              superclasses.push({
-                name: typeNode.expression.getText(sourceFile),
-                pos: typeNode.expression.getStart(sourceFile),
-              });
+            // Only track extends (class inheritance), not implements (interface conformance).
+            // implements clauses point to interfaces which are not in the entity graph
+            // and would produce incorrect/unresolvable INHERITS_FROM edges.
+            if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
+              for (const typeNode of clause.types) {
+                superclasses.push({
+                  name: typeNode.expression.getText(sourceFile),
+                  pos: typeNode.expression.getStart(sourceFile),
+                });
+              }
             }
           }
-          cls.superclasses = superclasses;
+          if (superclasses.length > 0) cls.superclasses = superclasses;
         }
         // Rich metadata
         if (!cls.richMeta) {

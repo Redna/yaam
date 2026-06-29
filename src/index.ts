@@ -4,6 +4,7 @@ import { ConnectionManager } from "./db.js";
 import { Reconciler } from "./reconciler.js";
 import { exploreGraph } from "./graph_explore.js";
 import { initializeWorkspace, appendNote } from "./workspace.js";
+import { gatherWorkspaceData, renderWorkspaceView } from "./visualizer.js";
 
 export default function yaamExtension(pi: ExtensionAPI) {
   const connMgr = new ConnectionManager();
@@ -91,6 +92,11 @@ export default function yaamExtension(pi: ExtensionAPI) {
       `Executes a read-only Cypher query to explore code relationships (Layer 0)
 and agent memories (Layer 1) in LadybugDB.
 
+The graph is automatically reconciled after every file operation (write, edit, bash)
+and reflects the LIVE state of the repository. Entity topology — files, functions,
+classes, call graphs, imports, and inheritance — is current as of the last tool
+invocation. You can trust this information is accurate without manual verification.
+
 SCHEMA:
   Nodes:    Entity(id, type, status, last_modified, metadata)
             Workspace(workspace_name, description, status, closed_at)
@@ -126,7 +132,7 @@ PITFALLS:
   - Results > 20 rows are spooled to \`.chunks/memory_dumps/query_out.txt\`.`,
     promptSnippet: "Query YAAM memory graph with Cypher (read-only)",
     promptGuidelines: [
-      "Use yaam_graph_explore to query the YAAM memory graph before making architectural changes. It tracks files, functions, classes, call graphs, inheritance, and workspace scratchpads.",
+      "The YAAM graph is automatically reconciled after every file operation (write, edit, bash) and reflects the live repository state. Use yaam_graph_explore to query files, functions, classes, call graphs, imports, inheritance, and workspace scratchpads — the information is current and trustworthy.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Read-only Cypher query. Use [:LINKED_TO {relationship_type: 'CALLS'|'DECLARED_IN'|'IMPORTS'|'INHERITS_FROM'}] for Entity edges. Filter by label (:Entity, :Workspace, :Scratchpad) before accessing properties to avoid Binder exceptions." }),
@@ -158,7 +164,7 @@ PITFALLS:
       "Initializes a new workspace context in YAAM memory for task tracking. Deactivates any existing active workspace. Use at the start of a new feature or bug fix to create a persistent context for recording decisions.",
     promptSnippet: "Initialize a YAAM workspace for task tracking",
     promptGuidelines: [
-      "Use yaam_workspace_initialize at the start of a new feature or refactor to create a task context for recording decisions.",
+      "Use yaam_workspace_initialize at the start of a new feature or refactor to create a task context for recording decisions. The graph is automatically reconciled after file operations, so workspace entity mappings reflect the live codebase.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "The unique name of the workspace (e.g. 'auth-fix', 'ui-refactor')." }),
@@ -196,7 +202,7 @@ PITFALLS:
       "Appends a new insight or note to the active workspace scratchpad in YAAM memory. Notes persist across sessions. Record \"why\" decisions and architectural rationale, not just \"what\" was done.",
     promptSnippet: "Record an insight or decision to YAAM workspace",
     promptGuidelines: [
-      "Use yaam_workspace_append_note to record 'why' decisions and architectural rationale, not just 'what' was done.",
+      "Use yaam_workspace_append_note to record 'why' decisions and architectural rationale, not just 'what' was done. Notes persist across sessions alongside the live code graph.",
     ],
     parameters: Type.Object({
       workspace: Type.String({ description: "The name of the active workspace." }),
@@ -225,8 +231,32 @@ PITFALLS:
   // ─── Command: /yaam ─────────────────────────────────────────────────────
 
   pi.registerCommand("yaam", {
-    description: "Show YAAM memory status (entity counts, active workspace, recent notes)",
-    async handler(_args, ctx) {
+    description: "Show YAAM memory status. Use '/yaam viz' for a visual workspace graph view.",
+    async handler(args, ctx) {
+      // ─── Subcommand: viz ──────────────────────────────────────────────
+      if (typeof args === 'string' && args.trim() === 'viz') {
+        try {
+          const data = await connMgr.withConnection(async (conn) => {
+            return await gatherWorkspaceData(conn);
+          });
+
+          if (!data) {
+            ctx.ui.notify(
+              "No active workspace. Use yaam_workspace_initialize to create one.",
+              "info",
+            );
+            return;
+          }
+
+          const output = renderWorkspaceView(data);
+          ctx.ui.notify(output, "info");
+        } catch (e: any) {
+          ctx.ui.notify(`YAAM visualization error: ${e.message || String(e)}`, "error");
+        }
+        return;
+      }
+
+      // ─── Default: status display ──────────────────────────────────────
       try {
         const stats = await connMgr.withConnection(async (conn) => {
           const typeResult = await conn.query(

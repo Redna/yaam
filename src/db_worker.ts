@@ -12,35 +12,32 @@ function sleep(ms: number) {
 }
 
 async function safeOpenDatabase(dbPath: string): Promise<any> {
-  const walPath = dbPath + '.wal';
   const lockDir = dbPath + '.yaam_probe_lock';
 
-  if (fs.existsSync(walPath)) {
-    let lockAcquired = false;
+  let lockAcquired = false;
+  try {
+    fs.mkdirSync(lockDir);
+    lockAcquired = true;
+  } catch (e) {
+    let waited = 0;
+    while (fs.existsSync(lockDir) && waited < 15000) {
+      await sleep(100);
+      waited += 100;
+    }
     try {
       fs.mkdirSync(lockDir);
       lockAcquired = true;
-    } catch (e) {
-      let waited = 0;
-      while (fs.existsSync(lockDir) && waited < 15000) {
-        await sleep(100);
-        waited += 100;
-      }
-    }
-
-    if (lockAcquired) {
-      try {
-        // If we acquired the lock and WAL exists, we could check if it crashes.
-        // We rely on the worker dying if it segfaults.
-      } finally {
-        try { fs.rmdirSync(lockDir); } catch {}
-      }
-    }
+    } catch {}
   }
 
-  // Default buffer pool is ~8TB which causes Mmap failures.
-  // 256MB is plenty for YAAM's graph size.
-  return new ladybug.Database(dbPath, 256 * 1024 * 1024);
+  try {
+    // 32MB buffer pool is plenty for code topology graphs and prevents VM OOM.
+    return new ladybug.Database(dbPath, 32 * 1024 * 1024);
+  } finally {
+    if (lockAcquired) {
+      try { fs.rmdirSync(lockDir); } catch {}
+    }
+  }
 }
 
 process.on('message', async (msg: any) => {
@@ -62,6 +59,7 @@ process.on('message', async (msg: any) => {
       db = null;
       conn = null;
       stmts.clear();
+      if (global.gc) global.gc(); // Force V8 to run destructors and unmap 8TB sparse memory
       safeSend({ id: msg.id, success: true });
 
     } else if (msg.action === 'prepare') {
@@ -93,27 +91,33 @@ process.on('message', async (msg: any) => {
       safeSend({ id: msg.id, success: true, rows });
     }
   } catch (err: any) {
-    if (process.connected && process.send) {
-      try { 
-        process.send({ id: msg.id, success: false, error: err.message || String(err) }, (e) => {
-          if (e) process.exit(1);
-        }); 
-      } catch (e) { process.exit(1); }
-    } else {
+    // Only exit if the IPC channel is truly gone (parent died).
+    // Transient send errors (EPIPE from full buffer, momentary congestion)
+    // must NOT kill the worker — that creates a race where the callback
+    // fires mid-next-operation, corrupting DB state and leaving the
+    // parent's pending request hanging forever.
+    if (!process.connected || !process.send) {
       process.exit(1);
+    }
+    try {
+      process.send!({ id: msg.id, success: false, error: err.message || String(err) });
+    } catch {
+      // Send failed but IPC still connected — don't exit.
+      // Parent will detect the missing response via its exit/error handlers.
     }
   }
 });
 
-// Helper for safe sends
+// Helper for safe sends — only exits if IPC is truly disconnected.
+// Transient send errors are swallowed to prevent killing the worker
+// mid-operation (which corrupts DB state and hangs the parent's mutex).
 function safeSend(payload: any) {
-  if (process.connected && process.send) {
-    try { 
-      process.send(payload, (e) => {
-        if (e) process.exit(1);
-      }); 
-    } catch (e) { process.exit(1); }
-  } else {
+  if (!process.connected || !process.send) {
     process.exit(1);
+  }
+  try {
+    process.send!(payload);
+  } catch {
+    // Transient error — don't exit. Parent handles missing responses.
   }
 }

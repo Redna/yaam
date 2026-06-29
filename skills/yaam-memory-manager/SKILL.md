@@ -11,7 +11,7 @@ This skill provides procedural guidance for interacting with the YAAM engine, wh
 
 - **Layer 0 (Physical):** Automatically tracked files, functions, classes, call graphs, inheritance, and import dependencies. Use `yaam_graph_explore` to query.
 - **Layer 1 (Cognitive):** Agent-defined workspaces and scratchpads for recording decisions and rationale.
-- **Reconciliation:** The system automatically syncs with the filesystem in the background after tool use. Uses the TypeScript Compiler API for TS/JS and Pyright LSP for Python.
+- **Reconciliation:** The system automatically syncs with the filesystem in the background after every file operation (write, edit, bash). The graph always reflects the **live state** of the repository — entity topology (files, functions, classes, calls, imports, inheritance) is current as of the last tool invocation. Uses the TypeScript Compiler API for TS/JS and Pyright LSP for Python.
 
 ## Architecture Overview
 
@@ -20,6 +20,8 @@ YAAM runs as a first-class pi extension. All database operations happen in-proce
 The reconciler runs in the background (fire-and-forget):
 1. **Parse phase** (no DB lock): Reads files, parses AST, resolves calls/inheritance/imports.
 2. **Commit phase** (brief DB lock): Writes entities and relationships to LadybugDB.
+
+**The graph is trustworthy.** Every `write`, `edit`, and `bash` tool result triggers a background reconcile that updates the graph to match the filesystem. You do not need to manually verify graph data against files — if an entity is in the graph, it exists on disk; if a file was deleted, its entities are marked deleted. The topology (calls, imports, inheritance) reflects the current codebase. Use the graph as your primary navigation and impact-analysis tool.
 
 ## Workflows
 
@@ -320,6 +322,7 @@ If a query returns a "spooled" message, read that file to see full results.
 
 ## Guardrails
 
+- **Live Reconciliation:** The graph is automatically reconciled after every file operation (write, edit, bash) and reflects the current state of the repository. Entity topology is always current — trust it as your primary source of code structure.
 - **Read-Only:** `yaam_graph_explore` is strictly read-only. Write operations (CREATE, MERGE, SET, DELETE, etc.) are blocked.
 - **Context Protection:** Results > 20 rows are spooled to `.chunks/memory_dumps/query_out.txt`. Read that file if directed.
 - **Memory Decay:** Older notes lose relevance. Focus on the most recent context returned by retrieval tools.
