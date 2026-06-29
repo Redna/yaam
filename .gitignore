@@ -1,22 +1,6 @@
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-ENV/
-.env
-
-# LadybugDB files
-*.lbug
-*.lbug/
-memory.lbug
-memory.lbug/
-*.lbug.wal
-*.lbug.wal/
-
 # YAAM internals
 .chunks/
 history.jsonl
+events.jsonl
 node_modules/
 .pi/
-

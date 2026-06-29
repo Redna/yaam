@@ -1,101 +1,86 @@
-# YAAM Agent Onboarding & Instructions (Antigravity / Gemini CLI)
+# YAAM Agent Onboarding & Instructions (Gemini / Antigravity / Other Agents)
 
-This repository is equipped with **YAAM (Yet Another Agent Memory)**. All agents interacting with this codebase MUST use the memory engine to maintain continuity and structural awareness.
+This repository is equipped with **YAAM (Yet Another Agent Memory)**. All agents interacting with this codebase SHOULD use the memory engine to maintain continuity and structural awareness.
 
 ## 1. Environment & Tools
 
-YAAM runs as a **first-class pi extension** when used with pi. For Gemini/Antigravity and other agents, CLI scripts are available.
+YAAM runs as a **first-class pi extension**. The Rust engine daemon (`src-rust/`) is spawned automatically by the extension and communicates over stdio JSON-RPC 2.0.
 
-- **Pi extension:** Tools (`yaam_graph_explore`, `yaam_workspace_initialize`, `yaam_workspace_append_note`) and `/yaam` command are registered automatically.
-- **CLI scripts:** Located at `skills/yaam-memory-manager/scripts/` (for non-pi agents).
-- **Node Env:** Run CLI scripts via `npx tsx skills/yaam-memory-manager/scripts/<script>.ts`.
+- **Pi extension:** Tools (`yaam_graph_explore`, `yaam_workspace_initialize`, `yaam_workspace_append_note`) and `/yaam` command are registered automatically when the extension loads.
+- **Non-pi agents:** The YAAM tools are available only within pi. If you are a non-pi agent, you can still benefit from the graph data by reading the `events.jsonl` log or asking a pi agent to run queries on your behalf.
 
 ## 2. Mandatory Workflows
 
 ### Memory Exploration
 Before making architectural changes, query the existing relationships:
 
-**Pi (in-process tool):**
 ```
-yaam_graph_explore(query="MATCH (n:Entity) RETURN n.type, count(n) AS count ORDER BY count DESC")
-```
-
-**Gemini/CLI:**
-```bash
-npx tsx skills/yaam-memory-manager/scripts/graph_explore.ts "MATCH (n:Entity) RETURN n.type, count(n) AS count ORDER BY count DESC"
+yaam_graph_explore(query={"match":{"label":"Entity"}, "aggregate":{"group_by":"type","count":true}})
 ```
 
 ### Task Initialization
-When starting a new task, initialize a dedicated context:
+When starting a task, initialize a dedicated context:
 
-**Pi:**
 ```
 yaam_workspace_initialize(name="your-active-task", description="What you're working on")
-```
-
-**Gemini/CLI:**
-```bash
-npx tsx skills/yaam-memory-manager/scripts/workspace_initialize.ts --name "your-active-task" --description "What you're working on"
 ```
 
 ### Insight Capture
 Record all "Why" decisions and learnings:
 
-**Pi:**
 ```
 yaam_workspace_append_note(workspace="your-active-task", content="Decided X because Y")
 ```
 
-**Gemini/CLI:**
-```bash
-npx tsx skills/yaam-memory-manager/scripts/workspace_append_note.ts --workspace "your-active-task" --content "Decided X because Y"
-```
-
 ## 3. Physical State Sync
 
-### Pi agents
-The extension automatically reconciles the codebase in the background after tool use and at agent end. No manual sync is needed.
+The extension automatically reconciles the codebase in the background after every tool use (`write`, `edit`, `bash`, `read`). The Rust engine parses files with tree-sitter and resolves cross-file references via `typescript-language-server`. No manual sync is needed.
 
-### Gemini / other agents
-The system relies on hooks configured in `.gemini/settings.json` (`AfterTool`) and `.agents/hooks.json` (`PostToolUse`). These trigger the reconciler CLI script after tool use. If manual sync is needed:
-```bash
-npx tsx skills/yaam-memory-manager/scripts/reconciler.ts          # incremental
-npx tsx skills/yaam-memory-manager/scripts/reconciler.ts --full  # full scan
+## 4. Querying Examples (JSON DSL)
+
+The `yaam_graph_explore` tool accepts a JSON Query DSL, not Cypher.
+
+### Entity counts by type
+```json
+{"match":{"label":"Entity"}, "aggregate":{"group_by":"type","count":true}}
 ```
 
-## 4. Querying Examples
+### All functions in a file
+```json
+{"match":{"label":"Entity","entity_type":"Function"}, "where":{"edge_to":{"id":"src/index.ts","relationship":"DECLARED_IN"}}}
+```
 
-### Entity counts
-```cypher
-MATCH (n:Entity) RETURN n.type, count(n) AS count ORDER BY count DESC
+### Reverse call graph (impact analysis)
+```json
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"inbound","max_depth":2}}
+```
+
+### Forward call graph
+```json
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"outbound","max_depth":3}}
 ```
 
 ### Import dependencies
-```cypher
-MATCH (src:Entity {type: 'File'})-[:LINKED_TO {relationship_type: 'IMPORTS'}]->(dst:Entity {type: 'File'}) RETURN src.id, dst.id
+```json
+{"match":{"label":"Entity","entity_type":"File"}, "traverse":{"relationship":"IMPORTS","direction":"outbound","max_depth":1}}
 ```
 
-### Call graph
-```cypher
-MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity) RETURN caller.id, callee.id
+### Active workspace notes
+```json
+{"match":{"label":"Workspace","status":"active"}, "traverse":{"relationship":"HAS_SCRATCHPAD","direction":"outbound","max_depth":1}}
 ```
 
-### Inheritance
-```cypher
-MATCH (sub:Entity)-[:LINKED_TO {relationship_type: 'INHERITS_FROM'}]->(sup:Entity) RETURN sub.id, sup.id
-```
+## 5. Architecture
 
-### Workspace notes
-```cypher
-MATCH (w:Workspace {status: 'active'})-[:HAS_SCRATCHPAD]->(s:Scratchpad) RETURN s.content, s.created_at ORDER BY s.created_at DESC
-```
+YAAM uses a dual-layer model:
 
-## 5. Multi-Agent Coexistence
+- **Layer 0 (Physical):** Files, functions, classes, call graphs, imports, and inheritance — automatically tracked via tree-sitter + LSP.
+- **Layer 1 (Cognitive):** Agent-defined workspaces with scratchpad notes for recording decisions.
 
-Multiple agents can share the same `memory.lbug` database file. Lock contention is handled via exponential backoff (50ms → 2s, up to 10 retries). Each agent holds the database lock only for milliseconds during queries or reconciliation writes.
+State is persisted as an append-only `events.jsonl` log. On startup, events are replayed into an in-memory graph (`Arc<RwLock<MemoryEngine>`) for instant queries.
 
 ## 6. Guardrails
 
-- **Read-Only:** `graph_explore` is strictly read-only. Write operations are blocked.
+- **Read-Only:** `yaam_graph_explore` is strictly read-only.
 - **Context Protection:** Results > 20 rows are spooled to `.chunks/memory_dumps/query_out.txt`.
-- **Memory Decay:** Older notes lose relevance. Focus on the most recent context.
+- **Auto-Reconciliation:** The graph reflects the live state of the repository after every tool invocation.

@@ -1,56 +1,44 @@
 # YAAM (Yet Another Agent Memory)
 
-2-layered agent memory system: physical code topology (Layer 0) + cognitive workspaces (Layer 1). Written in TypeScript, backed by LadybugDB.
+A dual-layered hybrid semantic-episodic memory engine for local coding agents. It provides a physical code topology (Layer 0) augmented with cognitive workspaces (Layer 1).
+
+YAAM runs as a standalone compiled **Rust daemon** communicating over `stdio` JSON-RPC 2.0, utilizing an append-only JSONL event stream, an in-memory graph, and a highly interactive web-based Cytoscape UI.
 
 ## Architecture
 
 ```
-src/
-├── index.ts          Pi extension: tools, hooks, /yaam command, progress bar UI
-├── db.ts             ConnectionManager: Mutex + worker IPC + lock-and-release
-├── db_worker.ts       Forked worker process: LadybugDB native isolation, safe IPC
-├── reconciler.ts     Background reconciler: parse phase (no lock) + commit phase (brief lock)
-├── graph_explore.ts  Read-only Cypher with write protection + result spooling
-└── workspace.ts      Workspace init, note append, file tracking
-
-skills/yaam-memory-manager/
-├── SKILL.md              Agent onboarding skill
-└── scripts/              CLI scripts for non-pi agents (Gemini, etc.)
-    ├── db.ts             Standalone DB connection
-    ├── graph_explore.ts  CLI query tool
-    ├── reconciler.ts     CLI reconciler
-    ├── workspace_*.ts    CLI workspace tools
-    └── lsp_client.ts     Pyright LSP client (shared with extension)
+src-rust/
+├── src/main.rs          Rust daemon entrypoint
+├── src/rpc.rs           JSON-RPC 2.0 stdio server
+├── src/graph.rs         In-memory graph engine (Arc<RwLock>)
+├── src/storage.rs       Append-only JSONL event persistence (`fs2` file locks)
+├── src/reconciler.rs    Tree-sitter AST parser
+├── src/lsp_adapter.rs   Stdio client to typescript-language-server
+├── src/embedding.rs     ONNX Inference (gte-small)
+└── src/search.rs        BM25 Inverted Index
 ```
 
 ## How It Works
 
 ### Layer 0 — Physical Topology
-Automatically tracks files, functions, classes, call graphs, inheritance, and imports.
-- **TS/JS:** TypeScript Compiler API (`createLanguageService`, `resolveModuleName`)
-- **Python:** Pyright LSP via stdio JSON-RPC
+Automatically tracks files, functions, classes, and cross-file relationships (CALLS, IMPORTS, INHERITS_FROM).
+- **Tree-sitter Parsing:** Extracts local declarations and call expressions seamlessly.
+- **LSP Resolution:** The Rust Reconciler delegates `textDocument/definition` requests to an active background `typescript-language-server` over stdio, resolving targets and generating accurate cross-file edges.
+- **Deletion Tracking:** Orphaned entities and deleted files automatically issue `DELETE_NODE` payloads across the in-memory graph, preventing stale context.
 
 ### Layer 1 — Cognitive Context
-Agent-defined workspaces with chronological scratchpads for design rationale and decisions.
+Agent-defined workspaces containing chronological scratchpads for design rationale and decisions.
 
-### Database Isolation
-LadybugDB uses native C++ with mmap buffer pools. A native segfault kills the process. All DB operations run in a **forked worker process** (`db_worker.ts`) to isolate crashes.
+### Zero-Dependency Rust Engine
+The backend operates entirely without heavy external DBs.
+- **Append-Only JSONL Storage:** State is restored safely from a unified `events.jsonl` event log, protected from concurrent overwrites by OS-level locking.
+- **In-Memory Speed:** Graph relationships and nodes reside exclusively in RAM, enabling instant DSL queries and recursive traversals.
+- **Semantic + Keyword Hybrid Search:** `yaam-engine` ships with a 38M parameter ONNX embedding model (`thenlper/gte-small`) executed locally on CPU for dense semantic lookup, paired with a custom Unicode-aware BM25 token index.
 
-- **Buffer pool:** 256 MB (default ~8 TB causes mmap failures)
-- **CHECKPOINT** before every close (prevents WAL corruption)
-- **Worker reuse** on success (no fork overhead); **SIGKILL** on error (clean buffer pool)
-- **Mutex** serializes `withConnection()` calls — only one DB operation at a time
-- **IPC:** `safeSend()` with error callbacks prevents EPIPE crashes on both sides
-
-### Background Reconciler
-Fire-and-forget, two phases:
-1. **Parse** (no DB lock): scan files, extract AST, resolve calls/inheritance. Yields via `setImmediate()` between files — never blocks the developer.
-2. **Commit** (brief DB lock): write entities + edges, clean stale entries. Also yields between files.
-
-Progress is reported via a `progress` getter and rendered as a Unicode bar in the status bar: `Sync 🔄 Parsing files ████░░░░░░ 12/42` (250ms polling).
-
-### Optimistic Saves
-Workspace tools (`yaam_workspace_initialize`, `yaam_workspace_append_note`) fire DB writes without awaiting — they return immediately. Write completes in the background.
+## Web-Based Graph Visualizer
+Running `/yaam viz` spins up a local Express backend serving an interactive UI at `http://localhost:3456`.
+- **Cytoscape.js Frontend:** A premium, dark-mode GUI highlighting Code nodes, Workspaces, and Scratchpads natively.
+- **Interactive Details:** Hover animations and sidebars explicitly map node attributes and metadata in real-time.
 
 ## Graph Schema
 
@@ -70,33 +58,23 @@ Workspace tools (`yaam_workspace_initialize`, `yaam_workspace_append_note`) fire
 
 | Tool | Description |
 |------|-------------|
-| `yaam_graph_explore` | Read-only Cypher query. Write ops blocked. Results > 20 rows spooled to file. |
+| `yaam_graph_explore` | Executes a custom JSON DSL query against the Rust engine's in-memory graph. |
 | `yaam_workspace_initialize` | Create workspace, deactivate previous. Schedules full reconcile. |
 | `yaam_workspace_append_note` | Append note to workspace scratchpad. |
-| `/yaam` | Status command: entity counts, workspace, notes, reconciler state. |
-
-## Lifecycle Hooks
-
-| Event | Action |
-|-------|--------|
-| `session_start` | Status: "Ready ✅" |
-| `session_shutdown` | Kill status timer, shutdown LSP clients |
-| `turn_start` | Resume progress polling if reconciler running |
-| `tool_result` | Schedule incremental reconcile (write/edit/bash) |
-| `agent_end` | Schedule full reconcile |
+| `/yaam viz` | Launches the interactive web-based topology visualizer. |
 
 ## Setup
 
-```bash
-npm install
-```
+1. **Install Model Weights**:
+   Execute `cargo run --manifest-path src-rust/Cargo.toml -- setup` to pull down the required HuggingFace `gte-small` model and tokenizer.
+2. **Build Release Binary**:
+   Ensure Rust is installed, then compile the engine:
+   ```bash
+   cd src-rust && cargo build --release
+   ```
+3. **Compile TypeScript Extension**:
+   ```bash
+   npm run build
+   ```
 
 Loaded automatically by pi from `pi.extensions` in `package.json`.
-
-## Multi-Agent Support
-
-All agents share `memory.lbug`. Lock contention handled by exponential backoff (50ms → 2s, 10 retries). Each agent holds the lock only during the commit phase (~100ms).
-
-- **pi:** In-process extension tools
-- **Gemini/Antigravity:** CLI scripts via `.gemini/settings.json` hooks
-- **Other agents:** CLI scripts via `.agents/hooks.json` hooks

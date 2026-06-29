@@ -1,0 +1,15 @@
+/home/anima/yaam/src-rust/target/debug/deps/onig-6b82c28a840c5d93.d: /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/lib.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/buffers.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/find.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/flags.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/match_param.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/names.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/region.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/replace.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/syntax.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/tree.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/utils.rs
+
+/home/anima/yaam/src-rust/target/debug/deps/libonig-6b82c28a840c5d93.rmeta: /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/lib.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/buffers.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/find.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/flags.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/match_param.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/names.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/region.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/replace.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/syntax.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/tree.rs /home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/utils.rs
+
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/lib.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/buffers.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/find.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/flags.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/match_param.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/names.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/region.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/replace.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/syntax.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/tree.rs:
+/home/anima/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/onig-6.5.3/src/utils.rs:

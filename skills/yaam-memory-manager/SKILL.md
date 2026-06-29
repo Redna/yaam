@@ -11,17 +11,17 @@ This skill provides procedural guidance for interacting with the YAAM engine, wh
 
 - **Layer 0 (Physical):** Automatically tracked files, functions, classes, call graphs, inheritance, and import dependencies. Use `yaam_graph_explore` to query.
 - **Layer 1 (Cognitive):** Agent-defined workspaces and scratchpads for recording decisions and rationale.
-- **Reconciliation:** The system automatically syncs with the filesystem in the background after every file operation (write, edit, bash). The graph always reflects the **live state** of the repository — entity topology (files, functions, classes, calls, imports, inheritance) is current as of the last tool invocation. Uses the TypeScript Compiler API for TS/JS and Pyright LSP for Python.
+- **Reconciliation:** The system automatically syncs with the filesystem in the background after every tool operation (write, edit, bash, read). The graph always reflects the **live state** of the repository. Uses tree-sitter for AST parsing and `typescript-language-server` for cross-file resolution.
 
 ## Architecture Overview
 
-YAAM runs as a first-class pi extension. All database operations happen in-process using a lock-and-release pattern with exponential backoff — no subprocess spawning or CLI shell-outs. This enables multi-agent coexistence on the same project.
+YAAM runs as a first-class pi extension. The backend is a compiled Rust daemon communicating over stdio JSON-RPC 2.0, using an append-only JSONL event log and an in-memory graph engine. State is restored on startup by replaying events.
 
 The reconciler runs in the background (fire-and-forget):
-1. **Parse phase** (no DB lock): Reads files, parses AST, resolves calls/inheritance/imports.
-2. **Commit phase** (brief DB lock): Writes entities and relationships to LadybugDB.
+1. **Parse phase:** Reads files, parses AST with tree-sitter, resolves calls/inheritance/imports via LSP.
+2. **Commit phase:** Generates events (UPSERT_NODE, LINK_NODES, DELETE_NODE) and applies them to the JSONL log and in-memory graph.
 
-**The graph is trustworthy.** Every `write`, `edit`, and `bash` tool result triggers a background reconcile that updates the graph to match the filesystem. You do not need to manually verify graph data against files — if an entity is in the graph, it exists on disk; if a file was deleted, its entities are marked deleted. The topology (calls, imports, inheritance) reflects the current codebase. Use the graph as your primary navigation and impact-analysis tool.
+**The graph is trustworthy.** Every `write`, `edit`, `bash`, and `read` tool result triggers a background reconcile that updates the graph to match the filesystem. Use the graph as your primary navigation and impact-analysis tool.
 
 ## Workflows
 
@@ -39,7 +39,7 @@ As you discover nuances or make decisions, record them in the scratchpad.
 ### 3. Exploring Relationships
 To understand how code components are linked, query the graph.
 - **Tool:** `yaam_graph_explore(query)`
-- The tool description includes an inline schema and examples for quick reference.
+- The tool description includes an inline JSON DSL schema and examples for quick reference.
 - Detailed query patterns are documented below in **Query Cookbook**.
 
 ### 4. Checking Status
@@ -53,33 +53,15 @@ Run the `/yaam` command to see entity counts, active workspace, recent notes, an
 | Property | Type | Description |
 |----------|------|-------------|
 | `id` | string | Hierarchical path identifier (see ID Format below) |
-| `type` | string | `"File"`, `"Function"`, or `"Class"` |
+| `entity_type` | string | `"File"`, `"Function"`, or `"Class"` |
 | `status` | string | `"active"` (entity exists in codebase) |
 | `last_modified` | int | Unix timestamp of last reconciliation |
-| `metadata` | string (JSON) | Rich metadata for Functions/Classes (see below); `null` for Files |
-
-**`metadata` JSON fields (Functions/Classes):**
-
-| Field | Type | Description | Example |
-|-------|------|-------------|---------|
-| `line` | int | Start line number | `42` |
-| `endLine` | int | End line number | `96` |
-| `signature` | string | Full function/class signature | `"withConnection(fn, maxRetries): Promise<T>"` |
-| `isAsync` | bool | Whether the function is async | `true` |
-| `isExported` | bool | Whether it's exported (TS/JS) | `true` |
-| `isStatic` | bool | Whether it's a static method | `false` |
-| `isAbstract` | bool | Whether it's abstract | `false` |
-| `params` | array | Parameter list: `{name, type?, default?}` | `[{"name":"fn","type":"..."}]` |
-| `returnType` | string | Return type annotation | `"Promise<T>"` |
-| `docComment` | string | JSDoc/Python docstring text | `"Acquires a DB connection..."` |
-
-> Not all fields are present for every entity. Use `WHERE metadata CONTAINS '"isAsync":true'` to filter.
-> For Files, `metadata` is `null`.
+| `metadata` | string (JSON) | Rich metadata for Functions/Classes (see below); empty for Files |
 
 **Workspace** — task contexts
 | Property | Type | Description |
 |----------|------|-------------|
-| `workspace_name` | string | Unique identifier (e.g. `"auth-fix"`) |
+| `id` | string | Unique identifier (workspace name) |
 | `description` | string | Human-readable task description |
 | `status` | string | `"active"` or `"inactive"` |
 | `closed_at` | timestamp | When workspace was closed; `null` if still open |
@@ -96,9 +78,7 @@ Run the `/yaam` command to see entity counts, active workspace, recent notes, an
 **`LINKED_TO`** — Entity → Entity (code relationships)
 | Property | Type | Description |
 |----------|------|-------------|
-| `relationship_type` | string | `"CALLS"`, `"DECLARED_IN"`, `"IMPORTS"`, `"INHERITS_FROM"` |
-
-> This is the ONLY property on `LINKED_TO` edges. Do not access other properties on these edges.
+| `relationship` | string | `"CALLS"`, `"DECLARED_IN"`, `"IMPORTS"`, `"INHERITS_FROM"` |
 
 **`MAPPED_TO`** — Workspace → Entity (files tracked to a workspace)
 | Property | Type | Description |
@@ -115,215 +95,132 @@ Run the `/yaam` command to see entity counts, active workspace, recent notes, an
 | Type | Format | Example |
 |------|--------|---------|
 | File | `<path>` | `src/index.ts` |
-| Function | `<file>::<function>` | `src/db.ts::sleep` |
-| Method | `<file>::<Class>::<method>` | `src/db.ts::ConnectionManager::withConnection` |
-| Callback | `<file>::<parent>::<callback>` | `src/db.ts::main::action() callback` |
-| Class | `<file>::<Class>` | `test_py/a.py::DerivedClass` |
+| Function | `<file>::<function>` | `src/reconciler.ts::reconcile` |
+| Method | `<file>::<Class>::<method>` | `src/engine-client.ts::YaamEngineClient::start` |
+| Class | `<file>::<Class>` | `src/reconciler.ts::Reconciler` |
 
-> Nested callbacks and closures are tracked hierarchically: `file::outerFn::innerFn::callback`. This lets you trace callback scope chains.
+## Query Cookbook (JSON DSL)
 
-## Query Cookbook
+The `yaam_graph_explore` tool accepts a JSON Query DSL object. Below are common patterns.
 
 ### Entity Discovery
 
-```cypher
--- All files in the project
-MATCH (f:Entity {type: 'File'}) RETURN f.id AS file
+```json
+// All entities
+{"match":{"label":"Entity"}}
 
--- All files matching a pattern
-MATCH (f:Entity {type: 'File'}) WHERE f.id CONTAINS '.ts' RETURN f.id
+// All files
+{"match":{"label":"Entity","entity_type":"File"}}
 
--- All functions in a specific file
-MATCH (fn:Entity)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file:Entity {type: 'File'})
-WHERE file.id CONTAINS 'reconciler.ts'
-RETURN fn.id AS function, fn.metadata AS meta
+// All functions
+{"match":{"label":"Entity","entity_type":"Function"}}
+
+// All functions in a specific file
+{"match":{"label":"Entity","entity_type":"Function"}, "where":{"edge_to":{"id":"src/index.ts","relationship":"DECLARED_IN"}}}
+
+// Find entities by name substring
+{"match":{"label":"Entity","name_contains":"reconcile"}}
 ```
 
 ### Call Graph Analysis
 
-```cypher
--- What does function X call? (forward call graph)
-MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity)
-WHERE caller.id CONTAINS 'reconcile'
-RETURN caller.id AS caller, callee.id AS callee
+```json
+// What does function X call? (forward call graph, 3 hops)
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"outbound","max_depth":3}}
 
--- Who calls function X? (reverse call graph / impact analysis)
-MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity)
-WHERE callee.id CONTAINS 'getConn'
-RETURN caller.id AS caller
-
--- Multi-hop transitive call chain (1-3 levels)
-MATCH path = (src:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}*1..3]->(dst:Entity)
-WHERE src.id CONTAINS 'reconcile'
-RETURN src.id AS source, dst.id AS target, length(path) AS depth
-
--- Import dependencies between files
-MATCH (src:Entity {type: 'File'})-[:LINKED_TO {relationship_type: 'IMPORTS'}]->(dst:Entity {type: 'File'})
-RETURN src.id AS importer, dst.id AS imported
+// Who calls function X? (reverse call graph / impact analysis, 2 hops)
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"inbound","max_depth":2}}
 ```
 
-### Inheritance
+### Import Dependencies
 
-```cypher
--- Class inheritance hierarchy
-MATCH (sub:Entity)-[:LINKED_TO {relationship_type: 'INHERITS_FROM'}]->(sup:Entity)
-RETURN sub.id AS subclass, sup.id AS superclass
+```json
+// What does a file import?
+{"match":{"id":"src/index.ts"}, "traverse":{"relationship":"IMPORTS","direction":"outbound","max_depth":1}}
+```
+
+### Aggregation
+
+```json
+// Entity counts by type
+{"match":{"label":"Entity"}, "aggregate":{"group_by":"type","count":true}}
+
+// Entity counts by status
+{"match":{"label":"Entity"}, "aggregate":{"group_by":"status","count":true}}
 ```
 
 ### Workspace & Memory Queries
 
-```cypher
--- Active workspace
-MATCH (w:Workspace {status: 'active'}) RETURN w.workspace_name, w.description
+```json
+// Active workspace
+{"match":{"label":"Workspace","status":"active"}}
 
--- All workspaces and their status
-MATCH (w:Workspace) RETURN w.workspace_name AS name, w.status AS status, w.closed_at AS closed
-
--- Notes in a specific workspace
-MATCH (w:Workspace {workspace_name: 'auth-fix'})-[:HAS_SCRATCHPAD]->(s:Scratchpad)
-RETURN s.content AS note, s.created_at AS created
-
--- Files mapped to a workspace
-MATCH (w:Workspace {workspace_name: 'auth-fix'})-[:MAPPED_TO]->(e:Entity)
-WHERE e.type = 'File'
-RETURN e.id AS file
-
--- All functions in files mapped to a workspace
-MATCH (w:Workspace {workspace_name: 'auth-fix'})-[:MAPPED_TO]->(file:Entity {type: 'File'})
-MATCH (fn:Entity)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file)
-RETURN fn.id AS function
+// Notes in active workspace
+{"match":{"label":"Workspace","status":"active"}, "traverse":{"relationship":"HAS_SCRATCHPAD","direction":"outbound","max_depth":1}}
 ```
 
-### Metadata & Staleness
+### Result Projection
 
-```cypher
--- Entity counts by type
-MATCH (n:Entity) RETURN n.type AS type, count(n) AS count ORDER BY count DESC
-
--- Recently modified entities
-MATCH (e:Entity) RETURN e.id, e.last_modified ORDER BY e.last_modified DESC LIMIT 10
-
--- Stale workspace-to-entity mappings
-MATCH (w:Workspace)-[r:MAPPED_TO]->(e:Entity) WHERE r.is_stale = true
-RETURN w.workspace_name AS workspace, e.id AS entity
+```json
+// Return only specific fields
+{"match":{"label":"Entity","entity_type":"Function"}, "return_fields":["id","name"], "limit":10}
 ```
 
-### Rich Metadata Queries
+## DSL Structure Reference
 
-The `metadata` field is a JSON string containing signatures, docstrings, and structural
-metadata. Query it with `CONTAINS` (the DB does not support JSON path access):
-
-```cypher
--- Find all async functions
-MATCH (f:Entity {type: 'Function'})
-WHERE f.metadata CONTAINS '"isAsync":true'
-RETURN f.id, f.metadata
-
--- Find all exported functions
-MATCH (f:Entity {type: 'Function'})
-WHERE f.metadata CONTAINS '"isExported":true'
-RETURN f.id
-
--- Find functions that take a specific parameter type
-MATCH (f:Entity {type: 'Function'})
-WHERE f.metadata CONTAINS 'ConnectionProxy'
-RETURN f.id
-
--- Find functions with docstrings mentioning a keyword
-MATCH (f:Entity {type: 'Function'})
-WHERE f.metadata CONTAINS '"docComment"' AND f.metadata CONTAINS 'lock'
-RETURN f.id
-
--- View full signature and metadata for a function
-MATCH (f:Entity {type: 'Function'})
-WHERE f.id CONTAINS 'withConnection'
-RETURN f.id, f.metadata
-
--- Find all functions without docstrings (no docComment field)
-MATCH (f:Entity {type: 'Function'})
-WHERE NOT f.metadata CONTAINS '"docComment"'
-RETURN f.id
+```json
+{
+  "match": {
+    "label": "Entity" | "Workspace" | "Scratchpad",
+    "entity_type": "File" | "Function" | "Class",
+    "id": "node_id",
+    "status": "active" | "inactive",
+    "name_contains": "substring"
+  },
+  "where": {
+    "edge_to": { "id": "target_id", "relationship": "DECLARED_IN" | "CALLS" | "IMPORTS" },
+    "edge_from": { "id": "source_id", "relationship": "CALLS" }
+  },
+  "traverse": {
+    "relationship": "CALLS" | "IMPORTS" | "HAS_SCRATCHPAD" | "DECLARED_IN",
+    "direction": "outbound" | "inbound" | "both",
+    "max_depth": 1
+  },
+  "aggregate": { "group_by": "type" | "label" | "status", "count": true },
+  "limit": 20,
+  "return_fields": ["id", "name", "label", "content", "metadata"]
+}
 ```
-
-## Cypher Dialect Pitfalls
-
-This system uses a DuckDB-backed Cypher engine. The following are known differences from Neo4j/openCypher:
-
-### 1. `type(r)` does not exist
-
-```
-❌ MATCH ()-[r]->() RETURN type(r)
-   → Error: function TYPE does not exist
-
-✅ MATCH ()-[r:LINKED_TO]->() RETURN r.relationship_type
-```
-
-### 2. Strict property binding
-
-Accessing a property that doesn't exist on **all** matched nodes throws a Binder exception instead of returning `null`:
-
-```
-❌ MATCH (n) RETURN n.id
-   → Error: Binder exception: Cannot find property id for n
-   (because Workspace nodes don't have an `id` property)
-
-✅ MATCH (n:Entity) RETURN n.id
-   (filter by label first so all matched nodes have the property)
-
-✅ MATCH (n) RETURN keys(n) AS props
-   (use keys() to discover what properties exist before accessing them)
-```
-
-### 3. Relationship table names must match exactly
-
-```
-❌ MATCH (w:Workspace)-[:HAS_ENTITY]->(e:Entity)
-   → Error: Table HAS_ENTITY does not exist
-
-✅ MATCH (w:Workspace)-[:MAPPED_TO]->(e:Entity)
-```
-
-### 4. Large result sets are spooled
-
-Results > 20 rows are not returned inline. They are written to:
-`.chunks/memory_dumps/query_out.txt`
-
-If a query returns a "spooled" message, read that file to see full results.
 
 ## Best Practices
 
-1. **Always initialize a workspace** before starting substantive work. This creates a persistent context container.
+1. **Always initialize a workspace** before starting substantive work.
 
-2. **Use `CONTAINS` for fuzzy entity matching** instead of exact IDs. Entity IDs can be long hierarchical paths, and you often only know part of the name:
-   ```cypher
-   WHERE e.id CONTAINS 'getConn'    -- instead of exact match
+2. **Use `name_contains` for fuzzy matching** instead of exact IDs. Entity IDs can be long hierarchical paths:
+   ```json
+   {"match":{"label":"Entity","name_contains":"reconcile"}}
    ```
 
 3. **Query the reverse call graph for impact analysis.** Before modifying a function, find all callers:
-   ```cypher
-   MATCH (caller)-[:LINKED_TO {relationship_type: 'CALLS'}]->(target)
-   WHERE target.id CONTAINS 'functionYouWantToChange'
-   RETURN caller.id
+   ```json
+   {"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"inbound","max_depth":2}}
    ```
 
-4. **Record "why" not "what".** Scratchpad notes should capture decisions and rationale, not actions. The code diff already shows what changed — notes should explain why.
+4. **Record "why" not "what".** Scratchpad notes should capture decisions and rationale, not actions.
 
-5. **Discover schema with `keys()` before deep queries.** If you're unsure what properties a node type has, run `keys(n)` first:
-   ```cypher
-   MATCH (n:Entity) RETURN keys(n) AS props LIMIT 1
+5. **Use multi-hop traversal for transitive analysis.** The DSL supports `max_depth` up to 5:
+   ```json
+   {"match":{"id":"src/index.ts"}, "traverse":{"relationship":"CALLS","direction":"outbound","max_depth":3}}
    ```
 
-6. **Use multi-hop paths for transitive analysis.** The graph supports `[r*1..N]` traversal which is powerful for understanding cascading impacts:
-   ```cypher
-   MATCH path = (src)-[:LINKED_TO {relationship_type: 'CALLS'}*1..3]->(dst)
+6. **Use `aggregate` for quick summaries.** Get entity counts without retrieving full nodes:
+   ```json
+   {"match":{"label":"Entity"}, "aggregate":{"group_by":"type","count":true}}
    ```
-
-7. **Filter by label before accessing properties.** The strict binder means you should always specify node labels (`:Entity`, `:Workspace`, `:Scratchpad`) to ensure property compatibility.
 
 ## Guardrails
 
-- **Live Reconciliation:** The graph is automatically reconciled after every file operation (write, edit, bash) and reflects the current state of the repository. Entity topology is always current — trust it as your primary source of code structure.
-- **Read-Only:** `yaam_graph_explore` is strictly read-only. Write operations (CREATE, MERGE, SET, DELETE, etc.) are blocked.
+- **Live Reconciliation:** The graph is automatically reconciled after every file operation and reflects the current state of the repository.
+- **Read-Only:** `yaam_graph_explore` is strictly read-only.
 - **Context Protection:** Results > 20 rows are spooled to `.chunks/memory_dumps/query_out.txt`. Read that file if directed.
-- **Memory Decay:** Older notes lose relevance. Focus on the most recent context returned by retrieval tools.
-- **Multi-Agent:** Multiple agents share the same database. Lock contention is handled via exponential backoff.
+- **Max Traversal Depth:** 5 hops maximum.

@@ -6,10 +6,11 @@ All agents working in this repo MUST use YAAM tools to maintain continuity and s
 
 | Tool | Purpose |
 |------|---------|
-| `yaam_graph_explore` | Read-only Cypher queries against the memory graph |
+| `yaam_graph_explore` | Read-only JSON DSL queries against the in-memory Rust graph engine |
 | `yaam_workspace_initialize` | Create a task tracking workspace (deactivates previous) |
 | `yaam_workspace_append_note` | Record decisions/insights to a workspace scratchpad |
-| `/yaam` command | Show memory status (entity counts, workspace, notes) |
+| `/yaam` command | Show memory status (entity counts, workspace, notes, reconciler) |
+| `/yaam viz` | Launch interactive web-based topology visualizer at localhost:3456 |
 
 ## Mandatory Workflows
 
@@ -17,94 +18,89 @@ All agents working in this repo MUST use YAAM tools to maintain continuity and s
 2. **When starting a task:** initialize a workspace.
 3. **After key decisions:** append a note explaining "why", not just "what".
 
-## Architecture (Deep Knowledge)
+## Architecture
 
-### Database Layer: Worker Process Isolation
+### Rust Engine (Standalone Daemon)
 
-LadybugDB (`@ladybugdb/core` v0.17.1) uses native C++ with mmap for its buffer pool. A segfault in the native layer crashes the entire Node.js process. To isolate this, all DB operations run in a **forked worker process** (`src/db_worker.ts`).
+The backend is a compiled Rust binary (`src-rust/`) communicating over `stdio` JSON-RPC 2.0. It uses:
 
-**`ConnectionManager` (`src/db.ts`):**
-- Serializes access via an in-process `Mutex` — only one `withConnection()` runs at a time.
-- Each `withConnection()`: forks worker → open DB → run schema setup → execute fn → CHECKPOINT → close DB → return.
-- **Worker reuse:** On success, the worker stays alive for the next call (no fork overhead). On error, the worker is SIGKILLed so the next call gets a fresh process with a clean buffer pool.
-- **IPC:** Parent sends messages (`open`, `close`, `prepare`, `execute_stmt`, `query`), worker responds via `process.send()`. Both sides use callback-based error handling to prevent EPIPE crashes.
-- **Buffer pool:** Set to 256 MB (`new ladybug.Database(path, 256 * 1024 * 1024)`). The default is ~8 TB which causes mmap failures on systems with limited address space.
-- **CHECKPOINT:** Always runs before `conn.close()` in the worker's `close` handler. Without it, the WAL file is left on disk and the next open segfaults during WAL replay.
+- **Append-only JSONL storage** (`events.jsonl`) with `fs2` file locks for concurrent safety.
+- **In-memory graph** (`Arc<RwLock<MemoryEngine>`) — all nodes and edges reside in RAM for instant queries.
+- **Tree-sitter + LSP reconciliation** — parses TypeScript/JavaScript ASTs and resolves cross-file references via `typescript-language-server`.
+- **Hybrid search** — BM25 inverted index + ONNX `gte-small` dense embeddings (38M params, CPU-only).
 
-**`db_worker.ts`:**
-- Single-threaded message handler. Receives one action at a time.
-- `safeSend()` wraps `process.send()` with `process.connected` check and error callback → `process.exit(1)`. Prevents EPIPE from crashing the parent.
-- `safeOpenDatabase()`: checks for stale WAL file, uses a filesystem lock dir (`.yaam_probe_lock`) for concurrent-open protection.
+### TypeScript Extension (Pi)
 
-### Reconciler: Background Code Topology Sync
+`src/index.ts` is the pi extension entry point. It spawns the Rust engine as a child process and communicates via JSON-RPC over stdio.
 
-**`reconciler.ts`** runs fire-and-forget in the background. Two phases:
+- **`src/engine-client.ts`** — `YaamEngineClient` wraps the stdio JSON-RPC protocol.
+- **`src/reconciler.ts`** — Debounced file sync orchestrator. Walks the project for `.ts`/`.js` files and sends them to the Rust engine for parsing.
+- **`src/workspace.ts`** — Workspace initialization, note appending, and file-access tracking.
+- **`src/graph_explore.ts`** — Thin wrapper that sends DSL queries to the engine and handles result spooling.
+- **`src/visualizer.ts`** — Express + Cytoscape.js web UI served at localhost:3456.
 
-1. **Parse phase** (no DB lock): scans files, parses AST, resolves calls/inheritance/imports. Yields to the event loop via `setImmediate()` between each file so the developer's tools are never blocked. Uses `execFile` (async) for git status, not `execSync`.
-2. **Commit phase** (brief DB lock via `ConnectionManager`): writes entities, edges, cleans up stale entries. Also yields between files.
+### Reconciliation
 
-**Progress reporting:** The reconciler exposes a `progress` getter (`{ phase, detail, current, total }`). The extension polls this every 250ms and renders a Unicode progress bar in the status bar: `Sync 🔄 Parsing files ████░░░░░░ 12/42`.
+The TypeScript `Reconciler` class debounces file changes (1s) and sends file contents to the Rust engine's `reconcile` RPC method. The Rust reconciler:
 
-**Coalescing:** Multiple reconcile requests coalesce. If a full is pending, it takes priority over incremental.
+1. **Parses** the file with tree-sitter to extract declarations (functions, classes) and references (calls, imports).
+2. **Resolves** cross-file references via LSP `textDocument/definition` requests.
+3. **Generates** `UPSERT_NODE`, `LINK_NODES`, `DELETE_NODE` events.
+4. **Applies** events to both the JSONL log and the in-memory graph.
 
-### Extension Entry Point (`index.ts`)
+Progress is polled every 250ms and displayed in the pi status bar.
 
-- **Optimistic saves:** `yaam_workspace_initialize` and `yaam_workspace_append_note` fire `connMgr.withConnection()` without awaiting — they return immediately. DB write happens in the background.
-- **Status polling:** A 250ms `setInterval` updates the status bar with reconciler progress. Auto-stops when the reconciler finishes.
-- **Hooks:** `tool_result` (write/edit/bash) → incremental reconcile. `agent_end` → full reconcile. Both fire-and-forget.
+### Optimistic Writes
+
+`yaam_workspace_initialize` and `yaam_workspace_append_note` return immediately — the actual JSON-RPC call to the engine happens in the background (fire-and-forget).
 
 ## Graph Schema
 
 ### Nodes
 
-| Table | Key | Fields |
+| Label | Key | Fields |
 |-------|-----|--------|
-| `Entity` | `id` (STRING) | `type`, `status`, `last_modified`, `metadata` |
+| `Entity` | `id` | `entity_type` ("File", "Function", "Class"), `status`, `last_modified`, `metadata` |
+| `Workspace` | `id` (workspace name) | `description`, `status` ("active"/"inactive"), `closed_at` |
+| `Scratchpad` | `id` | `content`, `created_at` |
 
-> **`metadata`** is a JSON string with rich fields for Functions/Classes:
-> `{"line":42,"endLine":96,"signature":"foo(x: string): void","isAsync":true,"isExported":false,"isStatic":false,"params":[...],"returnType":"void","docComment":"..."}`
-> Query with `WHERE metadata CONTAINS '"isAsync":true'` or `WHERE metadata CONTAINS 'Mutex'`.
-| `Workspace` | `workspace_name` (STRING) | `description`, `status`, `closed_at` |
-| `Scratchpad` | `id` (STRING) | `content`, `created_at` |
+### Edges
 
-### Relationships
-
-| Table | From → To | Properties |
-|-------|-----------|------------|
-| `LINKED_TO` | Entity → Entity | `relationship_type` (CALLS, DECLARED_IN, IMPORTS, INHERITS_FROM) |
+| Relationship | From → To | Properties |
+|--------------|-----------|------------|
+| `LINKED_TO` | Entity → Entity | `relationship_type`: "CALLS", "DECLARED_IN", "IMPORTS", "INHERITS_FROM" |
 | `MAPPED_TO` | Workspace → Entity | `created_at`, `invalidated_at`, `is_stale` |
 | `HAS_SCRATCHPAD` | Workspace → Scratchpad | — |
 
 ### Entity ID Format
 
 - File: `src/index.ts`
-- Function: `src/db.ts::sleep`
-- Method: `src/db.ts::ConnectionManager::withConnection`
+- Function: `src/reconciler.ts::walkSync`
+- Method: `src/engine-client.ts::YaamEngineClient::start`
 - Class: `src/reconciler.ts::Reconciler`
 
-## Query Examples
+## Query DSL
 
-```cypher
--- Entity counts
-MATCH (n:Entity) RETURN n.type, count(n) AS count ORDER BY count DESC
+The `yaam_graph_explore` tool accepts a JSON Query DSL (not Cypher). See the tool description for full schema and examples.
 
--- Call graph
-MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity) RETURN caller.id, callee.id
+### Quick Reference
 
--- Inheritance
-MATCH (sub:Entity)-[:LINKED_TO {relationship_type: 'INHERITS_FROM'}]->(sup:Entity) RETURN sub.id, sup.id
+```json
+// Entity counts by type
+{"match":{"label":"Entity"}, "aggregate":{"group_by":"type","count":true}}
 
--- Import dependencies
-MATCH (src:Entity {type: 'File'})-[:LINKED_TO {relationship_type: 'IMPORTS'}]->(dst:Entity {type: 'File'}) RETURN src.id, dst.id
+// All functions in a file
+{"match":{"label":"Entity","entity_type":"Function"}, "where":{"edge_to":{"id":"src/index.ts","relationship":"DECLARED_IN"}}}
 
--- Workspace notes
-MATCH (w:Workspace {status: 'active'})-[:HAS_SCRATCHPAD]->(s:Scratchpad) RETURN s.content, s.created_at ORDER BY s.created_at DESC
+// Reverse call graph (who calls X?)
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"inbound","max_depth":2}}
+
+// Forward call graph (what does X call?)
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"outbound","max_depth":3}}
 ```
 
 ## Gotchas
 
 - **Results > 20 rows** are spooled to `.chunks/memory_dumps/query_out.txt`. Read that file if directed.
-- **`yaam_graph_explore` is read-only.** Write keywords (CREATE, MERGE, SET, DELETE, DROP, ALTER) are blocked.
-- **If the DB is corrupted** (IO exception with multi-TB position), delete `memory.lbug` and `memory.lbug.wal`. The extension will recreate them on the next operation.
-- **Multiple agents** share `memory.lbug`. Lock contention is handled by exponential backoff (50ms → 2s, 10 retries).
-- **Stale workers** can accumulate if SIGTERM doesn't kill them. SIGKILL is used in `killWorker()` for reliability.
+- **`yaam_graph_explore` is read-only.** Write operations are not supported via the query tool.
+- **The graph is auto-reconciled** after every `write`, `edit`, `bash`, and `read` tool result. Trust it as your primary source of code structure.

@@ -1,14 +1,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { ConnectionManager } from "./db.js";
+import { YaamEngineClient } from "./engine-client.js";
 import { Reconciler } from "./reconciler.js";
 import { exploreGraph } from "./graph_explore.js";
-import { initializeWorkspace, appendNote } from "./workspace.js";
-import { gatherWorkspaceData, renderWorkspaceView } from "./visualizer.js";
+import { initializeWorkspace, appendNote, trackAccessedFile } from "./workspace.js";
+import { startServerIfNeeded } from "./visualizer.js";
+import * as path from "path";
 
 export default function yaamExtension(pi: ExtensionAPI) {
-  const connMgr = new ConnectionManager();
-  const reconciler = new Reconciler();
+  const eventsPath = path.resolve(process.cwd(), "events.jsonl");
+  const engine = new YaamEngineClient(eventsPath);
+  const reconciler = new Reconciler(engine);
 
   // ─── UI helpers (safe in all modes) ─────────────────────────────────────
   let lastCtx: any = null;
@@ -48,12 +50,19 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     lastCtx = ctx;
-    setStatus(ctx, "yaam", "Ready ✅");
+    try {
+      await engine.start();
+      setStatus(ctx, "yaam", "Ready ✅");
+      reconciler.scheduleFull();
+    } catch (e: any) {
+      setStatus(ctx, "yaam", `Error ❌`);
+      ctx.ui.notify(`Failed to start YAAM Engine: ${e.message}`, "error");
+    }
   });
 
   pi.on("session_shutdown", async () => {
     if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-    reconciler.shutdownLspClients();
+    engine.stop();
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -71,16 +80,15 @@ export default function yaamExtension(pi: ExtensionAPI) {
     const toolName = (event as any).toolName;
     const toolInput = (event as any).input;
 
-    // Schedule background reconcile + file tracking (non-blocking)
-    if (["write", "edit", "bash"].includes(toolName)) {
+    if (["write", "edit", "bash", "read"].includes(toolName)) {
       startStatusPolling(ctx);
-      reconciler.scheduleIncremental(connMgr, { toolName, toolInput });
+      await trackAccessedFile(toolName, toolInput, engine, process.cwd());
     }
   });
 
   pi.on("agent_end", async (_event, ctx) => {
     startStatusPolling(ctx);
-    reconciler.scheduleFull(connMgr);
+    // reconciler.scheduleFull(connMgr); (Disabled for now as Rust reconciler handles file-by-file)
   });
 
   // ─── Tool: yaam_graph_explore ────────────────────────────────────────────
@@ -89,59 +97,53 @@ export default function yaamExtension(pi: ExtensionAPI) {
     name: "yaam_graph_explore",
     label: "YAAM Graph Explore",
     description:
-      `Executes a read-only Cypher query to explore code relationships (Layer 0)
-and agent memories (Layer 1) in LadybugDB.
+      `Executes a read-only JSON Query DSL against the Rust graph engine.
 
-The graph is automatically reconciled after every file operation (write, edit, bash)
-and reflects the LIVE state of the repository. Entity topology — files, functions,
-classes, call graphs, imports, and inheritance — is current as of the last tool
-invocation. You can trust this information is accurate without manual verification.
+The graph is automatically reconciled after every file operation and reflects the LIVE state of the repository.
 
-SCHEMA:
-  Nodes:    Entity(id, type, status, last_modified, metadata)
-            Workspace(workspace_name, description, status, closed_at)
-            Scratchpad(id, content, created_at)
-  Edges:    -[:LINKED_TO {relationship_type}]->     (Entity → Entity)
-            -[:MAPPED_TO {created_at, is_stale}]->  (Workspace → Entity)
-            -[:HAS_SCRATCHPAD]->                    (Workspace → Scratchpad)
-
-  Entity.type = "File" | "Function" | "Class"
-  Entity.id format: "path/to/file.ts" or "path/to/file.ts::functionName"
-  Entity.last_modified = unix epoch int (e.g. 1782562666, NOT a date string)
-  Entity.metadata = JSON string with rich fields (Functions/Classes only): {"line":42,"endLine":96,"signature":"foo(x: string): void","isAsync":true,"isExported":false,"isStatic":false,"params":[...],"returnType":"void","docComment":"Does the thing"}
-  LINKED_TO.relationship_type = "CALLS" | "DECLARED_IN" | "IMPORTS" | "INHERITS_FROM"
+JSON DSL STRUCTURE:
+{
+  "match": { // Filter initial candidate nodes
+    "label": "Entity" | "Workspace" | "Scratchpad",
+    "entity_type": "File" | "Function" | "Class",
+    "id": "node_id",
+    "status": "active" | "closed",
+    "name_contains": "substring"
+  },
+  "where": { // Filter candidates by edge constraints
+    "edge_to": { "id": "target_id", "relationship": "DECLARED_IN" | "CALLS" | "IMPORTS" },
+    "edge_from": { "id": "source_id", "relationship": "CALLS" }
+  },
+  "traverse": { // BFS graph walk from candidates
+    "relationship": "CALLS" | "IMPORTS" | "HAS_SCRATCHPAD" | "DECLARED_IN",
+    "direction": "outbound" | "inbound" | "both",
+    "max_depth": 1-5
+  },
+  "aggregate": { "group_by": "type" | "label" | "status", "count": true },
+  "limit": 20,
+  "return_fields": ["id", "name", "label", "content", "metadata"]
+}
 
 EXAMPLES:
-  -- Find all functions in a file:
-  MATCH (f:Entity)-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(file:Entity {type: 'File'})
-  WHERE file.id CONTAINS 'db.ts' RETURN f.id
+1. Find all functions in a file:
+{"match":{"label":"Entity","entity_type":"Function"}, "where":{"edge_to":{"id":"src/index.ts","relationship":"DECLARED_IN"}}}
 
-  -- Trace who calls a function (reverse call graph):
-  MATCH (caller:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}]->(callee:Entity)
-  WHERE callee.id CONTAINS 'getConn' RETURN caller.id
+2. Trace who calls a function (reverse call graph):
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"inbound","max_depth":2}}
 
-  -- Multi-hop impact analysis:
-  MATCH path = (src:Entity)-[:LINKED_TO {relationship_type: 'CALLS'}*1..3]->(dst:Entity)
-  WHERE src.id CONTAINS 'reconcile' RETURN src.id, dst.id, length(path)
-
-PITFALLS:
-  - \`type(r)\` does NOT work. Use \`r.relationship_type\` instead.
-  - Property access is strict: accessing \`n.prop\` throws a Binder exception
-    if \`prop\` doesn't exist on ALL matched nodes. Use \`keys(n)\` to discover
-    available properties first.
-  - Results > 20 rows are spooled to \`.chunks/memory_dumps/query_out.txt\`.`,
-    promptSnippet: "Query YAAM memory graph with Cypher (read-only)",
+3. Multi-hop impact analysis (outbound):
+{"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"outbound","max_depth":3}}
+`,
+    promptSnippet: "Query YAAM memory graph with JSON DSL (read-only)",
     promptGuidelines: [
-      "The YAAM graph is automatically reconciled after every file operation (write, edit, bash) and reflects the live repository state. Use yaam_graph_explore to query files, functions, classes, call graphs, imports, inheritance, and workspace scratchpads — the information is current and trustworthy.",
+      "The YAAM graph is automatically reconciled. Use yaam_graph_explore with the JSON Query DSL to query files, functions, call graphs, imports, and workspace scratchpads.",
     ],
     parameters: Type.Object({
-      query: Type.String({ description: "Read-only Cypher query. Use [:LINKED_TO {relationship_type: 'CALLS'|'DECLARED_IN'|'IMPORTS'|'INHERITS_FROM'}] for Entity edges. Filter by label (:Entity, :Workspace, :Scratchpad) before accessing properties to avoid Binder exceptions." }),
+      query: Type.Any({ description: "The JSON Query DSL object (NOT Cypher!) specifying the match, where, and traverse parameters." }),
     }),
     async execute(_toolCallId, params) {
       try {
-        const result = await connMgr.withConnection(async (conn) => {
-          return await exploreGraph(params.query, conn, connMgr.projectRoot);
-        });
+        const result = await exploreGraph(params.query, engine, process.cwd());
         return {
           content: [{ type: "text" as const, text: result.text }],
           details: { spooledTo: result.spooledTo },
@@ -173,12 +175,11 @@ PITFALLS:
     async execute(_toolCallId, params) {
       try {
         // Schedule a full reconcile to ensure topology is current (non-blocking)
-        reconciler.scheduleFull(connMgr);
+        reconciler.scheduleFull();
 
         // Optimistic background save
-        connMgr.withConnection(async (conn) => {
-          return await initializeWorkspace(params.name, params.description, conn);
-        }).catch(e => console.error("Workspace init error:", e));
+        initializeWorkspace(params.name, params.description, engine)
+          .catch(e => console.error("Workspace init error:", e));
         
         return {
           content: [{ type: "text" as const, text: `Workspace '${params.name}' initialized successfully (background save).` }],
@@ -211,9 +212,8 @@ PITFALLS:
     async execute(_toolCallId, params) {
       try {
         // Optimistic background save
-        connMgr.withConnection(async (conn) => {
-          return await appendNote(params.workspace, params.content, conn);
-        }).catch(e => console.error("Workspace append note error:", e));
+        appendNote(params.workspace, params.content, engine)
+          .catch(e => console.error("Workspace append note error:", e));
 
         return {
           content: [{ type: "text" as const, text: `Note added to workspace '${params.workspace}' (background save).` }],
@@ -236,20 +236,9 @@ PITFALLS:
       // ─── Subcommand: viz ──────────────────────────────────────────────
       if (typeof args === 'string' && args.trim() === 'viz') {
         try {
-          const data = await connMgr.withConnection(async (conn) => {
-            return await gatherWorkspaceData(conn);
-          });
-
-          if (!data) {
-            ctx.ui.notify(
-              "No active workspace. Use yaam_workspace_initialize to create one.",
-              "info",
-            );
-            return;
-          }
-
-          const output = renderWorkspaceView(data);
-          ctx.ui.notify(output, "info");
+          ctx.ui.notify("Launching YAAM Visualizer... 🚀", "info");
+          const url = await startServerIfNeeded(engine, 3456);
+          ctx.ui.notify(`YAAM Graph Visualizer is running at: ${url}`, "info");
         } catch (e: any) {
           ctx.ui.notify(`YAAM visualization error: ${e.message || String(e)}`, "error");
         }
@@ -258,52 +247,56 @@ PITFALLS:
 
       // ─── Default: status display ──────────────────────────────────────
       try {
-        const stats = await connMgr.withConnection(async (conn) => {
-          const typeResult = await conn.query(
-            "MATCH (n:Entity) RETURN n.type, count(n) AS count ORDER BY count DESC"
-          );
-          const typeRows = await typeResult.getAll();
-
-          const wsResult = await conn.query(
-            "MATCH (w:Workspace {status: 'active'}) RETURN w.workspace_name, w.description"
-          );
-          const wsRows = await wsResult.getAll();
-
-          const notesResult = await conn.query(
-            "MATCH (w:Workspace {status: 'active'})-[:HAS_SCRATCHPAD]->(s:Scratchpad) RETURN s.content, s.created_at ORDER BY s.created_at DESC LIMIT 5"
-          );
-          const notesRows = await notesResult.getAll();
-
-          return { typeRows, wsRows, notesRows };
+        const typeRows = await engine.query({
+          match: { label: "Entity" },
+          aggregate: { group_by: "type", count: true }
         });
+
+        const wsRows = await engine.query({
+          match: { label: "Workspace" },
+          where: { field: "status", op: "eq", value: "active" }
+        });
+
+        const activeWs = wsRows.length > 0 ? wsRows[0].id : null;
+        let notesRows = [];
+
+        if (activeWs) {
+          notesRows = await engine.query({
+            match: { label: "Workspace" },
+            where: { field: "id", op: "eq", value: activeWs },
+            traverse: { relationship: "HAS_SCRATCHPAD", direction: "outbound" },
+            limit: 5
+          });
+        }
 
         let output = "═══ YAAM Memory Status ═══\n\n";
 
         output += "📊 Entities:\n";
-        if (stats.typeRows.length === 0) {
+        if (typeRows.length === 0) {
           output += "  (empty)\n";
         } else {
-          for (const row of stats.typeRows) {
-            output += `  ${row["n.type"]}: ${row["count"]}\n`;
+          // The DSL aggregate returns an array of { group, value }
+          for (const row of typeRows) {
+            output += `  ${row.group}: ${row.value}\n`;
           }
         }
 
         output += "\n📝 Active Workspace:\n";
-        if (stats.wsRows.length === 0) {
+        if (wsRows.length === 0) {
           output += "  (none active)\n";
         } else {
-          const ws = stats.wsRows[0];
-          output += `  Name: ${ws["w.workspace_name"]}\n`;
-          output += `  Description: ${ws["w.description"]}\n`;
+          const ws = wsRows[0];
+          output += `  Name: ${ws.id}\n`;
+          output += `  Description: ${ws.properties.description}\n`;
         }
 
         output += "\n🗒️  Recent Notes:\n";
-        if (stats.notesRows.length === 0) {
+        if (notesRows.length === 0) {
           output += "  (none)\n";
         } else {
-          for (const note of stats.notesRows) {
-            const date = new Date(note["s.created_at"] * 1000).toLocaleString();
-            const preview = note["s.content"].substring(0, 80);
+          for (const note of notesRows) {
+            const date = new Date(note.properties.created_at * 1000).toLocaleString();
+            const preview = note.properties.content.substring(0, 80);
             output += `  [${date}] ${preview}...\n`;
           }
         }

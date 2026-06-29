@@ -1,22 +1,33 @@
-/**
- * workspace.ts — workspace initialization, note appending, and file tracking.
- * All functions receive a raw connection (used within ConnectionManager.withConnection).
- */
-
 import * as path from 'path';
+import * as fs from 'fs';
+import { YaamEngineClient } from './engine-client.js';
 
 export async function initializeWorkspace(
   name: string,
   description: string,
-  conn: any
+  client: YaamEngineClient
 ): Promise<string> {
   // Deactivate all existing active workspaces
-  await conn.query("MATCH (w:Workspace {status: 'active'}) SET w.status = 'inactive'");
+  const dsl = {
+    match: { label: "Workspace" },
+    where: { field: "status", op: "eq", value: "active" }
+  };
+  const activeWorkspaces = await client.query(dsl);
+  
+  for (const ws of activeWorkspaces) {
+    await client.upsertNode({
+      id: ws.id,
+      label: "Workspace",
+      properties: { ...ws.properties, status: "inactive" }
+    });
+  }
 
   // Create the new workspace
-  const query = "CREATE (:Workspace {workspace_name: $name, description: $description_val, status: 'active'})";
-  const prepared = await conn.prepare(query);
-  await conn.execute(prepared, { name, description_val: description });
+  await client.upsertNode({
+    id: name,
+    label: "Workspace",
+    properties: { description, status: "active" }
+  });
 
   return `Workspace '${name}' initialized successfully.`;
 }
@@ -24,18 +35,23 @@ export async function initializeWorkspace(
 export async function appendNote(
   workspace: string,
   content: string,
-  conn: any
+  client: YaamEngineClient
 ): Promise<string> {
   const noteId = `note_${Date.now()}`;
   const ts = Math.floor(Date.now() / 1000);
 
-  const query1 = "CREATE (:Scratchpad {id: $id, content: $content, created_at: $ts})";
-  const prep1 = await conn.prepare(query1);
-  await conn.execute(prep1, { id: noteId, content, ts });
+  await client.upsertNode({
+    id: noteId,
+    label: "Scratchpad",
+    properties: { content, created_at: ts }
+  });
 
-  const query2 = "MATCH (w:Workspace {workspace_name: $ws_name}), (s:Scratchpad {id: $n_id}) CREATE (w)-[:HAS_SCRATCHPAD]->(s)";
-  const prep2 = await conn.prepare(query2);
-  await conn.execute(prep2, { ws_name: workspace, n_id: noteId });
+  await client.linkNodes({
+    from_id: workspace,
+    to_id: noteId,
+    relationship: "HAS_SCRATCHPAD",
+    properties: {}
+  });
 
   return `Note added to workspace '${workspace}'.`;
 }
@@ -47,7 +63,7 @@ export async function appendNote(
 export async function trackAccessedFile(
   toolName: string,
   toolInput: any,
-  conn: any,
+  client: YaamEngineClient,
   projectRoot: string
 ): Promise<void> {
   let filePath = '';
@@ -62,17 +78,20 @@ export async function trackAccessedFile(
 
   if (!filePath) return;
 
-  const relPath = path.relative(projectRoot, path.resolve(filePath));
+  const resolvedPath = path.resolve(filePath);
+  const relPath = path.relative(projectRoot, resolvedPath);
   if (relPath.startsWith('..')) return;
 
   // Find active workspace
   let wsName: string | null = null;
   try {
-    const prep = await conn.prepare("MATCH (w:Workspace {status: 'active'}) RETURN w.workspace_name");
-    const res = await conn.execute(prep);
-    const rows = await res.getAll();
-    if (rows.length > 0) {
-      wsName = rows[0]['w.workspace_name'];
+    const dsl = {
+      match: { label: "Workspace" },
+      where: { field: "status", op: "eq", value: "active" }
+    };
+    const active = await client.query(dsl);
+    if (active.length > 0) {
+      wsName = active[0].id;
     }
   } catch {
     return;
@@ -80,21 +99,22 @@ export async function trackAccessedFile(
 
   if (!wsName) return;
 
-  const timestamp = Math.floor(Date.now() / 1000);
+  // Reconcile the file content via AST if it exists
   try {
-    const prep1 = await conn.prepare("MERGE (e:Entity {id: $eid}) SET e.type = 'File'");
-    await conn.execute(prep1, { eid: relPath });
-    const prep2 = await conn.prepare("MATCH (w:Workspace {workspace_name: $ws}), (e:Entity {id: $eid}) MERGE (w)-[:MAPPED_TO {created_at: $ts_val, is_stale: false}]->(e)");
-    await conn.execute(prep2, { ws: wsName, eid: relPath, ts_val: timestamp });
-
-    // Also map classes declared in this file
-    const prepClasses = await conn.prepare("MATCH (c:Entity {type: 'Class'})-[:LINKED_TO {relationship_type: 'DECLARED_IN'}]->(f:Entity {id: $fid}) RETURN c.id");
-    const resClasses = await conn.execute(prepClasses, { fid: relPath });
-    const classRows = await resClasses.getAll();
-    for (const row of classRows) {
-      const cid = row['c.id'];
-      const prepMap = await conn.prepare("MATCH (w:Workspace {workspace_name: $ws}), (e:Entity {id: $eid}) MERGE (w)-[:MAPPED_TO {created_at: $ts_val, is_stale: false}]->(e)");
-      await conn.execute(prepMap, { ws: wsName, eid: cid, ts_val: timestamp });
+    if (fs.existsSync(resolvedPath)) {
+      const content = fs.readFileSync(resolvedPath, 'utf-8');
+      const res = await client.reconcile({ file_path: relPath, content });
+      
+      // Link the workspace to the reconciled entities
+      const timestamp = Math.floor(Date.now() / 1000);
+      for (const entityId of res.upserted_nodes) {
+        await client.linkNodes({
+          from_id: wsName,
+          to_id: entityId,
+          relationship: "MAPPED_TO",
+          properties: { created_at: timestamp, is_stale: false }
+        });
+      }
     }
   } catch (e) {
     console.error("Error mapping workspace to file:", e);

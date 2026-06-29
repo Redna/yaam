@@ -1,0 +1,28 @@
+[package]
+name = "yaam-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Hybrid Semantic-Episodic Agent Memory Engine"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+unicode-segmentation = "1"
+fs2 = "0.4"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["ndarray", "std", "download-binaries", "tls-rustls"] }
+ndarray = "0.17"
+tokenizers = "0.19"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+tree-sitter = "0.22"
+tree-sitter-typescript = "0.21"
+tower-lsp = "0.20"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

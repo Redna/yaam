@@ -1,7 +1,7 @@
 {
   "name": "pi-yaam",
   "version": "1.0.0",
-  "description": "Yet Another Agent Memory pi.dev extension and Antigravity skill",
+  "description": "Hybrid Semantic-Episodic Agent Memory Engine using a standalone Rust daemon, JSONL persistence, and a web-based Cytoscape visualizer.",
   "type": "module",
   "main": "./index.ts",
   "exports": {
@@ -16,17 +16,15 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json",
-    "graph_explore": "tsx skills/yaam-memory-manager/scripts/graph_explore.ts",
-    "workspace_initialize": "tsx skills/yaam-memory-manager/scripts/workspace_initialize.ts",
-    "workspace_append_note": "tsx skills/yaam-memory-manager/scripts/workspace_append_note.ts"
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@ladybugdb/core": "^0.17.1",
-    "commander": "^12.1.0"
+    "commander": "^12.1.0",
+    "express": "^5.2.1"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@types/express": "^5.0.6",
     "@types/node": "^20.14.9",
     "tsx": "^4.15.7",
     "typebox": "^1.1.38",
