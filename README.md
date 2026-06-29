@@ -59,6 +59,7 @@ Running `/yaam viz` spins up a local Express backend serving an interactive UI a
 | Tool | Description |
 |------|-------------|
 | `yaam_graph_explore` | Executes a custom JSON DSL query against the Rust engine's in-memory graph. |
+| `yaam_search` | Hybrid BM25 + ONNX semantic search across all memory nodes by natural language. |
 | `yaam_workspace_initialize` | Create workspace, deactivate previous. Schedules full reconcile. |
 | `yaam_workspace_append_note` | Append note to workspace scratchpad. |
 | `/yaam viz` | Launches the interactive web-based topology visualizer. |

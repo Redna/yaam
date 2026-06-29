@@ -73,13 +73,25 @@ impl MemoryEngine {
         let content = extract_string_or(props, "content", "");
         let metadata = extract_string_or(props, "metadata", "");
 
+        // Extract embedding vector from properties if present.
+        // The RPC handler computes embeddings and stores them in properties["embedding"].
+        // This also covers replay from JSONL events where embeddings are persisted.
+        let embedding = props
+            .get("embedding")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect::<Vec<f32>>()
+            });
+
         let node = MemoryNode {
             id: payload.id.clone(),
             label,
             name,
             content,
             metadata,
-            embedding: None,
+            embedding,
         };
 
         self.nodes.insert(payload.id.clone(), node);

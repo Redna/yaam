@@ -228,6 +228,54 @@ EXAMPLES:
     },
   });
 
+  // ─── Tool: yaam_search ───────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "yaam_search",
+    label: "YAAM Hybrid Search",
+    description:
+      `Performs a hybrid semantic + keyword search across the YAAM memory graph.\n\nCombines BM25 keyword matching with dense ONNX embeddings (gte-small) to find relevant code entities, workspaces, and scratchpad notes by natural language meaning — not just exact keyword matches.\n\nUse this when you need to find code by concept or behavior (e.g. "file reconciliation logic", "workspace tracking") rather than exact names. Results are ranked by combined BM25 + cosine similarity score.\n\nParameters:\n- text (required): Natural language or keyword query\n- top_k (optional): Max results to return (default: 10)\n- workspace (optional): Scope results to entities mapped to a specific workspace`,
+    promptSnippet: "Search YAAM memory by semantic meaning + keywords",
+    promptGuidelines: [
+      "Use yaam_search for natural-language discovery of code entities and notes — it combines BM25 keyword search with dense semantic embeddings to find relevant nodes by meaning, not just exact text matches.",
+    ],
+    parameters: Type.Object({
+      text: Type.String({ description: "The natural language or keyword search query." }),
+      top_k: Type.Optional(Type.Number({ description: "Maximum number of results to return (default: 10)." })),
+      workspace: Type.Optional(Type.String({ description: "Optional: scope results to entities mapped to a specific workspace." })),
+    }),
+    async execute(_toolCallId, params) {
+      try {
+        const results = await engine.search({
+          text: params.text,
+          top_k: params.top_k,
+          workspace: params.workspace,
+        });
+
+        if (!results || results.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "Search completed. No results found." }],
+            details: undefined,
+          };
+        }
+
+        const formatted = results.map((r: any) =>
+          `[${r.type}] ${r.id} (score: ${typeof r.score === 'number' ? r.score.toFixed(4) : r.score})${r.name ? ' — ' + r.name : ''}${r.content ? '\n  ' + r.content.substring(0, 200) : ''}`
+        ).join('\n');
+
+        return {
+          content: [{ type: "text" as const, text: `Search results for "${params.text}":\n\n${formatted}` }],
+          details: { resultCount: results.length },
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e.message || String(e)}` }],
+          details: undefined,
+        };
+      }
+    },
+  });
+
   // ─── Command: /yaam ─────────────────────────────────────────────────────
 
   pi.registerCommand("yaam", {

@@ -42,6 +42,13 @@ To understand how code components are linked, query the graph.
 - The tool description includes an inline JSON DSL schema and examples for quick reference.
 - Detailed query patterns are documented below in **Query Cookbook**.
 
+### 3a. Semantic + Keyword Search
+To find code entities or notes by natural language meaning (not just exact names):
+- **Tool:** `yaam_search(text, top_k?, workspace?)`
+- Combines BM25 keyword matching with ONNX dense embeddings (gte-small) for hybrid ranked retrieval.
+- Example: `yaam_search(text="file reconciliation logic")` finds functions related to reconciliation even if their names don't contain those exact words.
+- Use `workspace` parameter to scope results to entities mapped to a specific workspace.
+
 ### 4. Checking Status
 Run the `/yaam` command to see entity counts, active workspace, recent notes, and reconciler state.
 

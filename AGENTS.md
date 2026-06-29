@@ -7,6 +7,7 @@ All agents working in this repo MUST use YAAM tools to maintain continuity and s
 | Tool | Purpose |
 |------|---------|
 | `yaam_graph_explore` | Read-only JSON DSL queries against the in-memory Rust graph engine |
+| `yaam_search` | Hybrid BM25 + semantic (ONNX embedding) search across all memory nodes |
 | `yaam_workspace_initialize` | Create a task tracking workspace (deactivates previous) |
 | `yaam_workspace_append_note` | Record decisions/insights to a workspace scratchpad |
 | `/yaam` command | Show memory status (entity counts, workspace, notes, reconciler) |
@@ -27,7 +28,7 @@ The backend is a compiled Rust binary (`src-rust/`) communicating over `stdio` J
 - **Append-only JSONL storage** (`events.jsonl`) with `fs2` file locks for concurrent safety.
 - **In-memory graph** (`Arc<RwLock<MemoryEngine>`) — all nodes and edges reside in RAM for instant queries.
 - **Tree-sitter + LSP reconciliation** — parses TypeScript/JavaScript ASTs and resolves cross-file references via `typescript-language-server`.
-- **Hybrid search** — BM25 inverted index + ONNX `gte-small` dense embeddings (38M params, CPU-only).
+- **Hybrid search** — BM25 inverted index + ONNX `gte-small` dense embeddings (38M params, CPU-only). Embeddings are computed for all node types (files, functions, classes, workspaces, scratchpads) and combined with BM25 scores for ranked retrieval. Scratchpad notes receive temporal decay weighting.
 
 ### TypeScript Extension (Pi)
 

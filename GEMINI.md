@@ -6,7 +6,7 @@ This repository is equipped with **YAAM (Yet Another Agent Memory)**. All agents
 
 YAAM runs as a **first-class pi extension**. The Rust engine daemon (`src-rust/`) is spawned automatically by the extension and communicates over stdio JSON-RPC 2.0.
 
-- **Pi extension:** Tools (`yaam_graph_explore`, `yaam_workspace_initialize`, `yaam_workspace_append_note`) and `/yaam` command are registered automatically when the extension loads.
+- **Pi extension:** Tools (`yaam_graph_explore`, `yaam_search`, `yaam_workspace_initialize`, `yaam_workspace_append_note`) and `/yaam` command are registered automatically when the extension loads.
 - **Non-pi agents:** The YAAM tools are available only within pi. If you are a non-pi agent, you can still benefit from the graph data by reading the `events.jsonl` log or asking a pi agent to run queries on your behalf.
 
 ## 2. Mandatory Workflows

@@ -12,6 +12,7 @@ use crate::types::*;
 use crate::lsp_adapter::{LspAdapter, StdioLspClient};
 use std::panic;
 use std::sync::{Arc, RwLock, Mutex};
+use std::collections::HashMap;
 
 /// Shared application state passed to all RPC handlers.
 pub struct AppState {
@@ -99,6 +100,46 @@ fn build_bm25_text(node: &MemoryNode) -> String {
     parts.join(" ")
 }
 
+/// Build the text to embed for semantic search from a node's properties.
+/// Used during upsert and reconciliation to compute ONNX embeddings.
+fn build_embedding_text_from_props(
+    label: &str,
+    props: &HashMap<String, serde_json::Value>,
+) -> String {
+    let name = props.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    match label {
+        "Workspace" => {
+            let desc = props.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                desc.to_string()
+            } else {
+                format!("{} {}", name, desc)
+            }
+        }
+        "Scratchpad" => {
+            props.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
+        "Entity" => {
+            // For code entities, embed the name plus any docComment from metadata.
+            let metadata = props.get("metadata").and_then(|v| v.as_str()).unwrap_or("");
+            let doc = if !metadata.is_empty() {
+                serde_json::from_str::<serde_json::Value>(metadata)
+                    .ok()
+                    .and_then(|m| m.get("docComment").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if doc.is_empty() {
+                name.to_string()
+            } else {
+                format!("{} {}", name, doc)
+            }
+        }
+        _ => name.to_string(),
+    }
+}
+
 /// Dispatch a single JSON-RPC request and return a response.
 /// Panics in handlers are caught and returned as internal errors.
 pub fn dispatch(state: &AppState, request: &RpcRequest) -> RpcResponse {
@@ -161,23 +202,17 @@ fn handle_upsert_node(
         RpcResponse::error(None, RPC_INVALID_PARAMS, format!("Invalid params: {}", e))
     })?;
 
-    // Compute embedding if it's a Workspace or Scratchpad
+    // Compute embedding for all node types (Workspace, Scratchpad, Entity)
     let mut payload = payload;
-    if payload.label == "Workspace" || payload.label == "Scratchpad" {
-        if let Some(ref embedder) = state.embedder {
-            let text_to_embed = if payload.label == "Workspace" {
-                payload.properties.get("description").and_then(|v| v.as_str()).unwrap_or("")
-            } else {
-                payload.properties.get("content").and_then(|v| v.as_str()).unwrap_or("")
-            };
-            if !text_to_embed.is_empty() {
-                match embedder.embed(text_to_embed) {
-                    Ok(vec) => {
-                        payload.properties.insert("embedding".to_string(), serde_json::json!(vec));
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to compute embedding: {}", e);
-                    }
+    if let Some(ref embedder) = state.embedder {
+        let text_to_embed = build_embedding_text_from_props(&payload.label, &payload.properties);
+        if !text_to_embed.is_empty() {
+            match embedder.embed(&text_to_embed) {
+                Ok(vec) => {
+                    payload.properties.insert("embedding".to_string(), serde_json::json!(vec));
+                }
+                Err(e) => {
+                    eprintln!("Failed to compute embedding: {}", e);
                 }
             }
         }
@@ -400,7 +435,8 @@ fn handle_search(
                     "name": node.name,
                     "score": score,
                     "content": node.content,
-                    "label": match &node.label {
+                    "metadata": node.metadata,
+                    "type": match &node.label {
                         NodeLabel::Entity { entity_type, .. } => entity_type.clone(),
                         NodeLabel::Workspace { .. } => "Workspace".to_string(),
                         NodeLabel::Scratchpad { .. } => "Scratchpad".to_string(),
@@ -437,10 +473,32 @@ fn handle_reconcile(
         None => None,
     };
 
-    let events = {
+    let mut events = {
         let engine = state.engine.read().unwrap();
         crate::reconciler::reconcile_file(path, request.content.as_deref(), lsp_dyn, &engine)
     };
+
+    // Compute embeddings for Entity UpsertNode events before persistence.
+    // This ensures embeddings are written to JSONL and loaded into MemoryNode.embedding.
+    if let Some(ref embedder) = state.embedder {
+        for event in events.iter_mut() {
+            if let EventPayload::UpsertNode(ref mut payload) = event.payload {
+                if payload.label == "Entity" {
+                    let text = build_embedding_text_from_props(&payload.label, &payload.properties);
+                    if !text.is_empty() {
+                        match embedder.embed(&text) {
+                            Ok(vec) => {
+                                payload.properties.insert("embedding".to_string(), serde_json::json!(vec));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to compute embedding for {}: {}", payload.id, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut generated_ids = Vec::new();
 
