@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tree_sitter::{Parser, Query, QueryCursor, Node};
+use tree_sitter::{Parser, Query, QueryCursor};
 
+use crate::language_adapter::{get_adapter, LanguageAdapter};
 use crate::types::{
     Event, EventPayload, EventType, LinkNodesPayload, UpsertNodePayload, EVENT_VERSION,
     DeleteNodePayload,
@@ -23,55 +24,26 @@ pub struct ParsedReference {
     pub enclosing_function_id: Option<String>, // ID of the function containing this reference
 }
 
-/// Walk up the tree-sitter AST from a given node to find the enclosing
-/// function/class declaration. Returns the entity ID ("file_path:name") if found.
-fn find_enclosing_function(node: Node, source_code: &[u8], file_path: &Path) -> Option<String> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        match parent.kind() {
-            "function_declaration" | "class_declaration" | "method_definition" => {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    let name = name_node.utf8_text(source_code).ok()?.to_string();
-                    return Some(format!("{}:{}", file_path.display(), name));
-                }
-            }
-            "variable_declarator" => {
-                // Check if this is a function variable (const foo = () => {})
-                if let Some(value_node) = parent.child_by_field_name("value") {
-                    if value_node.kind() == "arrow_function" || value_node.kind() == "function_expression" {
-                        if let Some(name_node) = parent.child_by_field_name("name") {
-                            let name = name_node.utf8_text(source_code).ok()?.to_string();
-                            return Some(format!("{}:{}", file_path.display(), name));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-pub fn parse_typescript(file_path: &Path, content: &str) -> (Vec<ParsedDeclaration>, Vec<ParsedReference>) {
+/// Parse a source file using the given language adapter.
+///
+/// Extracts declarations (functions, classes) and references (calls, imports)
+/// via tree-sitter queries.  The adapter provides the grammar, query source,
+/// and enclosing-function lookup specific to the language.
+pub fn parse_file(
+    file_path: &Path,
+    content: &str,
+    adapter: &dyn LanguageAdapter,
+) -> (Vec<ParsedDeclaration>, Vec<ParsedReference>) {
     let mut parser = Parser::new();
-    let language = tree_sitter_typescript::language_typescript();
-    parser.set_language(&language).expect("Error loading TypeScript grammar");
+    let language = adapter.language();
+    parser
+        .set_language(&language)
+        .expect("Error loading language grammar");
 
     let tree = parser.parse(content, None).unwrap();
     let source_code = content.as_bytes();
 
-    let query_source = r#"
-        (class_declaration name: (type_identifier) @class.name)
-        (function_declaration name: (identifier) @function.name)
-        (method_definition name: (property_identifier) @method.name)
-        (lexical_declaration (variable_declarator name: (identifier) @variable.name value: [(arrow_function) (function_expression)]))
-        (call_expression function: (identifier) @call.name)
-        (call_expression function: (member_expression property: (property_identifier) @call.name))
-        (import_statement (import_clause (identifier) @import.name))
-        (import_statement (import_clause (named_imports (import_specifier name: (identifier) @import.name))))
-    "#;
-
+    let query_source = adapter.query_source();
     let query = Query::new(&language, query_source).unwrap();
     let mut query_cursor = QueryCursor::new();
     let matches = query_cursor.matches(&query, tree.root_node(), source_code);
@@ -84,10 +56,13 @@ pub fn parse_typescript(file_path: &Path, content: &str) -> (Vec<ParsedDeclarati
             let capture_name = query.capture_names()[capture.index as usize];
             let node = capture.node;
 
-            let name = node.utf8_text(source_code).unwrap_or("").to_string();
-            
+            let name = node
+                .utf8_text(source_code)
+                .unwrap_or("")
+                .to_string();
+
             if capture_name.starts_with("call") {
-                let enclosing = find_enclosing_function(node, source_code, file_path);
+                let enclosing = adapter.find_enclosing_function(node, source_code, file_path);
                 references.push(ParsedReference {
                     ref_type: "CALLS".to_string(),
                     name,
@@ -218,10 +193,18 @@ pub fn reconcile_file(
         }),
     });
 
-    // 4. Parse content
-    let (declarations, references) = parse_typescript(file_path, content_str);
+    // 4. Resolve the language adapter for this file.
+    //    If the file type is not supported, we stop here — the file node is
+    //    upserted but no declarations or references are extracted.
+    let adapter = match get_adapter(file_path) {
+        Some(a) => a,
+        None => return events,
+    };
 
-    // 5. Upsert new declarations
+    // 5. Parse content
+    let (declarations, references) = parse_file(file_path, content_str, adapter.as_ref());
+
+    // 6. Upsert new declarations
     for decl in declarations {
         let mut entity_props = HashMap::new();
         entity_props.insert(
@@ -269,8 +252,8 @@ pub fn reconcile_file(
         });
     }
 
-    // 6. Resolve references via LSP
-    if let Some(mut lsp_client) = lsp {
+    // 7. Resolve references via LSP
+    if let Some(lsp_client) = lsp {
         // Use absolute path for the file URI so the LSP can resolve it correctly.
         let abs_path = std::env::current_dir()
             .unwrap_or_default()
@@ -279,10 +262,12 @@ pub fn reconcile_file(
 
         // Notify the LSP about this file's content so it can resolve definitions
         // even if the on-disk content differs or hasn't been indexed yet.
-        let _ = lsp_client.notify_open(&file_uri, content_str, "typescript");
+        let _ = lsp_client.notify_open(&file_uri, content_str, adapter.language_id());
 
         for rf in references {
-            if let Ok(locations) = lsp_client.get_definition(&file_uri, rf.line as u32, rf.col as u32) {
+            if let Ok(locations) =
+                lsp_client.get_definition(&file_uri, rf.line as u32, rf.col as u32)
+            {
                 if let Some(loc) = locations.first() {
                     let absolute_path = uri_to_path(&loc.uri);
                     let target_file_path = std::path::Path::new(&absolute_path)
@@ -293,7 +278,8 @@ pub fn reconcile_file(
 
                     // Use the enclosing function as the source of the edge.
                     // Fall back to the file node if the call is at the top level.
-                    let source_id = rf.enclosing_function_id
+                    let source_id = rf
+                        .enclosing_function_id
                         .unwrap_or_else(|| file_id.clone());
 
                     events.push(Event {

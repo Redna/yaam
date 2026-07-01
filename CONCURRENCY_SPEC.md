@@ -21,7 +21,7 @@ A single Rust daemon runs in the background per system (or per workspace) and se
 | **Tokenizer in memory** | ✅ Yes | Loaded **once** by the daemon. |
 | **BM25 index** | ✅ Yes | Built once and updated live. All agents query the same index. |
 | **Graph state (MemoryEngine)** | ✅ Yes | Centralized in the daemon. One source of truth for the entire workspace. |
-| **LSP client** | ✅ Yes | One `typescript-language-server` instance managed by the daemon, servicing all files. |
+| **LSP clients** | ✅ Yes | One LSP server per language, lazily started on first reconcile of that language. Managed by the daemon in a `HashMap<language_id, Arc<Mutex<StdioLspClient>>`. All agents share the same LSP instances. |
 
 ## 2. Daemon Lifecycle & Communication
 

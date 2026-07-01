@@ -10,9 +10,11 @@ use crate::search::BM25Index;
 use crate::storage::EventStore;
 use crate::types::*;
 use crate::lsp_adapter::{LspAdapter, StdioLspClient};
+use crate::language_adapter::get_adapter;
 use std::panic;
 use std::sync::{Arc, RwLock, Mutex};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Shared application state passed to all RPC handlers.
 pub struct AppState {
@@ -20,7 +22,11 @@ pub struct AppState {
     pub store: Arc<RwLock<EventStore>>,
     pub bm25: Arc<RwLock<BM25Index>>,
     pub embedder: Option<Arc<EmbeddingModel>>,
-    pub lsp: Option<Arc<Mutex<StdioLspClient>>>,
+    /// Lazily-started LSP clients, keyed by language_id (e.g. "typescript", "python").
+    /// A client is only created the first time a file of that language is reconciled.
+    pub lsp_clients: Arc<RwLock<HashMap<String, Arc<Mutex<StdioLspClient>>>>>,
+    /// Project root directory, used as the LSP `rootUri` when starting servers.
+    pub project_root: PathBuf,
 }
 
 impl AppState {
@@ -52,19 +58,16 @@ impl AppState {
             }
         };
 
-        let mut lsp_client = StdioLspClient::new("npx", &["typescript-language-server", "--stdio"]);
-        let lsp = if let Ok(_) = lsp_client.start(dir) {
-            Some(Arc::new(Mutex::new(lsp_client)))
-        } else {
-            None
-        };
+        // LSP clients are lazily started on first reconcile of each language.
+        // No LSP servers are spawned at daemon startup.
 
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
             store: Arc::new(RwLock::new(store)),
             bm25: Arc::new(RwLock::new(bm25)),
             embedder,
-            lsp,
+            lsp_clients: Arc::new(RwLock::new(HashMap::new())),
+            project_root: dir.to_path_buf(),
         })
     }
 }
@@ -161,6 +164,9 @@ pub fn dispatch(state: Arc<AppState>, request: RpcRequest) -> RpcResponse {
 
             // ─── Reconciliation ───────────────────────────────────────────
             "reconcile" => handle_reconcile(state_ref, &request.params),
+
+            // ─── Language Registry ──────────────────────────────────────────
+            "languages.list" => handle_list_languages(state_ref),
 
             // ─── Lifecycle methods ────────────────────────────────────────
             "initialize" => handle_initialize(state_ref, &request.params),
@@ -452,6 +458,63 @@ fn handle_search(
 
 // ─── Reconciliation Handlers ────────────────────────────────────────────────
 
+/// Lazily obtain an LSP client for the language of the given file path.
+///
+/// If a client for the file's language is already running, returns the existing
+/// `Arc`.  If not, starts a new LSP server (using the adapter's `lsp_command`),
+/// stores it in the shared `lsp_clients` map, and returns it.  If the language
+/// is not supported or the LSP server fails to start, returns `None`.
+fn get_or_create_lsp(
+    state: &AppState,
+    file_path: &std::path::Path,
+) -> Option<Arc<Mutex<StdioLspClient>>> {
+    let adapter = get_adapter(file_path)?;
+    let lsp_cmd = adapter.lsp_command()?;
+    let lang_id = adapter.language_id().to_string();
+
+    // Fast path: a client for this language is already running.
+    {
+        let clients = state.lsp_clients.read().unwrap();
+        if let Some(c) = clients.get(&lang_id) {
+            return Some(c.clone());
+        }
+    }
+
+    // Slow path: start a new LSP server for this language.
+    let args: Vec<&str> = lsp_cmd.args.iter().map(|s| s.as_str()).collect();
+    let mut client = StdioLspClient::new(&lsp_cmd.command, &args);
+    match client.start(&state.project_root) {
+        Ok(_) => {
+            eprintln!(
+                "Started LSP server for '{}' ({} {})",
+                lang_id,
+                lsp_cmd.command,
+                lsp_cmd.args.join(" ")
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: Failed to start LSP server for '{}' ({} {}). \
+                 Cross-file resolution disabled for this language. ({})",
+                lang_id, lsp_cmd.command, lsp_cmd.args.join(" "), e
+            );
+            return None;
+        }
+    }
+
+    let arc = Arc::new(Mutex::new(client));
+    let mut clients = state.lsp_clients.write().unwrap();
+    // Double-check: another thread may have started the same language concurrently.
+    if let Some(existing) = clients.get(&lang_id) {
+        // Another thread won the race; stop our newly-started client to avoid
+        // a zombie process and return the existing one.
+        let _ = arc.lock().unwrap().stop();
+        return Some(existing.clone());
+    }
+    clients.insert(lang_id, arc.clone());
+    Some(arc)
+}
+
 fn handle_reconcile(
     state: &AppState,
     params: &serde_json::Value,
@@ -467,10 +530,15 @@ fn handle_reconcile(
     })?;
 
     let path = std::path::Path::new(&request.file_path);
-    
-    let mut lsp_guard = state.lsp.as_ref().map(|l| l.lock().unwrap());
-    let lsp_dyn: Option<&mut dyn crate::lsp_adapter::LspAdapter> = match lsp_guard {
-        Some(ref mut client) => Some(&mut **client),
+
+    // Lazily obtain (or start) an LSP server for the file's language.
+    // Returns an owned Arc so we can lock it without borrowing `state`.
+    let lsp_client_arc = get_or_create_lsp(state, path);
+
+    // Lock the client and hold the guard for the duration of reconcile_file.
+    let mut lsp_guard = lsp_client_arc.as_ref().map(|arc| arc.lock().unwrap());
+    let lsp_dyn: Option<&mut dyn crate::lsp_adapter::LspAdapter> = match &mut lsp_guard {
+        Some(ref mut guard) => Some(&mut **guard),
         None => None,
     };
 
@@ -556,9 +624,44 @@ fn handle_initialize(
 }
 
 fn handle_shutdown(state: &AppState) -> Result<serde_json::Value, RpcResponse> {
-    if let Some(lsp) = &state.lsp {
-        let _ = lsp.lock().unwrap().stop();
+    // Stop all running LSP servers.
+    let clients = state.lsp_clients.read().unwrap();
+    for (lang_id, client) in clients.iter() {
+        let _ = client.lock().unwrap().stop();
+        eprintln!("Stopped LSP server for '{}'", lang_id);
     }
     // Signal the main loop to exit
     Ok(serde_json::json!({"status": "shutdown"}))
+}
+
+// ─── Language Registry Handlers ─────────────────────────────────────────────
+
+/// Returns all registered languages with their extensions, LSP command,
+/// and whether the LSP server is currently running.
+fn handle_list_languages(state: &AppState) -> Result<serde_json::Value, RpcResponse> {
+    let languages = crate::language_adapter::list_languages();
+    let lsp_clients = state.lsp_clients.read().unwrap();
+
+    let result: Vec<serde_json::Value> = languages
+        .iter()
+        .map(|lang| {
+            let lsp_running = lsp_clients.contains_key(&lang.language_id);
+            let lsp_cmd_str = lang.lsp_command.as_ref().map(|c| {
+                if c.args.is_empty() {
+                    c.command.clone()
+                } else {
+                    format!("{} {}", c.command, c.args.join(" "))
+                }
+            });
+            serde_json::json!({
+                "name": lang.name,
+                "extensions": lang.extensions,
+                "language_id": lang.language_id,
+                "lsp_command": lsp_cmd_str,
+                "lsp_running": lsp_running,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({"languages": result}))
 }

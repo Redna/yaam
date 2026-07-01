@@ -34,7 +34,7 @@ yaam_workspace_append_note(workspace="your-active-task", content="Decided X beca
 
 ## 3. Physical State Sync
 
-The extension automatically reconciles the codebase in the background after every tool use (`write`, `edit`, `bash`, `read`). The Rust engine parses files with tree-sitter and resolves cross-file references via `typescript-language-server`. No manual sync is needed.
+The extension automatically reconciles the codebase in the background after every tool use (`write`, `edit`, `bash`, `read`). The Rust engine uses a **language adapter pattern** to parse files with tree-sitter and resolve cross-file references via per-language LSP servers (lazily started). TypeScript/JavaScript and Python are supported out of the box. No manual sync is needed.
 
 ## 4. Querying Examples (JSON DSL)
 
@@ -74,7 +74,7 @@ The `yaam_graph_explore` tool accepts a JSON Query DSL, not Cypher.
 
 YAAM uses a dual-layer model:
 
-- **Layer 0 (Physical):** Files, functions, classes, call graphs, imports, and inheritance — automatically tracked via tree-sitter + LSP.
+- **Layer 0 (Physical):** Files, functions, classes, call graphs, imports, and inheritance — automatically tracked via tree-sitter + LSP. Supports multiple languages through a pluggable adapter pattern (TypeScript, Python, and easily extensible via `scripts/add-language.sh`).
 - **Layer 1 (Cognitive):** Agent-defined workspaces with scratchpad notes for recording decisions.
 
 State is persisted as an append-only `events.jsonl` log. On startup, events are replayed into an in-memory graph (`Arc<RwLock<MemoryEngine>`) for instant queries.
@@ -84,3 +84,4 @@ State is persisted as an append-only `events.jsonl` log. On startup, events are 
 - **Read-Only:** `yaam_graph_explore` is strictly read-only.
 - **Context Protection:** Results > 20 rows are spooled to `.chunks/memory_dumps/query_out.txt`.
 - **Auto-Reconciliation:** The graph reflects the live state of the repository after every tool invocation.
+- **Multi-Language:** TypeScript/JavaScript and Python are supported. Query registered languages via `languages.list` RPC. Add new languages with `./scripts/add-language.sh`.

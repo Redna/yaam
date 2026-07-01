@@ -8,6 +8,7 @@
 
 pub mod embedding;
 mod graph;
+mod language_adapter;
 mod lsp_adapter;
 mod query_dsl;
 mod reconciler;
