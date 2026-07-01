@@ -19,12 +19,12 @@ impl EmbeddingModel {
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
-        tokenizer.with_truncation(Some(TruncationParams {
+        let _ = tokenizer.with_truncation(Some(TruncationParams {
             max_length: 512,
             ..Default::default()
         }));
 
-        tokenizer.with_padding(Some(PaddingParams {
+        let _ = tokenizer.with_padding(Some(PaddingParams {
             ..Default::default()
         }));
 

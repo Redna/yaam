@@ -14,6 +14,7 @@ pub struct Location {
 
 pub trait LspAdapter {
     fn start(&mut self, project_root: &Path) -> Result<(), Box<dyn Error>>;
+    fn notify_open(&mut self, file_uri: &str, content: &str, language_id: &str) -> Result<(), Box<dyn Error>>;
     fn get_definition(
         &mut self,
         file_uri: &str,
@@ -131,6 +132,18 @@ impl LspAdapter for StdioLspClient {
 
         self.send_notification("initialized", json!({}))?;
 
+        Ok(())
+    }
+
+    fn notify_open(&mut self, file_uri: &str, content: &str, language_id: &str) -> Result<(), Box<dyn Error>> {
+        self.send_notification("textDocument/didOpen", json!({
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": language_id,
+                "version": 1,
+                "text": content,
+            }
+        }))?;
         Ok(())
     }
 

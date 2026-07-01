@@ -4,3 +4,7 @@ history.jsonl
 events.jsonl
 node_modules/
 .pi/
+.yaam/
+
+# Rust build artifacts
+src-rust/target/

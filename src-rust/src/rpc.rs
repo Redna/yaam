@@ -142,28 +142,29 @@ fn build_embedding_text_from_props(
 
 /// Dispatch a single JSON-RPC request and return a response.
 /// Panics in handlers are caught and returned as internal errors.
-pub fn dispatch(state: &AppState, request: &RpcRequest) -> RpcResponse {
+pub fn dispatch(state: Arc<AppState>, request: RpcRequest) -> RpcResponse {
     let id = request.id.clone();
 
     // Wrap the entire dispatch in catch_unwind
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let state_ref = state.as_ref();
         match request.method.as_str() {
             // ─── Mutation methods ─────────────────────────────────────────
-            "upsert_node" => handle_upsert_node(state, &request.params),
-            "link_nodes" => handle_link_nodes(state, &request.params),
-            "delete_node" => handle_delete_node(state, &request.params),
-            "delete_edges" => handle_delete_edges(state, &request.params),
+            "upsert_node" => handle_upsert_node(state_ref, &request.params),
+            "link_nodes" => handle_link_nodes(state_ref, &request.params),
+            "delete_node" => handle_delete_node(state_ref, &request.params),
+            "delete_edges" => handle_delete_edges(state_ref, &request.params),
 
             // ─── Query methods ────────────────────────────────────────────
-            "query" => handle_query(state, &request.params),
-            "search" => handle_search(state, &request.params),
+            "query" => handle_query(state_ref, &request.params),
+            "search" => handle_search(state_ref, &request.params),
 
             // ─── Reconciliation ───────────────────────────────────────────
-            "reconcile" => handle_reconcile(state, &request.params),
+            "reconcile" => handle_reconcile(state_ref, &request.params),
 
             // ─── Lifecycle methods ────────────────────────────────────────
-            "initialize" => handle_initialize(state, &request.params),
-            "shutdown" => handle_shutdown(state),
+            "initialize" => handle_initialize(state_ref, &request.params),
+            "shutdown" => handle_shutdown(state_ref),
 
             _ => Err(RpcResponse::error(
                 id.clone(),

@@ -376,7 +376,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
             } catch (err) {
                 document.getElementById('loading').innerHTML = '<span style="color:hsl(0,80%,60%)">Failed to load graph data.</span>';
-                console.error(err);
+                // Failed to load graph data
             }
         }
 
@@ -463,14 +463,14 @@ export async function startServerIfNeeded(client: YaamEngineClient, port: number
                 edges: cyEdges
             });
         } catch (e: any) {
-            console.error("Graph API Error:", e);
+            // Graph API Error
             res.status(500).json({ error: e.message || String(e) });
         }
     });
 
     return new Promise((resolve, reject) => {
         server = app!.listen(port, '0.0.0.0', () => {
-            console.log(`YAAM Visualizer running on port ${port}`);
+            // YAAM Visualizer running
             resolve(`http://localhost:${port}`);
         }).on('error', (err: any) => {
             if (err.code === 'EADDRINUSE') {

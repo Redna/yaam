@@ -47,7 +47,7 @@ impl MemoryEngine {
 
         let label = match payload.label.as_str() {
             "Entity" => NodeLabel::Entity {
-                entity_type: extract_string(props, "type"),
+                entity_type: extract_string(props, "entity_type"),
                 status: extract_string_or(props, "status", "active"),
                 last_modified: extract_u64(props, "last_modified"),
             },
@@ -374,7 +374,7 @@ mod tests {
             "node-1",
             "Entity",
             json!({
-                "type": "Function",
+                "entity_type": "Function",
                 "status": "active",
                 "last_modified": 1719680000,
                 "name": "my_func",
@@ -459,8 +459,8 @@ mod tests {
     #[test]
     fn get_nodes_by_label_returns_correct_set() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("e1", "Entity", json!({"type": "File"})));
-        engine.upsert_node(&make_upsert("e2", "Entity", json!({"type": "Class"})));
+        engine.upsert_node(&make_upsert("e1", "Entity", json!({"entity_type": "File"})));
+        engine.upsert_node(&make_upsert("e2", "Entity", json!({"entity_type": "Class"})));
         engine.upsert_node(&make_upsert("ws1", "Workspace", json!({})));
 
         let entities = engine.get_nodes_by_label("Entity");
@@ -473,9 +473,9 @@ mod tests {
     #[test]
     fn get_nodes_by_type_filters_entity_type() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("e1", "Entity", json!({"type": "Function"})));
-        engine.upsert_node(&make_upsert("e2", "Entity", json!({"type": "Function"})));
-        engine.upsert_node(&make_upsert("e3", "Entity", json!({"type": "Class"})));
+        engine.upsert_node(&make_upsert("e1", "Entity", json!({"entity_type": "Function"})));
+        engine.upsert_node(&make_upsert("e2", "Entity", json!({"entity_type": "Function"})));
+        engine.upsert_node(&make_upsert("e3", "Entity", json!({"entity_type": "Class"})));
 
         let funcs = engine.get_nodes_by_type("Function");
         assert_eq!(funcs.len(), 2);
@@ -490,7 +490,7 @@ mod tests {
         engine.upsert_node(&make_upsert(
             "e1",
             "Entity",
-            json!({"type": "File", "name": "old_name", "status": "active"}),
+            json!({"entity_type": "File", "name": "old_name", "status": "active"}),
         ));
         assert_eq!(engine.get_node("e1").unwrap().name, "old_name");
 
@@ -498,7 +498,7 @@ mod tests {
         engine.upsert_node(&make_upsert(
             "e1",
             "Entity",
-            json!({"type": "File", "name": "new_name", "status": "inactive"}),
+            json!({"entity_type": "File", "name": "new_name", "status": "inactive"}),
         ));
 
         let node = engine.get_node("e1").unwrap();
@@ -516,8 +516,8 @@ mod tests {
     #[test]
     fn link_nodes_creates_forward_and_reverse() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("a", "Entity", json!({"type": "File"})));
-        engine.upsert_node(&make_upsert("b", "Entity", json!({"type": "Function"})));
+        engine.upsert_node(&make_upsert("a", "Entity", json!({"entity_type": "File"})));
+        engine.upsert_node(&make_upsert("b", "Entity", json!({"entity_type": "Function"})));
 
         engine.link_nodes(&make_link("a", "b", "CONTAINS"));
 
@@ -534,9 +534,9 @@ mod tests {
     #[test]
     fn delete_node_removes_associated_edges() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("a", "Entity", json!({"type": "File"})));
-        engine.upsert_node(&make_upsert("b", "Entity", json!({"type": "Function"})));
-        engine.upsert_node(&make_upsert("c", "Entity", json!({"type": "Class"})));
+        engine.upsert_node(&make_upsert("a", "Entity", json!({"entity_type": "File"})));
+        engine.upsert_node(&make_upsert("b", "Entity", json!({"entity_type": "Function"})));
+        engine.upsert_node(&make_upsert("c", "Entity", json!({"entity_type": "Class"})));
 
         engine.link_nodes(&make_link("a", "b", "CONTAINS"));
         engine.link_nodes(&make_link("c", "a", "IMPORTS"));
@@ -557,8 +557,8 @@ mod tests {
     #[test]
     fn delete_edges_outbound() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("a", "Entity", json!({"type": "File"})));
-        engine.upsert_node(&make_upsert("b", "Entity", json!({"type": "File"})));
+        engine.upsert_node(&make_upsert("a", "Entity", json!({"entity_type": "File"})));
+        engine.upsert_node(&make_upsert("b", "Entity", json!({"entity_type": "File"})));
         engine.link_nodes(&make_link("a", "b", "CALLS"));
 
         engine.delete_edges("a", "outbound");
@@ -569,8 +569,8 @@ mod tests {
     #[test]
     fn delete_edges_inbound() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("a", "Entity", json!({"type": "File"})));
-        engine.upsert_node(&make_upsert("b", "Entity", json!({"type": "File"})));
+        engine.upsert_node(&make_upsert("a", "Entity", json!({"entity_type": "File"})));
+        engine.upsert_node(&make_upsert("b", "Entity", json!({"entity_type": "File"})));
         engine.link_nodes(&make_link("a", "b", "CALLS"));
 
         // Delete inbound edges to "b" (which is the edge from a->b).
@@ -582,9 +582,9 @@ mod tests {
     #[test]
     fn delete_edges_both() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("a", "Entity", json!({"type": "File"})));
-        engine.upsert_node(&make_upsert("b", "Entity", json!({"type": "File"})));
-        engine.upsert_node(&make_upsert("c", "Entity", json!({"type": "File"})));
+        engine.upsert_node(&make_upsert("a", "Entity", json!({"entity_type": "File"})));
+        engine.upsert_node(&make_upsert("b", "Entity", json!({"entity_type": "File"})));
+        engine.upsert_node(&make_upsert("c", "Entity", json!({"entity_type": "File"})));
         engine.link_nodes(&make_link("a", "b", "CALLS"));
         engine.link_nodes(&make_link("c", "a", "IMPORTS"));
 
@@ -612,7 +612,7 @@ mod tests {
             EventPayload::UpsertNode(UpsertNodePayload {
                 id: "ev-1".to_string(),
                 label: "Entity".to_string(),
-                properties: json!({"type": "Module", "name": "core"})
+                properties: json!({"entity_type": "Module", "name": "core"})
                     .as_object()
                     .unwrap()
                     .clone()
@@ -627,8 +627,8 @@ mod tests {
     #[test]
     fn apply_event_link() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("x", "Entity", json!({"type": "A"})));
-        engine.upsert_node(&make_upsert("y", "Entity", json!({"type": "B"})));
+        engine.upsert_node(&make_upsert("x", "Entity", json!({"entity_type": "A"})));
+        engine.upsert_node(&make_upsert("y", "Entity", json!({"entity_type": "B"})));
 
         let event = make_event(
             EventType::LinkNodes,
@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn apply_event_delete_node() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("d", "Entity", json!({"type": "X"})));
+        engine.upsert_node(&make_upsert("d", "Entity", json!({"entity_type": "X"})));
         assert!(engine.get_node("d").is_some());
 
         let event = make_event(
@@ -662,8 +662,8 @@ mod tests {
     #[test]
     fn apply_event_delete_edges() {
         let mut engine = MemoryEngine::new();
-        engine.upsert_node(&make_upsert("p", "Entity", json!({"type": "A"})));
-        engine.upsert_node(&make_upsert("q", "Entity", json!({"type": "B"})));
+        engine.upsert_node(&make_upsert("p", "Entity", json!({"entity_type": "A"})));
+        engine.upsert_node(&make_upsert("q", "Entity", json!({"entity_type": "B"})));
         engine.link_nodes(&make_link("p", "q", "REL"));
 
         let event = make_event(
@@ -685,7 +685,7 @@ mod tests {
                 EventPayload::UpsertNode(make_upsert(
                     "file1",
                     "Entity",
-                    json!({"type": "File", "name": "main.rs"}),
+                    json!({"entity_type": "File", "name": "main.rs"}),
                 )),
             ),
             make_event(
@@ -693,7 +693,7 @@ mod tests {
                 EventPayload::UpsertNode(make_upsert(
                     "fn1",
                     "Entity",
-                    json!({"type": "Function", "name": "main"}),
+                    json!({"entity_type": "Function", "name": "main"}),
                 )),
             ),
             make_event(
@@ -701,7 +701,7 @@ mod tests {
                 EventPayload::UpsertNode(make_upsert(
                     "fn2",
                     "Entity",
-                    json!({"type": "Function", "name": "helper"}),
+                    json!({"entity_type": "Function", "name": "helper"}),
                 )),
             ),
             make_event(
@@ -746,11 +746,11 @@ mod tests {
         let events = vec![
             make_event(
                 EventType::UpsertNode,
-                EventPayload::UpsertNode(make_upsert("a", "Entity", json!({"type": "X"}))),
+                EventPayload::UpsertNode(make_upsert("a", "Entity", json!({"entity_type": "X"}))),
             ),
             make_event(
                 EventType::UpsertNode,
-                EventPayload::UpsertNode(make_upsert("b", "Entity", json!({"type": "Y"}))),
+                EventPayload::UpsertNode(make_upsert("b", "Entity", json!({"entity_type": "Y"}))),
             ),
             make_event(
                 EventType::LinkNodes,

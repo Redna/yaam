@@ -324,7 +324,7 @@ mod tests {
 
         // Create a file entity
         let mut file_props = HashMap::new();
-        file_props.insert("type".into(), serde_json::json!("File"));
+        file_props.insert("entity_type".into(), serde_json::json!("File"));
         file_props.insert("status".into(), serde_json::json!("active"));
         file_props.insert("last_modified".into(), serde_json::json!(1000));
         file_props.insert("name".into(), serde_json::json!("auth.ts"));
@@ -337,7 +337,7 @@ mod tests {
         // Create two function entities
         for (id, name) in [("src/auth.ts::validate", "validate"), ("src/auth.ts::parse", "parse")] {
             let mut props = HashMap::new();
-            props.insert("type".into(), serde_json::json!("Function"));
+            props.insert("entity_type".into(), serde_json::json!("Function"));
             props.insert("status".into(), serde_json::json!("active"));
             props.insert("last_modified".into(), serde_json::json!(1000));
             props.insert("name".into(), serde_json::json!(name));

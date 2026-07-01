@@ -117,6 +117,6 @@ export async function trackAccessedFile(
       }
     }
   } catch (e) {
-    console.error("Error mapping workspace to file:", e);
+    // Error mapping workspace to file
   }
 }

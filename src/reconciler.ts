@@ -47,25 +47,25 @@ export class Reconciler {
         .then(async (fileNodes) => {
           for (const node of fileNodes) {
             if (!allFilesSet.has(node.id)) {
-              console.log(`[YAAM] Removing stale file from graph: ${node.id}`);
+              // Removing stale file from graph: ${node.id}
               await this.engine.reconcile({ file_path: node.id, content: "" });
             }
           }
           this.triggerSync();
         })
         .catch(e => {
-          console.error("Failed to query nodes during full sync:", e);
+          // Failed to query nodes during full sync
           this.triggerSync();
         });
     } catch (e) {
-      console.error("Full sync error:", e);
+      // Full sync error
     }
   }
 
   private triggerSync() {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
-      this.runSync().catch(e => console.error("Reconciler error:", e));
+      this.runSync().catch(e => {}); // Reconciler error suppressed
     }, 1000);
   }
 
@@ -91,7 +91,7 @@ export class Reconciler {
           await this.engine.reconcile({ file_path: relPath, content });
         }
       } catch (e) {
-        console.warn(`Failed to reconcile ${file}:`, e);
+        // Failed to reconcile ${file}
       }
     }
 

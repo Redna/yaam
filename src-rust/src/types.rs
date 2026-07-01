@@ -210,7 +210,7 @@ pub struct MatchClause {
     #[serde(default)]
     pub label: Option<String>,
     /// Match by entity type: "File", "Class", "Function".
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "entity_type")]
     pub entity_type: Option<String>,
     /// Match by exact node ID.
     #[serde(default)]

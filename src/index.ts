@@ -12,6 +12,9 @@ export default function yaamExtension(pi: ExtensionAPI) {
   const engine = new YaamEngineClient(eventsPath);
   const reconciler = new Reconciler(engine);
 
+  // ─── Cached memory context (refreshed at session start) ──────────────────
+  let memoryContext = "";
+
   // ─── UI helpers (safe in all modes) ─────────────────────────────────────
   let lastCtx: any = null;
   let statusTimer: ReturnType<typeof setInterval> | null = null;
@@ -48,17 +51,88 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
   // ─── Session lifecycle ───────────────────────────────────────────────────
 
+  async function refreshMemoryContext() {
+    try {
+      const [typeRows, wsRows] = await Promise.all([
+        engine.query({
+          match: { label: "Entity" },
+          aggregate: { group_by: "type", count: true }
+        }),
+        engine.query({
+          match: { label: "Workspace", status: "active" } }),
+      ]);
+
+      const parts: string[] = [];
+
+      // Entity counts
+      if (typeRows.length > 0) {
+        const counts = typeRows.map((r: any) => `${r.count} ${r.type}`).join(", ");
+        parts.push(`Graph: ${counts}`);
+      }
+
+      // Active workspace + recent notes
+      if (wsRows.length > 0) {
+        const ws = wsRows[0];
+        parts.push(`Active workspace: ${ws.id}`);
+        if (ws.properties?.description) {
+          parts.push(`  Task: ${ws.properties.description}`);
+        }
+
+        // Fetch recent scratchpad notes
+        try {
+          const notes = await engine.query({
+            match: { label: "Workspace", id: ws.id },
+            traverse: { relationship: "HAS_SCRATCHPAD", direction: "outbound", max_depth: 1 },
+            limit: 3,
+          });
+          if (notes.length > 0) {
+            const noteSummaries = notes.map((n: any) => {
+              const preview = (n.content || "").substring(0, 150);
+              return `  - ${preview}`;
+            }).join("\n");
+            parts.push(`Recent decisions:\n${noteSummaries}`);
+          }
+        } catch {}
+      } else {
+        parts.push("No active workspace.");
+      }
+
+      memoryContext = parts.join("\n");
+    } catch {
+      memoryContext = "";
+    }
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     lastCtx = ctx;
     try {
       await engine.start();
       setStatus(ctx, "yaam", "Ready ✅");
       reconciler.scheduleFull();
+      // Refresh memory context and inject as a one-time message.
+      // Do NOT modify the system prompt — that would invalidate the prompt cache.
+      // Instead, send the context as a new message that the LLM sees at the start.
+      setTimeout(() => {
+        refreshMemoryContext().then(() => {
+          if (memoryContext) {
+            pi.sendMessage({
+              customType: "yaam_memory_context",
+              content: `[YAAM Memory Context]\n${memoryContext}`,
+              display: true,
+            }, { deliverAs: "nextTurn" });
+          }
+        });
+      }, 3000);
     } catch (e: any) {
       setStatus(ctx, "yaam", `Error ❌`);
       ctx.ui.notify(`Failed to start YAAM Engine: ${e.message}`, "error");
     }
   });
+
+  // NOTE: Do NOT modify the system prompt via before_agent_start.
+  // The system prompt must remain stable across turns to preserve the
+  // LLM provider's prompt cache. Dynamic memory context is delivered
+  // as one-time messages via pi.sendMessage instead.
 
   pi.on("session_shutdown", async () => {
     if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
@@ -179,7 +253,7 @@ EXAMPLES:
 
         // Optimistic background save
         initializeWorkspace(params.name, params.description, engine)
-          .catch(e => console.error("Workspace init error:", e));
+          .catch(e => {}); // Workspace init error suppressed
         
         return {
           content: [{ type: "text" as const, text: `Workspace '${params.name}' initialized successfully (background save).` }],
@@ -213,7 +287,7 @@ EXAMPLES:
       try {
         // Optimistic background save
         appendNote(params.workspace, params.content, engine)
-          .catch(e => console.error("Workspace append note error:", e));
+          .catch(e => {}); // Workspace append note error suppressed
 
         return {
           content: [{ type: "text" as const, text: `Note added to workspace '${params.workspace}' (background save).` }],
