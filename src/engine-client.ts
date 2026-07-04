@@ -253,7 +253,7 @@ export class YaamEngineClient {
     return this.call('query', dsl);
   }
 
-  public async search(payload: { text: string; top_k?: number; workspace?: string }): Promise<any[]> {
+  public async search(payload: { text: string; top_k?: number; workspace?: string; entity_types?: string[]; include_paths?: string[]; exclude_paths?: string[] }): Promise<any[]> {
     return this.call('search', payload);
   }
 

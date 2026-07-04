@@ -277,6 +277,17 @@ pub struct SearchRequest {
     /// Maximum results to return (default: 10).
     #[serde(default = "default_top_k")]
     pub top_k: Option<usize>,
+    /// Optional: filter results by entity type (e.g. ["Function", "Class"]).
+    #[serde(default)]
+    pub entity_types: Option<Vec<String>>,
+    /// Optional: include only results whose ID starts with one of these path
+    /// prefixes (e.g. ["src/", "lib/"]).
+    #[serde(default)]
+    pub include_paths: Option<Vec<String>>,
+    /// Optional: exclude results whose ID starts with one of these path
+    /// prefixes (e.g. ["node_modules/", ".venv/"]).
+    #[serde(default)]
+    pub exclude_paths: Option<Vec<String>>,
 }
 
 fn default_top_k() -> Option<usize> {

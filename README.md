@@ -83,7 +83,7 @@ Running `/yaam viz` spins up a local Express backend serving an interactive UI a
 |--------|-------------|
 | `reconcile` | Parse a file with tree-sitter, resolve references via LSP, upsert entities. |
 | `query` | Execute a JSON DSL query against the in-memory graph. |
-| `search` | Hybrid BM25 + ONNX semantic search. |
+| `search` | Hybrid BM25 + ONNX semantic search. Supports filtering by `entity_types`, `include_paths`, `exclude_paths`. Results include `category` (module/library). |
 | `upsert_node` / `link_nodes` / `delete_node` / `delete_edges` | Graph mutations. |
 | `languages.list` | List all registered languages with extensions, LSP command, and running status. |
 | `initialize` / `shutdown` | Daemon lifecycle. |

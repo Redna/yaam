@@ -308,7 +308,7 @@ EXAMPLES:
     name: "yaam_search",
     label: "YAAM Hybrid Search",
     description:
-      `Performs a hybrid semantic + keyword search across the YAAM memory graph.\n\nCombines BM25 keyword matching with dense ONNX embeddings (gte-small) to find relevant code entities, workspaces, and scratchpad notes by natural language meaning — not just exact keyword matches.\n\nUse this when you need to find code by concept or behavior (e.g. "file reconciliation logic", "workspace tracking") rather than exact names. Results are ranked by combined BM25 + cosine similarity score.\n\nParameters:\n- text (required): Natural language or keyword query\n- top_k (optional): Max results to return (default: 10)\n- workspace (optional): Scope results to entities mapped to a specific workspace`,
+      `Performs a hybrid semantic + keyword search across the YAAM memory graph.\n\nCombines BM25 keyword matching with dense ONNX embeddings (gte-small) to find relevant code entities, workspaces, and scratchpad notes by natural language meaning — not just exact keyword matches.\n\nUse this when you need to find code by concept or behavior (e.g. "file reconciliation logic", "workspace tracking") rather than exact names. Results are ranked by combined BM25 + cosine similarity score.\n\nParameters:\n- text (required): Natural language or keyword query\n- top_k (optional): Max results to return (default: 10)\n- workspace (optional): Scope results to entities mapped to a specific workspace\n- entity_types (optional): Filter by entity type (e.g. ["Function", "Class", "File"]\n- include_paths (optional): Include only results whose path starts with one of these prefixes (e.g. ["src/"]\n- exclude_paths (optional): Exclude results whose path starts with one of these prefixes (e.g. ["node_modules/", ".venv/"]\n\nResults include a \"category\" field: "module" for project source code, "library" for dependencies.\nUse exclude_paths to scope searches to your own code.`,
     promptSnippet: "Search YAAM memory by semantic meaning + keywords",
     promptGuidelines: [
       "Use yaam_search for natural-language discovery of code entities and notes — it combines BM25 keyword search with dense semantic embeddings to find relevant nodes by meaning, not just exact text matches.",
@@ -317,6 +317,9 @@ EXAMPLES:
       text: Type.String({ description: "The natural language or keyword search query." }),
       top_k: Type.Optional(Type.Number({ description: "Maximum number of results to return (default: 10)." })),
       workspace: Type.Optional(Type.String({ description: "Optional: scope results to entities mapped to a specific workspace." })),
+      entity_types: Type.Optional(Type.Array(Type.String(), { description: "Optional: filter results by entity type (e.g. [\"Function\", \"Class\"])." })),
+      include_paths: Type.Optional(Type.Array(Type.String(), { description: "Optional: include only results whose path starts with one of these prefixes (e.g. [\"src/\"])." })),
+      exclude_paths: Type.Optional(Type.Array(Type.String(), { description: "Optional: exclude results whose path starts with one of these prefixes (e.g. [\"node_modules/\", \".venv/\"])." })),
     }),
     async execute(_toolCallId, params) {
       try {
@@ -324,6 +327,9 @@ EXAMPLES:
           text: params.text,
           top_k: params.top_k,
           workspace: params.workspace,
+          entity_types: params.entity_types,
+          include_paths: params.include_paths,
+          exclude_paths: params.exclude_paths,
         });
 
         if (!results || results.length === 0) {

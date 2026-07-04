@@ -362,6 +362,31 @@ fn handle_query(
     Ok(result)
 }
 
+/// Derive a category label from a file path.
+///
+/// Heuristic classification:
+/// - `library` — paths containing known dependency directories
+///   (node_modules, .venv, site-packages, dist, build, target, etc.)
+/// - `module` — everything else (the project's own source code)
+fn derive_category(path: &str) -> String {
+    const LIBRARY_MARKERS: &[&str] = &[
+        "node_modules/",
+        ".venv/",
+        "site-packages/",
+        "/dist/",
+        "/build/",
+        "/target/",
+        ".eggs/",
+        ".npm/",
+        ".cache/",
+    ];
+    if LIBRARY_MARKERS.iter().any(|marker| path.contains(marker)) {
+        "library".to_string()
+    } else {
+        "module".to_string()
+    }
+}
+
 fn handle_search(
     state: &AppState,
     params: &serde_json::Value,
@@ -430,6 +455,46 @@ fn handle_search(
         ranked
     };
 
+    // Apply path and entity-type filters.
+    let entity_types = request.entity_types.as_deref();
+    let include_paths = request.include_paths.as_deref();
+    let exclude_paths = request.exclude_paths.as_deref();
+
+    let filtered: Vec<(String, f32)> = filtered
+        .into_iter()
+        .filter(|(id, _)| {
+            // entity_types filter: check the node's entity_type against the allowed list.
+            if let Some(allowed_types) = entity_types {
+                if let Some(node) = engine.get_node(id) {
+                    let node_type = match &node.label {
+                        NodeLabel::Entity { entity_type, .. } => entity_type.as_str(),
+                        NodeLabel::Workspace { .. } => "Workspace",
+                        NodeLabel::Scratchpad { .. } => "Scratchpad",
+                    };
+                    if !allowed_types.iter().any(|t| t == node_type) {
+                        return false;
+                    }
+                }
+            }
+
+            // include_paths filter: ID must start with at least one prefix.
+            if let Some(prefixes) = include_paths {
+                if !prefixes.iter().any(|p| id.starts_with(p)) {
+                    return false;
+                }
+            }
+
+            // exclude_paths filter: ID must not start with any prefix.
+            if let Some(prefixes) = exclude_paths {
+                if prefixes.iter().any(|p| id.starts_with(p)) {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect();
+
     let limited: Vec<(String, f32)> = filtered.into_iter().take(top_k).collect();
 
     // Build result payloads
@@ -437,17 +502,36 @@ fn handle_search(
         .iter()
         .filter_map(|(id, score)| {
             engine.get_node(id).map(|node| {
+                let (entity_type_str, file_path) = match &node.label {
+                    NodeLabel::Entity { entity_type, .. } => {
+                        // Derive a file path from the entity ID for Entity nodes.
+                        // Entity IDs are either "file_path" (File) or "file_path:name" (Function/Class).
+                        let path = if id.contains(':') {
+                            id.splitn(2, ':').next().unwrap_or("")
+                        } else {
+                            id.as_str()
+                        };
+                        (entity_type.clone(), Some(path.to_string()))
+                    }
+                    NodeLabel::Workspace { .. } => ("Workspace".to_string(), None),
+                    NodeLabel::Scratchpad { .. } => ("Scratchpad".to_string(), None),
+                };
+
+                // Derive category from the file path.
+                let category = file_path
+                    .as_deref()
+                    .map(derive_category)
+                    .unwrap_or("workspace".to_string());
+
                 serde_json::json!({
                     "id": node.id,
                     "name": node.name,
                     "score": score,
                     "content": node.content,
                     "metadata": node.metadata,
-                    "type": match &node.label {
-                        NodeLabel::Entity { entity_type, .. } => entity_type.clone(),
-                        NodeLabel::Workspace { .. } => "Workspace".to_string(),
-                        NodeLabel::Scratchpad { .. } => "Scratchpad".to_string(),
-                    },
+                    "type": entity_type_str,
+                    "path": file_path,
+                    "category": category,
                 })
             })
         })
