@@ -80,6 +80,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
         .filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; margin-top: 8px; }
         .filter-item { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; user-select: none; }
         .filter-item input { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; margin: 0; }
+        .cat-btn { background: hsla(0,0%,100%,0.08); border: 1px solid hsla(0,0%,100%,0.15);
+            color: var(--text-muted); border-radius: 8px; padding: 4px 12px;
+            font-size: 12px; cursor: pointer; transition: all 0.2s; font-family: inherit; }
+        .cat-btn:hover { background: hsla(0,0%,100%,0.15); color: var(--text-main); }
+        .cat-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
         .legend-color { width: 12px; height: 12px; border-radius: 50%; box-shadow: 0 0 8px currentColor; flex-shrink: 0; }
         .legend-edge { width: 18px; height: 2px; border-radius: 2px; flex-shrink: 0; }
         .legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
@@ -134,7 +139,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
                 <button class="collapse-btn" onclick="toggleSection('filter-content', this)">−</button>
             </div>
             <div id="filter-content" class="section-content expanded">
-                <div class="filter-grid" id="node-filters"></div>
+                <div id="category-filters" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;"></div>
                 <div class="divider"></div>
                 <div class="filter-grid" id="edge-filters"></div>
             </div>
@@ -146,9 +151,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
                 <button class="collapse-btn" onclick="toggleSection('legend-content', this)">−</button>
             </div>
             <div id="legend-content" class="section-content expanded">
-                <div id="legend-nodes"></div>
+                <div class="legend-title">Nodes</div>
+                <div id="legend-nodes" style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:4px;"></div>
                 <div class="divider"></div>
-                <div id="legend-edges"></div>
+                <div class="legend-title">Edges</div>
+                <div id="legend-edges" style="display:flex;flex-direction:column;gap:6px;margin-top:4px;"></div>
             </div>
         </div>
     </div>
@@ -188,7 +195,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
         const EDGE_TYPES = ['CALLS','MAPPED_TO','IMPORTS','DECLARED_IN','HAS_SCRATCHPAD'];
 
         let cy;
-        const activeNodeFilters = new Set(NODE_TYPES);
+        const CATEGORIES = ['all','project','library'];
+        let activeCategory = 'all';
         const activeEdgeFilters = new Set(EDGE_TYPES);
 
         function toggleSidebar() {
@@ -202,31 +210,53 @@ const HTML_CONTENT = `<!DOCTYPE html>
             btn.textContent = el.classList.contains('collapsed') ? '+' : '−';
         }
 
+        function deriveCategory(id) {
+            const LIB = ['node_modules/','.venv/','site-packages/','/dist/','/build/','/target/'];
+            if (LIB.some(m => id.includes(m))) return 'library';
+            return 'project';
+        }
+
         function applyFilters() {
             if (!cy) return;
             cy.nodes().forEach(node => {
-                const type = node.data('type');
-                if (activeNodeFilters.has(type)) node.show();
+                const cat = node.data('category') || 'project';
+                if (activeCategory === 'all' || cat === activeCategory) node.show();
                 else node.hide();
             });
             cy.edges().forEach(edge => {
-                const label = edge.data('label');
-                const srcVisible = activeNodeFilters.has(edge.source().data('type'));
-                const tgtVisible = activeNodeFilters.has(edge.target().data('type'));
-                if (activeEdgeFilters.has(label) && srcVisible && tgtVisible) edge.show();
+                if (!activeEdgeFilters.has(edge.data('label'))) { edge.hide(); return; }
+                if (activeCategory === 'all') { edge.show(); return; }
+                const srcCat = edge.source().data('category') || 'project';
+                const tgtCat = edge.target().data('category') || 'project';
+                if (srcCat === activeCategory && tgtCat === activeCategory) edge.show();
                 else edge.hide();
             });
         }
 
         // Build filter + legend UI
         function buildControls() {
-            const nf = document.getElementById('node-filters');
+            // Category filter buttons
+            const cf = document.getElementById('category-filters');
+            CATEGORIES.forEach(cat => {
+                const label = cat.charAt(0).toUpperCase() + cat.slice(1);
+                const btn = document.createElement('button');
+                btn.className = 'cat-btn' + (cat === 'all' ? ' active' : '');
+                btn.textContent = label;
+                btn.onclick = () => {
+                    activeCategory = cat;
+                    document.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    applyFilters();
+                };
+                cf.appendChild(btn);
+            });
+            // Edge filters
             const ef = document.getElementById('edge-filters');
-            const ln = document.getElementById('legend-nodes');
             const le = document.getElementById('legend-edges');
+            const ln = document.getElementById('legend-nodes');
+            // Node legend (colors only, not filters)
             NODE_TYPES.forEach(t => {
                 const c = COLORS[t] || COLORS.Default;
-                nf.innerHTML += '<label class="filter-item"><input type="checkbox" data-kind="node" data-type="'+t+'" checked><div class="legend-color" style="color:'+c+';background:'+c+'"></div>'+t+'</label>';
                 ln.innerHTML += '<div class="legend-item"><div class="legend-color" style="color:'+c+';background:'+c+'"></div>'+t+'</div>';
             });
             EDGE_TYPES.forEach(t => {
@@ -235,12 +265,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
                 ef.innerHTML += '<label class="filter-item"><input type="checkbox" data-kind="edge" data-type="'+t+'" checked><div class="legend-edge" style="'+dash+'"></div>'+t+'</label>';
                 le.innerHTML += '<div class="legend-item"><div class="legend-edge" style="'+dash+'"></div>'+t+'</div>';
             });
-            document.querySelectorAll('input[data-kind]').forEach(cb => {
+            document.querySelectorAll('input[data-kind="edge"]').forEach(cb => {
                 cb.addEventListener('change', () => {
-                    const kind = cb.dataset.kind;
                     const type = cb.dataset.type;
-                    const set = kind === 'node' ? activeNodeFilters : activeEdgeFilters;
-                    if (cb.checked) set.add(type); else set.delete(type);
+                    if (cb.checked) activeEdgeFilters.add(type); else activeEdgeFilters.delete(type);
                     applyFilters();
                 });
             });
@@ -346,8 +374,13 @@ export async function startServerIfNeeded(client: YaamEngineClient, port: number
 
     app.get('/api/graph', async (req, res) => {
         try {
-            // Fetch all nodes
             const rawNodes = await client.query({ match: {} });
+            
+            const deriveCategory = (id: string): string => {
+                const LIB = ['node_modules/','.venv/','site-packages/','/dist/','/build/','/target/'];
+                if (LIB.some(m => id.includes(m))) return 'library';
+                return 'project';
+            };
             
             const cyNodes: any[] = [];
             const nodeIds = new Set();
@@ -358,15 +391,18 @@ export async function startServerIfNeeded(client: YaamEngineClient, port: number
                 nodeIds.add(n.id);
                 
                 let type = 'Unknown';
-                if (n.label === 'Entity') type = n.properties?.type || 'Entity';
-                else if (n.label === 'Workspace') type = 'Workspace';
-                else if (n.label === 'Scratchpad') type = 'Scratchpad';
+                if (n.label?.label === 'Entity') type = n.label?.type || 'Entity';
+                else if (n.label?.label === 'Workspace') type = 'Workspace';
+                else if (n.label?.label === 'Scratchpad') type = 'Scratchpad';
+                
+                const category = deriveCategory(n.id);
                 
                 cyNodes.push({
                     data: {
                         id: n.id,
                         name: n.name || n.id,
                         type: type,
+                        category: category,
                         content: n.content,
                         description: n.properties?.description,
                         metadata: n.metadata
