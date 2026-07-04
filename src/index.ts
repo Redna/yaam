@@ -109,20 +109,41 @@ export default function yaamExtension(pi: ExtensionAPI) {
       await engine.start();
       setStatus(ctx, "yaam", "Ready ✅");
       reconciler.scheduleFull();
-      // Refresh memory context and inject as a one-time message.
-      // Do NOT modify the system prompt — that would invalidate the prompt cache.
-      // Instead, send the context as a new message that the LLM sees at the start.
-      setTimeout(() => {
-        refreshMemoryContext().then(() => {
-          if (memoryContext) {
-            pi.sendMessage({
-              customType: "yaam_memory_context",
-              content: `[YAAM Memory Context]\n${memoryContext}`,
-              display: true,
-            }, { deliverAs: "nextTurn" });
-          }
-        });
-      }, 3000);
+
+      // Phase 1: Send context IMMEDIATELY from the persisted graph.
+      // The daemon already loaded everything from events.jsonl on startup,
+      // so the graph is fully populated before any reconciliation happens.
+      // No delay needed — this avoids the race condition where the old
+      // 3-second setTimeout captured a partial graph mid-reconcile.
+      await refreshMemoryContext();
+      if (memoryContext) {
+        pi.sendMessage({
+          customType: "yaam_memory_context",
+          content: `[YAAM Memory Context]\n${memoryContext}`,
+          display: true,
+        }, { deliverAs: "nextTurn" });
+      }
+
+      // Phase 2: After reconciliation finishes, send an UPDATED context
+      // if anything changed (new files, modified functions, deletions, etc.).
+      // This runs in the background — non-blocking.
+      (async () => {
+        // scheduleFull() debounces 1s before processing starts.
+        // Give it a moment to kick off, then poll until done.
+        await new Promise(r => setTimeout(r, 1500));
+        while (reconciler.isRunning) {
+          await new Promise(r => setTimeout(r, 250));
+        }
+        const before = memoryContext;
+        await refreshMemoryContext();
+        if (memoryContext && memoryContext !== before) {
+          pi.sendMessage({
+            customType: "yaam_memory_context",
+            content: `[YAAM Memory Context]\n${memoryContext}`,
+            display: true,
+          }, { deliverAs: "nextTurn" });
+        }
+      })();
     } catch (e: any) {
       setStatus(ctx, "yaam", `Error ❌`);
       ctx.ui.notify(`Failed to start YAAM Engine: ${e.message}`, "error");

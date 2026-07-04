@@ -27,7 +27,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
             color: var(--text-main);
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             overflow: hidden;
-            height: 100vh; width: 100vw;
+            height: 100vh; height: 100dvh;
+            width: 100vw;
         }
         #cy {
             width: 100%; height: 100%;
@@ -46,12 +47,17 @@ const HTML_CONTENT = `<!DOCTYPE html>
         #sidebar {
             top: 12px; left: 12px;
             width: 280px;
-            max-height: calc(100vh - 24px);
+            max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px);
             overflow-y: auto;
             padding: 16px;
             display: flex; flex-direction: column; gap: 12px;
+            padding-top: max(16px, env(safe-area-inset-top, 0px));
         }
-        #sidebar.collapsed { width: 48px; height: 48px; overflow: hidden; padding: 0; }
+        #sidebar.collapsed {
+            width: 52px; height: 52px; overflow: hidden; padding: 0;
+            top: max(12px, env(safe-area-inset-top, 12px));
+            border-radius: 14px;
+        }
         #sidebar.collapsed .sidebar-body { display: none; }
         #sidebar.collapsed .collapse-sidebar { display: flex; }
         .sidebar-header { display: flex; align-items: center; justify-content: space-between; }
@@ -70,7 +76,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
         .collapse-btn:hover { background: hsla(0,0%,100%,0.15); color: var(--text-main); }
         .collapse-sidebar { display: none; width: 100%; height: 100%;
             align-items: center; justify-content: center; cursor: pointer;
-            font-size: 20px; color: var(--text-muted); }
+            font-size: 22px; color: var(--text-muted); }
+        #sidebar.collapsed .collapse-sidebar {
+            background: var(--accent); color: #fff; border-radius: 14px;
+        }
         .section-header { display: flex; align-items: center; justify-content: space-between; }
         .legend-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
             color: var(--text-muted); font-weight: 600; }
@@ -104,6 +113,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
             position: absolute; top: 12px; right: 12px;
             width: 280px; padding: 16px; display: none;
             flex-direction: column; gap: 10px;
+            padding-top: max(16px, env(safe-area-inset-top, 0px));
         }
         #node-details h2 { margin: 0; font-size: 16px; word-break: break-all; }
         .tag { display: inline-block; padding: 3px 8px; border-radius: 16px;
@@ -114,9 +124,18 @@ const HTML_CONTENT = `<!DOCTYPE html>
             border: 1px solid hsla(0,0%,100%,0.05); margin: 0; white-space: pre-wrap; }
         /* Mobile */
         @media (max-width: 640px) {
-            #sidebar { width: calc(100vw - 24px); max-width: 280px; }
-            #sidebar.collapsed { width: 44px; height: 44px; }
-            #node-details { width: calc(100vw - 24px); max-width: 280px; }
+            #sidebar {
+                width: calc(100vw - 24px); max-width: 300px;
+                left: 12px;
+            }
+            #sidebar.collapsed { width: 52px; height: 52px; }
+            /* Node details slides from bottom on mobile */
+            #node-details {
+                top: auto; right: 12px; left: 12px;
+                bottom: max(12px, env(safe-area-inset-bottom, 12px));
+                width: calc(100vw - 24px); max-width: none;
+                max-height: 50vh; max-height: 50dvh;
+            }
         }
     </style>
 </head>
