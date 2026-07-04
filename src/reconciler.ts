@@ -20,16 +20,22 @@ export class Reconciler {
     const fs = require('fs');
     const walkPath = require('path');
     
+    // File extensions supported by registered language adapters.
+    // Update this when adding a new language (see scripts/add-language.sh).
+    const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs'];
+    // Directories to skip during file walking.
+    const SKIP_DIRS = ['node_modules', 'dist', '.git', 'target', '.chunks', '.yaam'];
+    
     const walkSync = (dir: string, filelist: string[] = []) => {
       if (!fs.existsSync(dir)) return filelist;
       const files = fs.readdirSync(dir);
       for (const file of files) {
         const filepath = walkPath.join(dir, file);
         if (fs.statSync(filepath).isDirectory()) {
-          if (!['node_modules', 'dist', '.git', 'src-rust', 'target', '.chunks'].includes(file)) {
+          if (!SKIP_DIRS.includes(file)) {
             walkSync(filepath, filelist);
           }
-        } else if (file.endsWith('.ts') || file.endsWith('.js')) {
+        } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {
           filelist.push(filepath);
         }
       }
