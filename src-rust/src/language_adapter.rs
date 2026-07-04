@@ -94,6 +94,12 @@ pub fn list_languages() -> Vec<LanguageInfo> {
             language_id: "python".to_string(),
             lsp_command: PythonAdapter.lsp_command(),
         },
+        LanguageInfo {
+            name: "Rust".to_string(),
+            extensions: vec!["rs".to_string()],
+            language_id: "rust".to_string(),
+            lsp_command: RustAdapter.lsp_command(),
+        },
     ]
 }
 
@@ -104,6 +110,7 @@ pub fn get_adapter(file_path: &Path) -> Option<Box<dyn LanguageAdapter>> {
     match ext {
         "ts" | "tsx" | "js" | "jsx" => Some(Box::new(TypeScriptAdapter)),
         "py" => Some(Box::new(PythonAdapter)),
+        "rs" => Some(Box::new(RustAdapter)),
         _ => None,
     }
 }
@@ -229,6 +236,60 @@ impl LanguageAdapter for PythonAdapter {
     fn lsp_command(&self) -> Option<LspCommand> {
         Some(LspCommand {
             command: "pylsp".to_string(),
+            args: vec![],
+        })
+    }
+}
+
+// ─── Rust Adapter ───────────────────────────────────────────────────────────
+
+pub struct RustAdapter;
+
+impl LanguageAdapter for RustAdapter {
+    fn language(&self) -> Language {
+        tree_sitter_rust::language()
+    }
+
+    fn query_source(&self) -> &'static str {
+        r#"
+        (struct_item name: (type_identifier) @class.name)
+        (enum_item name: (type_identifier) @class.name)
+        (trait_item name: (type_identifier) @class.name)
+        (function_item name: (identifier) @function.name)
+        (call_expression function: (identifier) @call.name)
+        (call_expression function: (field_expression field: (field_identifier) @call.name))
+        (call_expression function: (scoped_identifier) @call.name)
+        (use_declaration (scoped_identifier) @import.name)
+        (use_declaration (identifier) @import.name)
+        "#
+    }
+
+    fn language_id(&self) -> &'static str {
+        "rust"
+    }
+
+    fn find_enclosing_function(
+        &self,
+        node: Node,
+        source_code: &[u8],
+        file_path: &Path,
+    ) -> Option<String> {
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if parent.kind() == "function_item" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source_code).ok()?.to_string();
+                    return Some(format!("{}:{}", file_path.display(), name));
+                }
+            }
+            current = parent.parent();
+        }
+        None
+    }
+
+    fn lsp_command(&self) -> Option<LspCommand> {
+        Some(LspCommand {
+            command: "rust-analyzer".to_string(),
             args: vec![],
         })
     }

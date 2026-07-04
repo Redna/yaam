@@ -36,6 +36,7 @@ Automatically tracks files, functions, classes, and cross-file relationships (CA
 |----------|-----------|------------|---------------------|
 | TypeScript / JavaScript | `.ts` `.tsx` `.js` `.jsx` | `typescript-language-server` | `tree-sitter-typescript` |
 | Python | `.py` | `pylsp` | `tree-sitter-python` |
+| Rust | `.rs` | `rust-analyzer` | `tree-sitter-rust` |
 
 Query registered languages at runtime via the `languages.list` RPC method.
 
@@ -106,6 +107,7 @@ Running `/yaam viz` spins up a local Express backend serving an interactive UI a
    ```bash
    npm install -g typescript-language-server typescript   # TypeScript
    pip install python-lsp-server                            # Python
+   rustup component add rust-analyzer                        # Rust
    ```
 
 Loaded automatically by pi from `pi.extensions` in `package.json`.
