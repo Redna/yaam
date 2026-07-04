@@ -114,34 +114,127 @@ Loaded automatically by pi from `pi.extensions` in `package.json`.
 
 ## Adding a New Language
 
-YAAM uses a **language adapter pattern** (strategy pattern) for multi-language support. Adding a new language is a 4-step process:
+YAAM uses a **language adapter pattern** (strategy pattern) for multi-language support. Each language is a self-contained adapter that provides the tree-sitter grammar, query, LSP command, and AST-walking logic. Adding a new language is a 4-step process.
 
 ### Option A: Scaffolding Script (recommended)
 
 ```bash
 # Generate and print boilerplate code with instructions
-./scripts/add-language.sh Rust rs tree-sitter-rust 0.21 rust-analyzer
+./scripts/add-language.sh Go go tree-sitter-go 0.21 gopls serve
 
 # Or auto-insert the code directly into source files
-./scripts/add-language.sh --apply Rust rs tree-sitter-rust 0.21 rust-analyzer
+./scripts/add-language.sh --apply Go go tree-sitter-go 0.21 gopls serve
 ```
 
-Then customize the `query_source()` and `find_enclosing_function()` TODO sections, build, and install the LSP server.
+**Arguments:**
+
+| Argument | Description | Example |
+|----------|-------------|---------|
+| `name` | Human-readable language name | `Go`, `Java`, `Ruby` |
+| `extensions` | Comma-separated file extensions (no dots) | `go`, `java,gradle` |
+| `tree-sitter-crate` | crates.io name of the grammar | `tree-sitter-go` |
+| `crate-version` | crates.io version | `0.21` |
+| `lsp-command` | LSP server executable, or `none` | `gopls`, `jdtls`, `none` |
+| `lsp-args` | Optional arguments for the LSP server | `--stdio`, `serve` |
+
+The script generates a complete adapter struct with TODO templates for `query_source()` and `find_enclosing_function()`. Customize those, then build and install the LSP server.
 
 ### Option B: Manual
 
 1. **Add tree-sitter grammar** to `src-rust/Cargo.toml`:
    ```toml
-   tree-sitter-rust = "0.21"
+   tree-sitter-go = "0.21"
    ```
-2. **Implement the `LanguageAdapter` trait** in `src-rust/src/language_adapter.rs`:
-   - `language()` — return the tree-sitter `Language`
-   - `query_source()` — tree-sitter query capturing declarations, calls, and imports
-   - `language_id()` — LSP `languageId` string
-   - `find_enclosing_function()` — walk the AST to attribute CALLS edges
-   - `lsp_command()` — return the LSP server command (or `None`)
-3. **Register in `get_adapter()`** — add a match arm for the file extension
-4. **Register in `list_languages()`** — add a `LanguageInfo` entry for introspection
+
+2. **Implement the `LanguageAdapter` trait** in `src-rust/src/language_adapter.rs` (see [Complete Example](#complete-adapter-example) below).
+
+3. **Register in `get_adapter()`** — add a match arm for the file extension:
+   ```rust
+   "go" => Some(Box::new(GoAdapter)),
+   ```
+
+4. **Register in `list_languages()`** — add a `LanguageInfo` entry:
+   ```rust
+   LanguageInfo {
+       name: "Go".to_string(),
+       extensions: vec!["go".to_string()],
+       language_id: "go".to_string(),
+       lsp_command: GoAdapter.lsp_command(),
+   },
+   ```
+
+### Complete Adapter Example
+
+Here is the full `PythonAdapter` implementation as a reference. A new adapter follows the same structure:
+
+```rust
+pub struct PythonAdapter;
+
+impl LanguageAdapter for PythonAdapter {
+    // 1. Return the tree-sitter Language for this grammar.
+    fn language(&self) -> Language {
+        tree_sitter_python::language()
+    }
+
+    // 2. Tree-sitter query that captures declarations, calls, and imports.
+    //    MUST be a &'static str (string literal).
+    //    Capture names determine entity classification by prefix (see table below).
+    fn query_source(&self) -> &'static str {
+        r#"
+        (class_definition name: (identifier) @class.name)
+        (function_definition name: (identifier) @function.name)
+        (call function: (identifier) @call.name)
+        (call function: (attribute attribute: (identifier) @call.name))
+        (import_statement (dotted_name) @import.name)
+        (import_from_statement (dotted_name) @import.name)
+        "#
+    }
+
+    // 3. LSP languageId string for textDocument/didOpen.
+    fn language_id(&self) -> &'static str {
+        "python"
+    }
+
+    // 4. Walk up the tree-sitter AST from a call/import node to find the
+    //    enclosing function or class. Returns "file_path:name" or None.
+    //    Node kinds are language-specific — check the grammar's node-types.json.
+    fn find_enclosing_function(
+        &self,
+        node: Node,
+        source_code: &[u8],
+        file_path: &Path,
+    ) -> Option<String> {
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            match parent.kind() {
+                // These node kind strings come from the tree-sitter grammar.
+                // For Python: "function_definition", "class_definition"
+                // For Rust: "function_item"
+                // For TypeScript: "function_declaration", "class_declaration", "method_definition"
+                "function_definition" | "class_definition" => {
+                    // "name" is the field name in the grammar for the
+                    // function/class identifier node.
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        let name = name_node.utf8_text(source_code).ok()?.to_string();
+                        return Some(format!("{}:{}", file_path.display(), name));
+                    }
+                }
+                _ => {}
+            }
+            current = parent.parent();
+        }
+        None
+    }
+
+    // 5. LSP server command. Return None if no LSP is available.
+    fn lsp_command(&self) -> Option<LspCommand> {
+        Some(LspCommand {
+            command: "pylsp".to_string(),
+            args: vec![],
+        })
+    }
+}
+```
 
 ### Tree-sitter Query Capture Conventions
 
@@ -156,4 +249,23 @@ Capture names are categorized by prefix in `parse_file()`:
 | `@call.name` | CALLS reference | `(call function: (identifier) @call.name)` |
 | `@import.name` | IMPORTS reference | `(import_statement ... @import.name)` |
 
-Use the [tree-sitter playground](https://tree-sitter.github.io/tree-sitter/playground) to find the correct node types for your language.
+**How to find node types for your language:**
+
+1. Use the [tree-sitter playground](https://tree-sitter.github.io/tree-sitter/playground) to parse a sample file and inspect the AST.
+2. Or check the grammar's `node-types.json` file in the crate source:
+   ```bash
+   # Find the node types for your tree-sitter grammar
+   find ~/.cargo/registry/src -path "*/tree-sitter-XXX*/node-types.json"
+   # List function/class node types and their fields
+   python3 -c "import json; [print(f'{t[\"type\"]}: fields={[f for f in t.get(\"fields\",{})]}') for t in json.load(open('PATH')) if 'function' in t.get('type','').lower() or 'class' in t.get('type','').lower()]"
+   ```
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| **Runtime panic: `QueryError ... kind: Structure`** | Tree-sitter query references a node type or field that doesn't exist in the grammar | Check `node-types.json` for the correct type/field names. E.g. Rust `trait_item` uses `type_identifier` for `name`, not `identifier`. |
+| **LSP warning: `Failed to start LSP server`** | LSP server not installed on the system | Install it (e.g. `pip install python-lsp-server`, `rustup component add rust-analyzer`). Declarations still work without LSP; only cross-file CALLS/IMPORTS edges are missing. |
+| **LSP starts but no CALLS edges created** | LSP server can't resolve definitions (file not part of a project, or needs indexing time) | For rust-analyzer: file must be part of a Cargo project. For pylsp: file should be on disk. Try reconciling the file a second time after a few seconds to give the LSP time to index. |
+| **CALLS edges attributed to file instead of function** | `find_enclosing_function()` returns `None` — wrong node kind string | Check the grammar's `node-types.json` for the correct function node kind (e.g. `function_item` for Rust, `function_definition` for Python). |
+| **`query_source()` won't compile** | Return type is `&'static str` — query must be a string literal | Use `r#"..."#` raw string literal, not `String::from()` or `format!()`. |
