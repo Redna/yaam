@@ -8,7 +8,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>YAAM Graph Visualizer</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
     <style>
@@ -20,193 +20,152 @@ const HTML_CONTENT = `<!DOCTYPE html>
             --text-muted: hsl(0, 0%, 70%);
             --accent: hsl(260, 100%, 70%);
         }
+        * { box-sizing: border-box; }
         body {
-            margin: 0;
-            padding: 0;
+            margin: 0; padding: 0;
             background-color: var(--bg-color);
             color: var(--text-main);
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             overflow: hidden;
-            display: flex;
-            height: 100vh;
-            width: 100vw;
+            height: 100vh; width: 100vw;
         }
         #cy {
-            width: 100%;
-            height: 100%;
-            position: absolute;
-            top: 0;
-            left: 0;
-            z-index: 1;
+            width: 100%; height: 100%;
+            position: absolute; top: 0; left: 0; z-index: 1;
         }
         .glass-panel {
-            position: absolute;
-            z-index: 10;
+            position: absolute; z-index: 10;
             background: var(--panel-bg);
             backdrop-filter: blur(12px);
             -webkit-backdrop-filter: blur(12px);
             border: 1px solid var(--panel-border);
             border-radius: 16px;
-            padding: 24px;
             box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
             transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
         }
         #sidebar {
-            top: 24px;
-            left: 24px;
-            width: 320px;
-            max-height: calc(100vh - 48px);
+            top: 12px; left: 12px;
+            width: 280px;
+            max-height: calc(100vh - 24px);
             overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
+            padding: 16px;
+            display: flex; flex-direction: column; gap: 12px;
         }
-        #sidebar:hover {
-            box-shadow: 0 12px 48px 0 rgba(0, 0, 0, 0.6);
-            border-color: hsla(220, 20%, 40%, 0.6);
-        }
-        h1 {
-            margin: 0;
-            font-size: 24px;
-            font-weight: 700;
+        #sidebar.collapsed { width: 48px; height: 48px; overflow: hidden; padding: 0; }
+        #sidebar.collapsed .sidebar-body { display: none; }
+        #sidebar.collapsed .collapse-sidebar { display: flex; }
+        .sidebar-header { display: flex; align-items: center; justify-content: space-between; }
+        h1 { margin: 0; font-size: 20px; font-weight: 700;
             background: linear-gradient(135deg, var(--text-main), var(--accent));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: -0.5px;
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px; }
+        p.subtitle { margin: 0; font-size: 12px; color: var(--text-muted); line-height: 1.4; }
+        .collapse-btn {
+            background: hsla(0,0%,100%,0.08); border: 1px solid hsla(0,0%,100%,0.15);
+            color: var(--text-muted); border-radius: 8px;
+            width: 28px; height: 28px; font-size: 16px; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: all 0.2s; flex-shrink: 0;
         }
-        p.subtitle {
-            margin: 0;
-            font-size: 14px;
-            color: var(--text-muted);
-            line-height: 1.5;
-        }
-        .legend {
-            margin-top: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-        .legend-title {
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: var(--text-muted);
-            font-weight: 600;
-            margin-bottom: 4px;
-        }
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            font-size: 14px;
-        }
-        .legend-color {
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            box-shadow: 0 0 12px currentColor;
-        }
-        .legend-edge {
-            width: 24px;
-            height: 3px;
-            border-radius: 2px;
-        }
+        .collapse-btn:hover { background: hsla(0,0%,100%,0.15); color: var(--text-main); }
+        .collapse-sidebar { display: none; width: 100%; height: 100%;
+            align-items: center; justify-content: center; cursor: pointer;
+            font-size: 20px; color: var(--text-muted); }
+        .section-header { display: flex; align-items: center; justify-content: space-between; }
+        .legend-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+            color: var(--text-muted); font-weight: 600; }
+        .section-content { overflow: hidden; transition: max-height 0.3s ease, opacity 0.3s ease; }
+        .section-content.collapsed { max-height: 0; opacity: 0; }
+        .section-content.expanded { max-height: 600px; opacity: 1; }
+        .filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; margin-top: 8px; }
+        .filter-item { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; user-select: none; }
+        .filter-item input { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; margin: 0; }
+        .legend-color { width: 12px; height: 12px; border-radius: 50%; box-shadow: 0 0 8px currentColor; flex-shrink: 0; }
+        .legend-edge { width: 18px; height: 2px; border-radius: 2px; flex-shrink: 0; }
+        .legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+        .divider { height: 1px; background: hsla(0,0%,100%,0.06); margin: 4px 0; }
         #loading {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            z-index: 20;
-            font-size: 18px;
-            font-weight: 600;
-            color: var(--accent);
-            display: flex;
-            align-items: center;
-            gap: 12px;
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            z-index: 20; font-size: 16px; font-weight: 600; color: var(--accent);
+            display: flex; align-items: center; gap: 12px;
             animation: pulse 2s infinite ease-in-out;
         }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-            50% { opacity: 0.6; transform: translate(-50%, -50%) scale(0.98); }
-        }
-        .spinner {
-            width: 24px;
-            height: 24px;
-            border: 3px solid rgba(255,255,255,0.1);
-            border-top-color: var(--accent);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+        .spinner { width: 22px; height: 22px;
+            border: 3px solid rgba(255,255,255,0.1); border-top-color: var(--accent);
+            border-radius: 50%; animation: spin 1s linear infinite; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
-        
         #node-details {
-            position: absolute;
-            top: 24px;
-            right: 24px;
-            width: 320px;
-            display: none;
-            flex-direction: column;
-            gap: 12px;
+            position: absolute; top: 12px; right: 12px;
+            width: 280px; padding: 16px; display: none;
+            flex-direction: column; gap: 10px;
         }
-        #node-details h2 { margin: 0; font-size: 18px; word-break: break-all; }
-        .tag {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            background: hsla(0,0%,100%,0.1);
-            color: var(--text-main);
-            border: 1px solid hsla(0,0%,100%,0.2);
-        }
-        pre.code-block {
-            background: hsla(0,0%,0%,0.3);
-            padding: 12px;
-            border-radius: 8px;
-            font-size: 12px;
-            overflow-x: auto;
-            color: var(--text-muted);
-            border: 1px solid hsla(0,0%,100%,0.05);
-            margin: 0;
-            white-space: pre-wrap;
+        #node-details h2 { margin: 0; font-size: 16px; word-break: break-all; }
+        .tag { display: inline-block; padding: 3px 8px; border-radius: 16px;
+            font-size: 11px; font-weight: 600; background: hsla(0,0%,100%,0.1);
+            color: var(--text-main); border: 1px solid hsla(0,0%,100%,0.2); }
+        pre.code-block { background: hsla(0,0%,0%,0.3); padding: 10px; border-radius: 8px;
+            font-size: 11px; overflow-x: auto; color: var(--text-muted);
+            border: 1px solid hsla(0,0%,100%,0.05); margin: 0; white-space: pre-wrap; }
+        /* Mobile */
+        @media (max-width: 640px) {
+            #sidebar { width: calc(100vw - 24px); max-width: 280px; }
+            #sidebar.collapsed { width: 44px; height: 44px; }
+            #node-details { width: calc(100vw - 24px); max-width: 280px; }
         }
     </style>
 </head>
 <body>
     <div id="cy"></div>
-    
+
     <div id="sidebar" class="glass-panel">
-        <h1>YAAM Graph View</h1>
-        <p class="subtitle">Real-time code topology & memory graph.</p>
-        
-        <div class="legend" style="margin-top: 24px;">
-            <div class="legend-title">Nodes</div>
-            <div class="legend-item"><div class="legend-color" style="color: hsl(280, 80%, 65%); background: hsl(280, 80%, 65%);"></div> Workspace</div>
-            <div class="legend-item"><div class="legend-color" style="color: hsl(210, 80%, 60%); background: hsl(210, 80%, 60%);"></div> File</div>
-            <div class="legend-item"><div class="legend-color" style="color: hsl(150, 80%, 55%); background: hsl(150, 80%, 55%);"></div> Function / Class</div>
-            <div class="legend-item"><div class="legend-color" style="color: hsl(40, 80%, 60%); background: hsl(40, 80%, 60%);"></div> Scratchpad</div>
-            
-            <div class="legend-title" style="margin-top: 16px;">Edges</div>
-            <div class="legend-item"><div class="legend-edge" style="background: hsl(0, 0%, 50%);"></div> DEFAULT</div>
-            <div class="legend-item"><div class="legend-edge" style="background: hsl(280, 80%, 65%);"></div> MAPPED_TO</div>
-            <div class="legend-item"><div class="legend-edge" style="background: hsl(0, 80%, 65%);"></div> CALLS</div>
-            <div class="legend-item"><div class="legend-edge" style="background: hsl(150, 80%, 55%);"></div> IMPORTS</div>
+        <div class="collapse-sidebar" onclick="toggleSidebar()">☰</div>
+        <div class="sidebar-body">
+            <div class="sidebar-header">
+                <h1>YAAM</h1>
+                <button class="collapse-btn" onclick="toggleSidebar()">−</button>
+            </div>
+            <p class="subtitle">Code topology & memory graph</p>
+
+            <div class="divider"></div>
+
+            <div class="section-header">
+                <span class="legend-title">Filters</span>
+                <button class="collapse-btn" onclick="toggleSection('filter-content', this)">−</button>
+            </div>
+            <div id="filter-content" class="section-content expanded">
+                <div class="filter-grid" id="node-filters"></div>
+                <div class="divider"></div>
+                <div class="filter-grid" id="edge-filters"></div>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="section-header">
+                <span class="legend-title">Legend</span>
+                <button class="collapse-btn" onclick="toggleSection('legend-content', this)">−</button>
+            </div>
+            <div id="legend-content" class="section-content expanded">
+                <div id="legend-nodes"></div>
+                <div class="divider"></div>
+                <div id="legend-edges"></div>
+            </div>
         </div>
     </div>
-    
+
     <div id="node-details" class="glass-panel">
-        <h2 id="nd-title">Node Name</h2>
+        <div class="sidebar-header">
+            <h2 id="nd-title">Node</h2>
+            <button class="collapse-btn" onclick="document.getElementById('node-details').style.display='none'">×</button>
+        </div>
         <div><span id="nd-type" class="tag">Type</span></div>
         <p id="nd-desc" class="subtitle"></p>
         <pre id="nd-meta" class="code-block"></pre>
     </div>
 
-    <div id="loading">
-        <div class="spinner"></div> Loading topology...
-    </div>
+    <div id="loading"><div class="spinner"></div> Loading topology...</div>
 
     <script>
-        // Setup Cytoscape colors and styles
         const COLORS = {
             Workspace: 'hsl(280, 80%, 65%)',
             File: 'hsl(210, 80%, 60%)',
@@ -215,7 +174,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
             Scratchpad: 'hsl(40, 80%, 60%)',
             Default: 'hsl(0, 0%, 60%)'
         };
-
         const EDGE_COLORS = {
             CALLS: 'hsl(0, 80%, 65%)',
             MAPPED_TO: 'hsl(280, 80%, 65%)',
@@ -223,163 +181,154 @@ const HTML_CONTENT = `<!DOCTYPE html>
             DECLARED_IN: 'hsla(0, 0%, 50%, 0.4)',
             HAS_SCRATCHPAD: 'hsl(40, 80%, 60%)'
         };
-
         const SIZES = {
-            Workspace: 80,
-            File: 50,
-            Function: 30,
-            Class: 40,
-            Scratchpad: 30,
-            Default: 30
+            Workspace: 70, File: 45, Function: 28, Class: 35, Scratchpad: 28, Default: 28
         };
+        const NODE_TYPES = ['Workspace','File','Function','Class','Scratchpad'];
+        const EDGE_TYPES = ['CALLS','MAPPED_TO','IMPORTS','DECLARED_IN','HAS_SCRATCHPAD'];
+
+        let cy;
+        const activeNodeFilters = new Set(NODE_TYPES);
+        const activeEdgeFilters = new Set(EDGE_TYPES);
+
+        function toggleSidebar() {
+            const sb = document.getElementById('sidebar');
+            sb.classList.toggle('collapsed');
+        }
+        function toggleSection(id, btn) {
+            const el = document.getElementById(id);
+            el.classList.toggle('collapsed');
+            el.classList.toggle('expanded');
+            btn.textContent = el.classList.contains('collapsed') ? '+' : '−';
+        }
+
+        function applyFilters() {
+            if (!cy) return;
+            cy.nodes().forEach(node => {
+                const type = node.data('type');
+                if (activeNodeFilters.has(type)) node.show();
+                else node.hide();
+            });
+            cy.edges().forEach(edge => {
+                const label = edge.data('label');
+                const srcVisible = activeNodeFilters.has(edge.source().data('type'));
+                const tgtVisible = activeNodeFilters.has(edge.target().data('type'));
+                if (activeEdgeFilters.has(label) && srcVisible && tgtVisible) edge.show();
+                else edge.hide();
+            });
+        }
+
+        // Build filter + legend UI
+        function buildControls() {
+            const nf = document.getElementById('node-filters');
+            const ef = document.getElementById('edge-filters');
+            const ln = document.getElementById('legend-nodes');
+            const le = document.getElementById('legend-edges');
+            NODE_TYPES.forEach(t => {
+                const c = COLORS[t] || COLORS.Default;
+                nf.innerHTML += '<label class="filter-item"><input type="checkbox" data-kind="node" data-type="'+t+'" checked><div class="legend-color" style="color:'+c+';background:'+c+'"></div>'+t+'</label>';
+                ln.innerHTML += '<div class="legend-item"><div class="legend-color" style="color:'+c+';background:'+c+'"></div>'+t+'</div>';
+            });
+            EDGE_TYPES.forEach(t => {
+                const c = EDGE_COLORS[t] || '#555';
+                const dash = t === 'DECLARED_IN' ? 'border-top: 2px dashed '+c+'; background: none;' : 'background: '+c+';';
+                ef.innerHTML += '<label class="filter-item"><input type="checkbox" data-kind="edge" data-type="'+t+'" checked><div class="legend-edge" style="'+dash+'"></div>'+t+'</label>';
+                le.innerHTML += '<div class="legend-item"><div class="legend-edge" style="'+dash+'"></div>'+t+'</div>';
+            });
+            document.querySelectorAll('input[data-kind]').forEach(cb => {
+                cb.addEventListener('change', () => {
+                    const kind = cb.dataset.kind;
+                    const type = cb.dataset.type;
+                    const set = kind === 'node' ? activeNodeFilters : activeEdgeFilters;
+                    if (cb.checked) set.add(type); else set.delete(type);
+                    applyFilters();
+                });
+            });
+        }
 
         async function initGraph() {
             try {
                 const res = await fetch('/api/graph');
                 const data = await res.json();
-                
                 document.getElementById('loading').style.display = 'none';
 
-                const cy = cytoscape({
+                cy = cytoscape({
                     container: document.getElementById('cy'),
                     elements: data,
                     style: [
-                        {
-                            selector: 'node',
-                            style: {
-                                'label': 'data(name)',
-                                'color': '#fff',
-                                'text-valign': 'bottom',
-                                'text-halign': 'center',
-                                'text-margin-y': 8,
-                                'font-size': '12px',
-                                'font-family': 'Inter, sans-serif',
-                                'text-outline-color': '#1a1d24',
-                                'text-outline-width': 3,
-                                'background-color': (ele) => COLORS[ele.data('type')] || COLORS.Default,
-                                'width': (ele) => SIZES[ele.data('type')] || SIZES.Default,
-                                'height': (ele) => SIZES[ele.data('type')] || SIZES.Default,
-                                'border-width': 2,
-                                'border-color': 'hsla(0,0%,100%,0.2)',
-                                'transition-property': 'background-color, transform, box-shadow',
-                                'transition-duration': '0.3s'
-                            }
-                        },
-                        {
-                            selector: 'node:selected',
-                            style: {
-                                'border-color': '#fff',
-                                'border-width': 4,
-                                'shadow-color': (ele) => COLORS[ele.data('type')] || COLORS.Default,
-                                'shadow-blur': 24,
-                                'shadow-opacity': 0.8
-                            }
-                        },
-                        {
-                            selector: 'edge',
-                            style: {
-                                'width': 2,
-                                'line-color': (ele) => EDGE_COLORS[ele.data('label')] || '#555',
-                                'target-arrow-color': (ele) => EDGE_COLORS[ele.data('label')] || '#555',
-                                'target-arrow-shape': 'triangle',
-                                'curve-style': 'bezier',
-                                'opacity': 0.6,
-                                'font-size': '10px',
-                                'color': '#aaa',
-                                'text-outline-color': '#1a1d24',
-                                'text-outline-width': 2,
-                                'transition-property': 'opacity, width, line-color',
-                                'transition-duration': '0.3s'
-                            }
-                        },
-                        {
-                            selector: 'edge[label = "DECLARED_IN"]',
-                            style: {
-                                'width': 1,
-                                'line-style': 'dashed',
-                                'target-arrow-shape': 'none'
-                            }
-                        },
-                        {
-                            selector: 'edge:selected',
-                            style: {
-                                'width': 4,
-                                'opacity': 1,
-                                'label': 'data(label)'
-                            }
-                        }
+                        { selector: 'node', style: {
+                            'label': 'data(name)', 'color': '#fff',
+                            'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 6,
+                            'font-size': '11px', 'font-family': 'Inter, sans-serif',
+                            'text-outline-color': '#1a1d24', 'text-outline-width': 3,
+                            'background-color': (ele) => COLORS[ele.data('type')] || COLORS.Default,
+                            'width': (ele) => SIZES[ele.data('type')] || SIZES.Default,
+                            'height': (ele) => SIZES[ele.data('type')] || SIZES.Default,
+                            'border-width': 2, 'border-color': 'hsla(0,0%,100%,0.2)'
+                        }},
+                        { selector: 'node:selected', style: {
+                            'border-color': '#fff', 'border-width': 4,
+                            'shadow-color': (ele) => COLORS[ele.data('type')] || COLORS.Default,
+                            'shadow-blur': 24, 'shadow-opacity': 0.8
+                        }},
+                        { selector: 'edge', style: {
+                            'width': 2,
+                            'line-color': (ele) => EDGE_COLORS[ele.data('label')] || '#555',
+                            'target-arrow-color': (ele) => EDGE_COLORS[ele.data('label')] || '#555',
+                            'target-arrow-shape': 'triangle', 'curve-style': 'bezier',
+                            'opacity': 0.6, 'font-size': '9px', 'color': '#aaa',
+                            'text-outline-color': '#1a1d24', 'text-outline-width': 2
+                        }},
+                        { selector: 'edge[label = "DECLARED_IN"]', style: {
+                            'width': 1, 'line-style': 'dashed', 'target-arrow-shape': 'none'
+                        }},
+                        { selector: 'edge:selected', style: {
+                            'width': 4, 'opacity': 1, 'label': 'data(label)'
+                        }}
                     ],
-                    layout: {
-                        name: 'cose',
-                        animate: true,
-                        randomize: true,
-                        nodeRepulsion: 400000,
-                        idealEdgeLength: 150,
-                        edgeElasticity: 100,
-                        gravity: 0.1,
-                        padding: 50
-                    }
+                    layout: { name: 'cose', animate: true, randomize: true,
+                        nodeRepulsion: 400000, idealEdgeLength: 150, edgeElasticity: 100,
+                        gravity: 0.1, padding: 50 }
                 });
 
-                // Micro-animations on hover
                 cy.on('mouseover', 'node', function(e){
                     const node = e.target;
                     node.style('shadow-color', COLORS[node.data('type')] || COLORS.Default);
-                    node.style('shadow-blur', 16);
-                    node.style('shadow-opacity', 0.8);
-                    
+                    node.style('shadow-blur', 16); node.style('shadow-opacity', 0.8);
                     document.body.style.cursor = 'pointer';
                 });
-                
                 cy.on('mouseout', 'node', function(e){
-                    const node = e.target;
-                    if(!node.selected()) {
-                        node.style('shadow-opacity', 0);
-                    }
+                    if(!e.target.selected()) e.target.style('shadow-opacity', 0);
                     document.body.style.cursor = 'default';
                 });
-
-                // Interactive sidebar update
                 cy.on('tap', 'node', function(e){
-                    const node = e.target;
-                    const d = node.data();
-                    
+                    const d = e.target.data();
                     const panel = document.getElementById('node-details');
                     panel.style.display = 'flex';
-                    
                     document.getElementById('nd-title').textContent = d.name || d.id;
                     document.getElementById('nd-type').textContent = d.type || 'Unknown';
                     document.getElementById('nd-type').style.background = COLORS[d.type] || COLORS.Default;
-                    
                     document.getElementById('nd-desc').textContent = d.content || d.description || '';
-                    
                     const metaEl = document.getElementById('nd-meta');
                     if (d.metadata && d.metadata !== 'null') {
-                        try {
-                            const parsed = JSON.parse(d.metadata);
-                            metaEl.textContent = JSON.stringify(parsed, null, 2);
-                            metaEl.style.display = 'block';
-                        } catch(err) {
-                            metaEl.textContent = String(d.metadata);
-                            metaEl.style.display = 'block';
-                        }
-                    } else {
-                        metaEl.style.display = 'none';
-                    }
+                        try { metaEl.textContent = JSON.stringify(JSON.parse(d.metadata), null, 2); metaEl.style.display = 'block'; }
+                        catch(err) { metaEl.textContent = String(d.metadata); metaEl.style.display = 'block'; }
+                    } else { metaEl.style.display = 'none'; }
+                });
+                cy.on('tap', function(e){
+                    if(e.target === cy) document.getElementById('node-details').style.display = 'none';
                 });
 
-                cy.on('tap', function(e){
-                    if(e.target === cy){
-                        document.getElementById('node-details').style.display = 'none';
-                    }
-                });
+                buildControls();
+                applyFilters();
+
+                // Auto-collapse sidebar on mobile
+                if (window.innerWidth <= 640) toggleSidebar();
 
             } catch (err) {
-                document.getElementById('loading').innerHTML = '<span style="color:hsl(0,80%,60%)">Failed to load graph data.</span>';
-                // Failed to load graph data
+                document.getElementById('loading').innerHTML = '<span style="color:hsl(0,80%,60%)">Failed to load graph.</span>';
             }
         }
-
         initGraph();
     </script>
 </body>
