@@ -124,9 +124,11 @@ export default function yaamExtension(pi: ExtensionAPI) {
         }, { deliverAs: "nextTurn" });
       }
 
-      // Phase 2: After reconciliation finishes, send an UPDATED context
-      // if anything changed (new files, modified functions, deletions, etc.).
-      // This runs in the background — non-blocking.
+      // Phase 2: After reconciliation finishes, send a COMPACT DELTA
+      // (not a full duplicate) if anything changed. The full context was
+      // already delivered in Phase 1 — sending it again would waste tokens
+      // because the agent sees both copies (Phase 1 in history + Phase 2
+      // as a fresh injection) on the next turn.
       (async () => {
         // scheduleFull() debounces 1s before processing starts.
         // Give it a moment to kick off, then poll until done.
@@ -137,9 +139,12 @@ export default function yaamExtension(pi: ExtensionAPI) {
         const before = memoryContext;
         await refreshMemoryContext();
         if (memoryContext && memoryContext !== before) {
+          // Send only the updated graph counts as a compact delta,
+          // NOT a full [YAAM Memory Context] duplicate.
+          const updateLine = memoryContext.split('\n')[0]; // e.g. "Graph: 181 Function, 39 Class, 18 File"
           pi.sendMessage({
             customType: "yaam_memory_context",
-            content: `[YAAM Memory Context]\n${memoryContext}`,
+            content: `[YAAM Context Update]\n${updateLine}\n(Reconciled graph reflects latest file changes.)`,
             display: true,
           }, { deliverAs: "nextTurn" });
         }

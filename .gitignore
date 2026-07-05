@@ -5,6 +5,7 @@ events.jsonl
 node_modules/
 .pi/
 .yaam/
+!.yaam/config.json
 
 # Rust build artifacts
 src-rust/target/

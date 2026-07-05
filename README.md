@@ -91,24 +91,76 @@ Running `/yaam viz` spins up a local Express backend serving an interactive UI a
 
 ## Setup
 
+### Quick Start (Recommended)
+
+```bash
+npm run setup
+```
+
+This runs the interactive bootstrap script which:
+1. Checks prerequisites (Rust, Node.js, npm)
+2. Installs npm dependencies
+3. Builds the Rust daemon (`cargo build --release`)
+4. Downloads the gte-small ONNX model weights (for semantic search)
+5. Installs LSP servers for all enabled languages
+6. Builds the TypeScript extension
+
+For non-interactive use (CI, Docker):
+```bash
+npm run setup:yes
+```
+
+Flags:
+```bash
+./scripts/setup.sh --no-lsp      # Skip LSP installation
+./scripts/setup.sh --no-build    # Skip Rust + TS build (LSP only)
+./scripts/setup.sh --yes         # Install everything without prompts
+```
+
+### Manual Setup
+
+If you prefer to do it step by step:
+
 1. **Install Model Weights**:
-   Execute `cargo run --manifest-path src-rust/Cargo.toml -- setup` to pull down the required HuggingFace `gte-small` model and tokenizer.
+   ```bash
+   cd src-rust && cargo run --release -- setup
+   ```
+   Downloads the required HuggingFace `gte-small` model and tokenizer for semantic search.
+
 2. **Build Release Binary**:
-   Ensure Rust is installed, then compile the engine:
    ```bash
    cd src-rust && cargo build --release
    ```
+
 3. **Compile TypeScript Extension**:
    ```bash
-   npm run build
+   npm install && npm run build
    ```
-4. **(Optional) Install Language Servers**:
+
+4. **Install Language Servers** (optional but recommended):
    LSP servers are started lazily on first use. Install only the ones you need:
    ```bash
-   npm install -g typescript-language-server typescript   # TypeScript
+   npm install -g typescript-language-server typescript   # TypeScript / JavaScript
    pip install python-lsp-server                            # Python
    rustup component add rust-analyzer                        # Rust
    ```
+   Without LSP servers, tree-sitter parsing still works (declarations are extracted),
+   but cross-file `CALLS` and `IMPORTS` edges won't be resolved.
+
+### Language Configuration
+
+Enabled languages are configured in [`.yaam/config.json`](.yaam/config.json).
+To disable a language you don't need, set `"enabled": false`:
+
+```json
+{
+  "languages": {
+    "python": { "enabled": false }
+  }
+}
+```
+
+The setup script reads this file and only installs LSP servers for enabled languages.
 
 Loaded automatically by pi from `pi.extensions` in `package.json`.
 

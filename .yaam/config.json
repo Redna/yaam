@@ -1,0 +1,31 @@
+{
+  "languages": {
+    "typescript": {
+      "enabled": true,
+      "extensions": ["ts", "tsx", "js", "jsx"],
+      "lsp": {
+        "command": "typescript-language-server",
+        "install": "npm install -g typescript-language-server typescript",
+        "check": "typescript-language-server --version"
+      }
+    },
+    "python": {
+      "enabled": true,
+      "extensions": ["py"],
+      "lsp": {
+        "command": "pylsp",
+        "install": "pip install python-lsp-server",
+        "check": "pylsp --version"
+      }
+    },
+    "rust": {
+      "enabled": true,
+      "extensions": ["rs"],
+      "lsp": {
+        "command": "rust-analyzer",
+        "install": "rustup component add rust-analyzer",
+        "check": "rust-analyzer --version"
+      }
+    }
+  }
+}

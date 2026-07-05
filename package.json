@@ -16,6 +16,8 @@
     ]
   },
   "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "setup:yes": "bash scripts/setup.sh --yes",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
