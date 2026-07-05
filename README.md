@@ -254,6 +254,146 @@ Returns:
 }
 ```
 
+## Hybrid Search
+
+The `yaam_search` tool and the `search` RPC method perform a **hybrid BM25 + semantic** search across all memory nodes. This finds code entities and notes by natural-language meaning — not just exact keyword matches.
+
+### How It Works
+
+Two search engines run in parallel and their scores are fused:
+
+| Engine | Method | Indexes |
+|--------|--------|--------|
+| **BM25** | Inverted index with Robertson-Sparck Jones IDF, k1=1.2, b=0.75 | Entity `name`, scratchpad `content`, workspace `description`, entity `metadata` |
+| **Semantic** | ONNX `gte-small` (38M params, local CPU) cosine similarity | Same fields, embedded into 384-dim dense vectors |
+
+**Score fusion**: BM25 scores are scaled by 0.1 and added to cosine similarity scores. Scratchpad notes receive a temporal decay weight (newer notes rank higher). Results are sorted by combined score descending.
+
+**Tokenizer**: The BM25 tokenizer is Unicode-aware and splits on:
+- CamelCase boundaries: `validateToken` → `validate`, `token`
+- PascalCase boundaries: `MyComponent` → `my`, `component`
+- Uppercase runs: `parseHTMLDocument` → `parse`, `html`, `document`
+- Snake_case: `get_user_by_id` → `get`, `user`, `by`, `id`
+- Kebab-case: `file-reconciler` → `file`, `reconciler`
+- All punctuation and whitespace
+
+### Search Request Schema
+
+```json
+{
+  "text": "file reconciliation logic",
+  "top_k": 10,
+  "workspace": "python-adapter-pattern",
+  "entity_types": ["Function", "Class"],
+  "include_paths": ["src/"],
+  "exclude_paths": ["node_modules/", ".venv/"]
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `text` | string | *(required)* | Natural language or keyword query |
+| `top_k` | number | 10 | Maximum results to return |
+| `workspace` | string | null | Scope results to entities mapped to a specific workspace (MAPPED_TO + HAS_SCRATCHPAD edges) |
+| `entity_types` | string[] | null | Filter by node type: `"Function"`, `"Class"`, `"File"`, `"Workspace"`, `"Scratchpad"` |
+| `include_paths` | string[] | null | Only return results whose ID starts with one of these prefixes |
+| `exclude_paths` | string[] | null | Exclude results whose ID starts with any of these prefixes |
+
+### Result Shape
+
+Each result includes:
+
+```json
+{
+  "id": "src/reconciler.rs::reconcile",
+  "name": "reconcile",
+  "score": 1.2345,
+  "content": "",
+  "metadata": "",
+  "type": "Function",
+  "path": "src/reconciler.rs",
+  "category": "module"
+}
+```
+
+The `category` field is derived from the entity's path:
+- `"module"` — project source code (not in node_modules, .venv, target, etc.)
+- `"library"` — dependency code (path contains node_modules, .venv, target, .cargo, etc.)
+- `"workspace"` — workspace or scratchpad nodes (no file path)
+
+### Examples
+
+#### Search for a concept by natural language
+
+```json
+{
+  "text": "file reconciliation logic"
+}
+```
+
+Finds functions like `reconcile`, `parse_file`, `scheduleFull` — even though none contain the word "reconciliation" — because the semantic embedding matches the concept.
+
+#### Search for functions only, excluding dependencies
+
+```json
+{
+  "text": "error handling",
+  "entity_types": ["Function"],
+  "exclude_paths": ["node_modules/", ".venv/", "target/"]
+}
+```
+
+#### Search within a workspace's scope
+
+```json
+{
+  "text": "LSP client management",
+  "workspace": "python-adapter-pattern"
+}
+```
+
+Only returns entities mapped to the `python-adapter-pattern` workspace via MAPPED_TO edges, plus its scratchpad notes.
+
+#### Search for classes in a specific directory
+
+```json
+{
+  "text": "graph node storage",
+  "entity_types": ["Class"],
+  "include_paths": ["src-rust/"]
+}
+```
+
+#### Limit results and scope to project code only
+
+```json
+{
+  "text": "workspace tracking",
+  "top_k": 5,
+  "exclude_paths": ["node_modules/", "target/", ".venv/", ".cargo/"]
+}
+```
+
+#### Keyword search (BM25 dominates)
+
+```json
+{
+  "text": "reconcile"
+}
+```
+
+Exact keyword match — `reconcile` will rank highly via BM25 even if semantically similar but differently-named functions exist.
+
+#### Combined keyword + semantic (typical case)
+
+```json
+{
+  "text": "LSP lazy startup"
+}
+```
+
+BM25 matches `lsp`, `lazy`, `startup` keywords. Semantic embedding matches the concept of deferred initialization. Both contribute to the fused score — so a function named `get_or_create_lsp` with a docstring about lazy initialization would score highly on both engines.
+
 ## Pi Extension Tools
 
 | Tool | Description |
