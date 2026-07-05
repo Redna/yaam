@@ -68,6 +68,192 @@ Running `/yaam viz` spins up a local Express backend serving an interactive UI a
 | `MAPPED_TO` | Workspace → Entity | `created_at`, `invalidated_at`, `is_stale` |
 | `HAS_SCRATCHPAD` | Workspace → Scratchpad | — |
 
+## JSON Query DSL
+
+The `yaam_graph_explore` tool and the `query` RPC method accept a declarative JSON DSL for read-only queries against the in-memory graph. No Cypher or SQL — just structured JSON.
+
+### Schema
+
+```json
+{
+  "match": {
+    "label": "Entity | Workspace | Scratchpad",
+    "entity_type": "File | Function | Class",
+    "id": "node_id",
+    "status": "active | inactive | closed | deleted",
+    "name_contains": "substring (case-insensitive)"
+  },
+  "where": {
+    "edge_to": { "id": "target_node_id", "relationship": "DECLARED_IN | CALLS | IMPORTS | INHERITS_FROM" },
+    "edge_from": { "id": "source_node_id", "relationship": "CALLS | IMPORTS | DECLARED_IN" }
+  },
+  "traverse": {
+    "relationship": "CALLS | IMPORTS | DECLARED_IN | HAS_SCRATCHPAD | MAPPED_TO",
+    "direction": "outbound | inbound | both",
+    "max_depth": 1
+  },
+  "aggregate": { "group_by": "type | label | status", "count": true },
+  "return": ["id", "name", "label", "content", "metadata"],
+  "limit": 20
+}
+```
+
+All fields are optional. An empty `{}` returns every node in the graph.
+
+### Evaluation Pipeline
+
+Queries are evaluated in this fixed order:
+
+1. **`match`** — Filter all nodes by label, type, id, status, or name substring. This is the entry point.
+2. **`where`** — Filter matched nodes by edge constraints (`edge_to`: must have an outbound edge to a specific node; `edge_from`: must have an inbound edge from a specific node).
+3. **`traverse`** — BFS graph walk from the filtered nodes along a relationship type, up to `max_depth` hops (capped at 5).
+4. **`aggregate`** — If present, group surviving nodes by a field and return counts. Skips steps 5–6.
+5. **`limit`** — Truncate to the first N results.
+6. **`return`** — Project each node to only the requested fields. If omitted, returns all fields.
+
+### Node Shape
+
+Every node in the graph has this shape when returned without `return` projection:
+
+```json
+{
+  "id": "src/index.ts::yaamExtension",
+  "name": "yaamExtension",
+  "label": {
+    "label": "Entity",
+    "type": "Function",
+    "status": "active",
+    "last_modified": 1783231322
+  },
+  "content": "",
+  "metadata": ""
+}
+```
+
+The `label` object's inner fields vary by node type:
+
+| Node Type | Label Fields |
+|-----------|-------------|
+| `Entity` | `type` (File \| Function \| Class), `status`, `last_modified` |
+| `Workspace` | `description`, `status`, `closed_at` |
+| `Scratchpad` | `created_at` |
+
+### Edge Types
+
+| Relationship | From → To | Description |
+|-------------|-----------|-------------|
+| `DECLARED_IN` | Function/Class → File | Entity is declared in this file |
+| `CALLS` | Function → Function | Caller invokes callee (resolved via LSP) |
+| `IMPORTS` | File → File/Entity | File imports a symbol (resolved via LSP) |
+| `INHERITS_FROM` | Class → Class | OOP inheritance |
+| `HAS_SCRATCHPAD` | Workspace → Scratchpad | Workspace owns a note |
+| `MAPPED_TO` | Workspace → Entity | Workspace tracks an entity |
+
+### Examples
+
+#### Find all functions in a specific file
+
+```json
+{
+  "match": { "label": "Entity", "entity_type": "Function" },
+  "where": { "edge_to": { "id": "src/index.ts", "relationship": "DECLARED_IN" } }
+}
+```
+
+#### Find all classes across the codebase
+
+```json
+{
+  "match": { "label": "Entity", "entity_type": "Class" }
+}
+```
+
+#### Trace who calls a function (reverse call graph, 2 hops)
+
+```json
+{
+  "match": { "id": "src/index.ts::yaamExtension" },
+  "traverse": { "relationship": "CALLS", "direction": "inbound", "max_depth": 2 }
+}
+```
+
+#### Multi-hop impact analysis (outbound call chain)
+
+```json
+{
+  "match": { "id": "src/reconciler.rs::reconcile" },
+  "traverse": { "relationship": "CALLS", "direction": "outbound", "max_depth": 3 }
+}
+```
+
+#### Count entities by type (graph summary)
+
+```json
+{
+  "match": { "label": "Entity" },
+  "aggregate": { "group_by": "type", "count": true }
+}
+```
+
+Returns:
+```json
+[
+  { "type": "Function", "count": 181 },
+  { "type": "File", "count": 18 },
+  { "type": "Class", "count": 39 }
+]
+```
+
+#### Get active workspace + its scratchpad notes
+
+```json
+{
+  "match": { "label": "Workspace", "status": "active" },
+  "traverse": { "relationship": "HAS_SCRATCHPAD", "direction": "outbound", "max_depth": 1 },
+  "limit": 5
+}
+```
+
+#### Find functions whose name contains "parse"
+
+```json
+{
+  "match": { "label": "Entity", "entity_type": "Function", "name_contains": "parse" },
+  "return": ["id", "name"]
+}
+```
+
+#### Find what a file imports
+
+```json
+{
+  "match": { "id": "src/index.ts" },
+  "traverse": { "relationship": "IMPORTS", "direction": "outbound", "max_depth": 1 },
+  "return": ["id", "name"]
+}
+```
+
+#### Find all entities mapped to a workspace
+
+```json
+{
+  "match": { "label": "Workspace", "id": "fix-double-context" },
+  "traverse": { "relationship": "MAPPED_TO", "direction": "outbound", "max_depth": 1 },
+  "return": ["id", "name"]
+}
+```
+
+#### Combined: functions in a file that call other functions (2-hop call chain)
+
+```json
+{
+  "match": { "label": "Entity", "entity_type": "Function" },
+  "where": { "edge_to": { "id": "src/rpc.rs", "relationship": "DECLARED_IN" } },
+  "traverse": { "relationship": "CALLS", "direction": "outbound", "max_depth": 2 },
+  "return": ["id", "name"]
+}
+```
+
 ## Pi Extension Tools
 
 | Tool | Description |
