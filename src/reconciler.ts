@@ -22,7 +22,7 @@ export class Reconciler {
     
     // File extensions supported by registered language adapters.
     // Update this when adding a new language (see scripts/add-language.sh).
-    const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs'];
+    const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
     // Directories to skip during file walking.
     const SKIP_DIRS = ['node_modules', 'dist', '.git', 'target', '.chunks', '.yaam'];
     

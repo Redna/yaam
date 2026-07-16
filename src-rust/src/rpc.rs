@@ -72,6 +72,46 @@ impl AppState {
     }
 }
 
+/// Extract the line number from a node's metadata JSON.
+///
+/// Code entities store `{"line": N}` in metadata. Sections store
+/// `{"level": N, "start_line": N, "end_line": N}`. Returns `None`
+/// if metadata is empty or doesn't contain a line field.
+fn extract_line(node: &MemoryNode) -> Option<usize> {
+    if node.metadata.is_empty() {
+        return None;
+    }
+    let meta = serde_json::from_str::<serde_json::Value>(&node.metadata).ok()?;
+    // Code entities: {"line": N}
+    if let Some(line) = meta.get("line").and_then(|v| v.as_u64()) {
+        return Some(line as usize);
+    }
+    // Sections: {"start_line": N}
+    if let Some(line) = meta.get("start_line").and_then(|v| v.as_u64()) {
+        return Some(line as usize);
+    }
+    None
+}
+
+/// Truncate content to approximately `max_words` words, appending "..." if truncated.
+fn preview_content(content: &str, max_words: usize) -> String {
+    let words: Vec<&str> = content.split_whitespace().collect();
+    if words.len() <= max_words {
+        return content.to_string();
+    }
+    let truncated = words[..max_words].join(" ");
+    format!("{}...", truncated)
+}
+
+/// Apply the retrieval mode to a node's content, returning the (possibly truncated or empty) content string.
+fn apply_retrieval_mode(content: &str, mode: RetrievalMode) -> String {
+    match mode {
+        RetrievalMode::Name => String::new(),
+        RetrievalMode::Preview => preview_content(content, 100),
+        RetrievalMode::Full => content.to_string(),
+    }
+}
+
 /// Build the text to index for BM25 from a node's relevant fields.
 fn build_bm25_text(node: &MemoryNode) -> String {
     let mut parts = Vec::new();
@@ -82,12 +122,30 @@ fn build_bm25_text(node: &MemoryNode) -> String {
     }
 
     match &node.label {
-        NodeLabel::Entity { .. } => {
-            // Index docComment from metadata if present
-            if !node.metadata.is_empty() {
-                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&node.metadata) {
-                    if let Some(doc) = meta.get("docComment").and_then(|v| v.as_str()) {
-                        parts.push(doc.to_string());
+        NodeLabel::Entity { entity_type, .. } => {
+            if entity_type == "Section" {
+                // Index heading + full section body for markdown sections
+                parts.push(node.content.clone());
+            } else if entity_type == "Function" || entity_type == "Class" {
+                // Index full source text for code entities
+                if !node.content.is_empty() {
+                    parts.push(node.content.clone());
+                }
+                // Also index docComment from metadata if present (forward-compatible)
+                if !node.metadata.is_empty() {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&node.metadata) {
+                        if let Some(doc) = meta.get("docComment").and_then(|v| v.as_str()) {
+                            parts.push(doc.to_string());
+                        }
+                    }
+                }
+            } else {
+                // File entities and other types: index docComment from metadata if present
+                if !node.metadata.is_empty() {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&node.metadata) {
+                        if let Some(doc) = meta.get("docComment").and_then(|v| v.as_str()) {
+                            parts.push(doc.to_string());
+                        }
                     }
                 }
             }
@@ -123,20 +181,41 @@ fn build_embedding_text_from_props(
             props.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string()
         }
         "Entity" => {
-            // For code entities, embed the name plus any docComment from metadata.
-            let metadata = props.get("metadata").and_then(|v| v.as_str()).unwrap_or("");
-            let doc = if !metadata.is_empty() {
-                serde_json::from_str::<serde_json::Value>(metadata)
-                    .ok()
-                    .and_then(|m| m.get("docComment").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_default()
+            let entity_type = props.get("entity_type").and_then(|v| v.as_str()).unwrap_or("");
+            if entity_type == "Section" {
+                // For markdown sections, embed heading + full section body.
+                // Long text will be chunked by embed_chunked.
+                let content = props.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if content.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{} {}", name, content)
+                }
+            } else if entity_type == "Function" || entity_type == "Class" {
+                // For code entities, embed name + full source text.
+                // Long source text will be chunked by embed_chunked.
+                let content = props.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if content.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{} {}", name, content)
+                }
             } else {
-                String::new()
-            };
-            if doc.is_empty() {
-                name.to_string()
-            } else {
-                format!("{} {}", name, doc)
+                // For File entities and other types, embed the name plus any docComment from metadata.
+                let metadata = props.get("metadata").and_then(|v| v.as_str()).unwrap_or("");
+                let doc = if !metadata.is_empty() {
+                    serde_json::from_str::<serde_json::Value>(metadata)
+                        .ok()
+                        .and_then(|m| m.get("docComment").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                if doc.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{} {}", name, doc)
+                }
             }
         }
         _ => name.to_string(),
@@ -214,9 +293,12 @@ fn handle_upsert_node(
     if let Some(ref embedder) = state.embedder {
         let text_to_embed = build_embedding_text_from_props(&payload.label, &payload.properties);
         if !text_to_embed.is_empty() {
-            match embedder.embed(&text_to_embed) {
-                Ok(vec) => {
-                    payload.properties.insert("embedding".to_string(), serde_json::json!(vec));
+            // Use embed_chunked for all entity types — it falls back to a single
+            // embedding for text under max_tokens, so there's no overhead for
+            // short functions or nodes with just a name.
+            match embedder.embed_chunked(&text_to_embed, 400, 50) {
+                Ok(vectors) => {
+                    payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
                 }
                 Err(e) => {
                     eprintln!("Failed to compute embedding: {}", e);
@@ -419,8 +501,13 @@ fn handle_search(
                 .as_secs();
 
             for node in engine.all_nodes() {
-                if let Some(doc_embedding) = node.embedding.as_deref() {
-                    let mut sim = crate::embedding::cosine_similarity(&query_embedding, doc_embedding);
+                if let Some(ref embeddings) = node.embedding {
+                    // Take the best (max) similarity across all chunk embeddings
+                    let best_sim = embeddings.iter()
+                        .map(|emb| crate::embedding::cosine_similarity(&query_embedding, emb))
+                        .fold(0.0f32, f32::max);
+                    
+                    let mut sim = best_sim;
                     
                     // Apply temporal decay for scratchpads
                     if let NodeLabel::Scratchpad { created_at } = node.label {
@@ -497,6 +584,9 @@ fn handle_search(
 
     let limited: Vec<(String, f32)> = filtered.into_iter().take(top_k).collect();
 
+    // Resolve retrieval mode (default: Full)
+    let retrieval = request.retrieval.unwrap_or_default();
+
     // Build result payloads
     let results: Vec<serde_json::Value> = limited
         .iter()
@@ -504,8 +594,6 @@ fn handle_search(
             engine.get_node(id).map(|node| {
                 let (entity_type_str, file_path) = match &node.label {
                     NodeLabel::Entity { entity_type, .. } => {
-                        // Derive a file path from the entity ID for Entity nodes.
-                        // Entity IDs are either "file_path" (File) or "file_path:name" (Function/Class).
                         let path = if id.contains(':') {
                             id.splitn(2, ':').next().unwrap_or("")
                         } else {
@@ -517,18 +605,19 @@ fn handle_search(
                     NodeLabel::Scratchpad { .. } => ("Scratchpad".to_string(), None),
                 };
 
-                // Derive category from the file path.
                 let category = file_path
                     .as_deref()
                     .map(derive_category)
                     .unwrap_or("workspace".to_string());
 
+                let line = extract_line(node);
+
                 serde_json::json!({
                     "id": node.id,
                     "name": node.name,
                     "score": score,
-                    "content": node.content,
-                    "metadata": node.metadata,
+                    "line": line,
+                    "content": apply_retrieval_mode(&node.content, retrieval),
                     "type": entity_type_str,
                     "path": file_path,
                     "category": category,
@@ -639,9 +728,11 @@ fn handle_reconcile(
                 if payload.label == "Entity" {
                     let text = build_embedding_text_from_props(&payload.label, &payload.properties);
                     if !text.is_empty() {
-                        match embedder.embed(&text) {
-                            Ok(vec) => {
-                                payload.properties.insert("embedding".to_string(), serde_json::json!(vec));
+                        // Use embed_chunked for all entity types — it falls back
+                        // to a single embedding for text under max_tokens.
+                        match embedder.embed_chunked(&text, 400, 50) {
+                            Ok(vectors) => {
+                                payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
                             }
                             Err(e) => {
                                 eprintln!("Failed to compute embedding for {}: {}", payload.id, e);
@@ -654,6 +745,33 @@ fn handle_reconcile(
     }
 
     let mut generated_ids = Vec::new();
+
+    // ── Phase 1: Snapshot affected Sections BEFORE applying events ──
+    // When code entities are deleted (file re-reconciled), their inbound REFERENCES
+    // edges from Section nodes are removed. We snapshot these so we can re-link
+    // the Sections to the newly created entities after all events are applied.
+    let mut affected_sections: Vec<(String, String)> = Vec::new(); // (section_id, matched_text)
+    {
+        let engine = state.engine.read().unwrap();
+        for event in &events {
+            if let EventPayload::DeleteNode(ref payload) = event.payload {
+                let inbound = engine.get_reverse_edges(&payload.id);
+                for edge in inbound {
+                    if edge.relationship == "REFERENCES" {
+                        if let Some(matched_text) = edge.properties
+                            .get("matched_text")
+                            .and_then(|v| v.as_str())
+                        {
+                            affected_sections.push((
+                                edge.from_id.clone(),
+                                matched_text.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Apply the generated events to storage and memory
     {
@@ -686,6 +804,90 @@ fn handle_reconcile(
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    // ── Phase 2: Re-link affected Sections to new entities ──
+    // After all events (deletions + creations) are applied, re-resolve the
+    // snapshotted references against the new graph state. This recreates
+    // REFERENCES edges from Sections to code entities that were recreated.
+    if !affected_sections.is_empty() {
+        let engine = state.engine.read().unwrap();
+        let mut relink_events = Vec::new();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Build name → node_ids index for current Function and Class entities
+        let mut name_index: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for node in engine.all_nodes() {
+            if let NodeLabel::Entity { entity_type, .. } = &node.label {
+                if entity_type == "Function" || entity_type == "Class" {
+                    name_index
+                        .entry(node.name.clone())
+                        .or_default()
+                        .push(node.id.clone());
+                }
+            }
+        }
+
+        for (section_id, matched_text) in &affected_sections {
+            // Skip if the Section itself was deleted (e.g., markdown file changed too)
+            if engine.get_node(section_id).is_none() {
+                continue;
+            }
+
+            // Find entities with this name in the current graph
+            if let Some(candidates) = name_index.get(matched_text) {
+                for target_id in candidates {
+                    // Skip if edge already exists (avoid duplicates)
+                    let existing = engine.get_forward_edges(section_id);
+                    if existing.iter().any(|e| e.to_id == *target_id && e.relationship == "REFERENCES") {
+                        continue;
+                    }
+
+                    let mut props = std::collections::HashMap::new();
+                    props.insert(
+                        "match_type".to_string(),
+                        serde_json::json!("inline_code"),
+                    );
+                    props.insert(
+                        "matched_text".to_string(),
+                        serde_json::json!(matched_text),
+                    );
+                    props.insert(
+                        "relinked".to_string(),
+                        serde_json::json!(true),
+                    );
+
+                    relink_events.push(Event {
+                        version: EVENT_VERSION,
+                        timestamp,
+                        event_type: EventType::LinkNodes,
+                        payload: EventPayload::LinkNodes(LinkNodesPayload {
+                            from_id: section_id.clone(),
+                            to_id: target_id.clone(),
+                            relationship: "REFERENCES".to_string(),
+                            properties: props,
+                        }),
+                    });
+                }
+            }
+        }
+        drop(engine);
+
+        // Apply relink events
+        if !relink_events.is_empty() {
+            let store = state.store.write().unwrap();
+            let mut engine = state.engine.write().unwrap();
+            for event in &relink_events {
+                if let Err(e) = store.append(event) {
+                    eprintln!("Failed to append relink event: {}", e);
+                    continue;
+                }
+                engine.apply_event(event);
             }
         }
     }
@@ -748,4 +950,263 @@ fn handle_list_languages(state: &AppState) -> Result<serde_json::Value, RpcRespo
         .collect();
 
     Ok(serde_json::json!({"languages": result}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{MemoryNode, NodeLabel};
+
+    // ── 7.2 BM25 Indexing ──────────────────────────────────────────────
+
+    fn make_function_node(name: &str, content: &str) -> MemoryNode {
+        MemoryNode {
+            id: format!("test.rs:{}", name),
+            label: NodeLabel::Entity {
+                entity_type: "Function".to_string(),
+                status: "active".to_string(),
+                last_modified: 0,
+            },
+            name: name.to_string(),
+            content: content.to_string(),
+            metadata: String::new(),
+            embedding: None,
+        }
+    }
+
+    fn make_class_node(name: &str, content: &str) -> MemoryNode {
+        MemoryNode {
+            id: format!("test.rs:{}", name),
+            label: NodeLabel::Entity {
+                entity_type: "Class".to_string(),
+                status: "active".to_string(),
+                last_modified: 0,
+            },
+            name: name.to_string(),
+            content: content.to_string(),
+            metadata: String::new(),
+            embedding: None,
+        }
+    }
+
+    fn make_file_node(name: &str) -> MemoryNode {
+        MemoryNode {
+            id: name.to_string(),
+            label: NodeLabel::Entity {
+                entity_type: "File".to_string(),
+                status: "active".to_string(),
+                last_modified: 0,
+            },
+            name: name.to_string(),
+            content: String::new(),
+            metadata: String::new(),
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn test_bm25_text_function_with_content() {
+        let node = make_function_node(
+            "embed_chunked",
+            "pub fn embed_chunked(&self, text: &str, max_tokens: usize) -> Result<Vec<Vec<f32>>",
+        );
+        let text = build_bm25_text(&node);
+        assert!(text.contains("embed_chunked"));
+        assert!(text.contains("max_tokens"));
+        assert!(text.contains("text"));
+    }
+
+    #[test]
+    fn test_bm25_text_function_empty_content() {
+        let node = make_function_node("simple", "");
+        let text = build_bm25_text(&node);
+        // Should fall back to just the name
+        assert_eq!(text, "simple");
+    }
+
+    #[test]
+    fn test_bm25_text_class_with_content() {
+        let node = make_class_node(
+            "EmbeddingModel",
+            "pub struct EmbeddingModel { session: Mutex<Session> }",
+        );
+        let text = build_bm25_text(&node);
+        assert!(text.contains("EmbeddingModel"));
+        assert!(text.contains("session"));
+        assert!(text.contains("Mutex"));
+    }
+
+    #[test]
+    fn test_bm25_text_file_entity_no_content() {
+        let node = make_file_node("test.rs");
+        let text = build_bm25_text(&node);
+        // File entities don't have content; should return just name
+        assert_eq!(text, "test.rs");
+    }
+
+    // ── 7.3 Embedding Text ─────────────────────────────────────────────
+
+    fn make_props(name: &str, entity_type: &str, content: &str) -> HashMap<String, serde_json::Value> {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+        props.insert("entity_type".to_string(), serde_json::Value::String(entity_type.to_string()));
+        props.insert("content".to_string(), serde_json::Value::String(content.to_string()));
+        props
+    }
+
+    #[test]
+    fn test_embedding_text_function_with_content() {
+        let props = make_props("embed_chunked", "Function", "pub fn embed_chunked(&self, text: &str)");
+        let text = build_embedding_text_from_props("Entity", &props);
+        assert!(text.starts_with("embed_chunked"));
+        assert!(text.contains("pub fn embed_chunked"));
+        assert!(text.contains("text"));
+    }
+
+    #[test]
+    fn test_embedding_text_function_empty_content() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), serde_json::Value::String("simple".to_string()));
+        props.insert("entity_type".to_string(), serde_json::Value::String("Function".to_string()));
+        props.insert("content".to_string(), serde_json::Value::String(String::new()));
+        let text = build_embedding_text_from_props("Entity", &props);
+        // Should fall back to just the name
+        assert_eq!(text, "simple");
+    }
+
+    #[test]
+    fn test_embedding_text_class_with_content() {
+        let props = make_props("MyClass", "Class", "class MyClass { method() { } }");
+        let text = build_embedding_text_from_props("Entity", &props);
+        assert!(text.starts_with("MyClass"));
+        assert!(text.contains("method"));
+    }
+
+    #[test]
+    fn test_embedding_text_section_with_content() {
+        let props = make_props("Architecture", "Section", "The system uses a reconciler pattern.");
+        let text = build_embedding_text_from_props("Entity", &props);
+        assert!(text.starts_with("Architecture"));
+        assert!(text.contains("reconciler"));
+    }
+
+    #[test]
+    fn test_embedding_text_file_entity_no_content() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), serde_json::Value::String("test.rs".to_string()));
+        props.insert("entity_type".to_string(), serde_json::Value::String("File".to_string()));
+        // No content property
+        let text = build_embedding_text_from_props("Entity", &props);
+        // File entities with no content and no metadata should return just name
+        assert_eq!(text, "test.rs");
+    }
+
+    #[test]
+    fn test_embedding_text_file_entity_with_doccomment() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), serde_json::Value::String("test.rs".to_string()));
+        props.insert("entity_type".to_string(), serde_json::Value::String("File".to_string()));
+        let metadata = serde_json::json!({"docComment": "This file handles authentication."}).to_string();
+        props.insert("metadata".to_string(), serde_json::Value::String(metadata));
+        let text = build_embedding_text_from_props("Entity", &props);
+        assert!(text.contains("test.rs"));
+        assert!(text.contains("authentication"));
+    }
+
+    #[test]
+    fn test_embedding_text_workspace() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), serde_json::Value::String("auth-fix".to_string()));
+        props.insert("description".to_string(), serde_json::Value::String("Fix the authentication flow".to_string()));
+        let text = build_embedding_text_from_props("Workspace", &props);
+        assert!(text.contains("auth-fix"));
+        assert!(text.contains("authentication"));
+    }
+
+    #[test]
+    fn test_embedding_text_scratchpad() {
+        let mut props = HashMap::new();
+        props.insert("content".to_string(), serde_json::Value::String("Decided to use JWT tokens".to_string()));
+        let text = build_embedding_text_from_props("Scratchpad", &props);
+        assert_eq!(text, "Decided to use JWT tokens");
+    }
+
+    // -- Retrieval Mode Tests ---------------------------------------------
+
+    #[test]
+    fn test_preview_content_short_text() {
+        let result = preview_content("hello world", 100);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_preview_content_truncates() {
+        let long_text = "word ".repeat(150);
+        let result = preview_content(long_text.trim(), 100);
+        assert!(result.ends_with("..."));
+        let word_count = result.split_whitespace().count();
+        assert!(word_count <= 101);
+    }
+
+    #[test]
+    fn test_preview_content_exact_boundary() {
+        let text = "a ".repeat(100).trim().to_string();
+        let result = preview_content(&text, 100);
+        assert!(!result.ends_with("..."));
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_apply_retrieval_mode_name() {
+        let result = apply_retrieval_mode("some code content here", RetrievalMode::Name);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_apply_retrieval_mode_preview() {
+        let long_text = "word ".repeat(150);
+        let result = apply_retrieval_mode(long_text.trim(), RetrievalMode::Preview);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_apply_retrieval_mode_full() {
+        let content = "full content here";
+        let result = apply_retrieval_mode(content, RetrievalMode::Full);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_extract_line_code_entity() {
+        let node = make_function_node("test", "content");
+        let mut node = node;
+        node.metadata = serde_json::json!({"line": 42}).to_string();
+        let line = extract_line(&node);
+        assert_eq!(line, Some(42));
+    }
+
+    #[test]
+    fn test_extract_line_section() {
+        let node = MemoryNode {
+            id: "test.md:Header".to_string(),
+            label: NodeLabel::Entity {
+                entity_type: "Section".to_string(),
+                status: "active".to_string(),
+                last_modified: 0,
+            },
+            name: "Header".to_string(),
+            content: "body text".to_string(),
+            metadata: serde_json::json!({"level": 2, "start_line": 10, "end_line": 20}).to_string(),
+            embedding: None,
+        };
+        let line = extract_line(&node);
+        assert_eq!(line, Some(10));
+    }
+
+    #[test]
+    fn test_extract_line_empty_metadata() {
+        let node = make_function_node("test", "content");
+        let line = extract_line(&node);
+        assert_eq!(line, None);
+    }
 }

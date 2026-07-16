@@ -13,10 +13,12 @@ src-rust/
 ├── src/graph.rs             In-memory graph engine (Arc<RwLock>)
 ├── src/storage.rs           Append-only JSONL event persistence (`fs2` file locks)
 ├── src/reconciler.rs        Generic tree-sitter AST parser (adapter-driven)
-├── src/language_adapter.rs  Language adapter trait + TypeScript/Python adapters
+├── src/language_adapter.rs  Language adapter trait + TypeScript/Python/Rust adapters
+├── src/document_adapter.rs  Markdown document parser (Section entities, REFERENCES edges)
 ├── src/lsp_adapter.rs       Stdio LSP client (shared by all languages)
-├── src/embedding.rs         ONNX Inference (gte-small)
-└── src/search.rs            BM25 Inverted Index
+├── src/embedding.rs         ONNX Inference (gte-small, chunked embeddings)
+├── src/search.rs            BM25 Inverted Index
+└── src/query_dsl.rs         JSON Query DSL evaluator
 
 scripts/
 └── add-language.sh          Scaffolding utility for adding new languages
@@ -58,13 +60,13 @@ Running `/yaam viz` spins up a local Express backend serving an interactive UI a
 
 | Node Table | Key | Fields |
 |------------|-----|--------|
-| `Entity` | `id` | `type`, `status`, `last_modified`, `metadata` |
+| `Entity` | `id` | `type` (File \| Function \| Class \| Section), `status`, `last_modified`, `metadata` |
 | `Workspace` | `workspace_name` | `description`, `status`, `closed_at` |
 | `Scratchpad` | `id` | `content`, `created_at` |
 
 | Rel Table | From → To | Properties |
 |-----------|-----------|------------|
-| `LINKED_TO` | Entity → Entity | `relationship_type` (CALLS, DECLARED_IN, IMPORTS, INHERITS_FROM) |
+| `LINKED_TO` | Entity → Entity | `relationship_type` (CALLS, DECLARED_IN, IMPORTS, INHERITS_FROM, REFERENCES) |
 | `MAPPED_TO` | Workspace → Entity | `created_at`, `invalidated_at`, `is_stale` |
 | `HAS_SCRATCHPAD` | Workspace → Scratchpad | — |
 
@@ -78,22 +80,23 @@ The `yaam_graph_explore` tool and the `query` RPC method accept a declarative JS
 {
   "match": {
     "label": "Entity | Workspace | Scratchpad",
-    "entity_type": "File | Function | Class",
+    "entity_type": "File | Function | Class | Section",
     "id": "node_id",
     "status": "active | inactive | closed | deleted",
     "name_contains": "substring (case-insensitive)"
   },
   "where": {
-    "edge_to": { "id": "target_node_id", "relationship": "DECLARED_IN | CALLS | IMPORTS | INHERITS_FROM" },
-    "edge_from": { "id": "source_node_id", "relationship": "CALLS | IMPORTS | DECLARED_IN" }
+    "edge_to": { "id": "target_node_id", "relationship": "DECLARED_IN | CALLS | IMPORTS | REFERENCES" },
+    "edge_from": { "id": "source_node_id", "relationship": "CALLS | IMPORTS | DECLARED_IN | REFERENCES" }
   },
   "traverse": {
-    "relationship": "CALLS | IMPORTS | DECLARED_IN | HAS_SCRATCHPAD | MAPPED_TO",
+    "relationship": "CALLS | IMPORTS | DECLARED_IN | REFERENCES | HAS_SCRATCHPAD | MAPPED_TO",
     "direction": "outbound | inbound | both",
     "max_depth": 1
   },
   "aggregate": { "group_by": "type | label | status", "count": true },
-  "return": ["id", "name", "label", "content", "metadata"],
+  "return": ["id", "name", "label", "content", "metadata", "line"],
+  "retrieval": "name | preview | full",
   "limit": 20
 }
 ```
@@ -111,6 +114,18 @@ Queries are evaluated in this fixed order:
 5. **`limit`** — Truncate to the first N results.
 6. **`return`** — Project each node to only the requested fields. If omitted, returns all fields.
 
+### Retrieval Mode
+
+The `retrieval` field controls how much `content` is returned per result:
+
+| Mode | Content | Use case |
+|------|---------|----------|
+| `"name"` | Empty string | Lightweight listing — just identify what matched |
+| `"preview"` | First ~100 words, truncated with `...` | Scan results without loading full implementations |
+| `"full"` | Complete source text (default) | Read the implementation directly from search results |
+
+When `return` fields are specified, `retrieval` only affects the `content` field if it is included in the projection.
+
 ### Node Shape
 
 Every node in the graph has this shape when returned without `return` projection:
@@ -119,22 +134,25 @@ Every node in the graph has this shape when returned without `return` projection
 {
   "id": "src/index.ts::yaamExtension",
   "name": "yaamExtension",
+  "line": 42,
   "label": {
     "label": "Entity",
     "type": "Function",
     "status": "active",
     "last_modified": 1783231322
   },
-  "content": "",
-  "metadata": ""
+  "content": "const yaamExtension = () => { ... }",
+  "metadata": "{\"line\": 42}"
 }
 ```
+
+The `line` field is extracted from `metadata` (code entities store `{"line": N}`, sections store `{"start_line": N, "end_line": N, "level": N}`). The `content` field contains the full source text for Function and Class entities, the section body for Section entities, and is empty for File entities.
 
 The `label` object's inner fields vary by node type:
 
 | Node Type | Label Fields |
 |-----------|-------------|
-| `Entity` | `type` (File \| Function \| Class), `status`, `last_modified` |
+| `Entity` | `type` (File \| Function \| Class \| Section), `status`, `last_modified` |
 | `Workspace` | `description`, `status`, `closed_at` |
 | `Scratchpad` | `created_at` |
 
@@ -146,6 +164,7 @@ The `label` object's inner fields vary by node type:
 | `CALLS` | Function → Function | Caller invokes callee (resolved via LSP) |
 | `IMPORTS` | File → File/Entity | File imports a symbol (resolved via LSP) |
 | `INHERITS_FROM` | Class → Class | OOP inheritance |
+| `REFERENCES` | Section → Function/Class/File | Documentation section references a code entity (resolved via inline code name-matching) |
 | `HAS_SCRATCHPAD` | Workspace → Scratchpad | Workspace owns a note |
 | `MAPPED_TO` | Workspace → Entity | Workspace tracks an entity |
 
@@ -264,8 +283,8 @@ Two search engines run in parallel and their scores are fused:
 
 | Engine | Method | Indexes |
 |--------|--------|--------|
-| **BM25** | Inverted index with Robertson-Sparck Jones IDF, k1=1.2, b=0.75 | Entity `name`, scratchpad `content`, workspace `description`, entity `metadata` |
-| **Semantic** | ONNX `gte-small` (38M params, local CPU) cosine similarity | Same fields, embedded into 384-dim dense vectors |
+| **BM25** | Inverted index with Robertson-Sparck Jones IDF, k1=1.2, b=0.75 | Entity `name` + `content` (full source text for Functions/Classes, section body for Sections), scratchpad `content`, workspace `description` |
+| **Semantic** | ONNX `gte-small` (38M params, local CPU) cosine similarity | Same fields, embedded into 384-dim dense vectors (chunked for text > 400 tokens) |
 
 **Score fusion**: BM25 scores are scaled by 0.1 and added to cosine similarity scores. Scratchpad notes receive a temporal decay weight (newer notes rank higher). Results are sorted by combined score descending.
 
@@ -286,7 +305,8 @@ Two search engines run in parallel and their scores are fused:
   "workspace": "python-adapter-pattern",
   "entity_types": ["Function", "Class"],
   "include_paths": ["src/"],
-  "exclude_paths": ["node_modules/", ".venv/"]
+  "exclude_paths": ["node_modules/", ".venv/"],
+  "retrieval": "full"
 }
 ```
 
@@ -295,9 +315,10 @@ Two search engines run in parallel and their scores are fused:
 | `text` | string | *(required)* | Natural language or keyword query |
 | `top_k` | number | 10 | Maximum results to return |
 | `workspace` | string | null | Scope results to entities mapped to a specific workspace (MAPPED_TO + HAS_SCRATCHPAD edges) |
-| `entity_types` | string[] | null | Filter by node type: `"Function"`, `"Class"`, `"File"`, `"Workspace"`, `"Scratchpad"` |
+| `entity_types` | string[] | null | Filter by node type: `"Function"`, `"Class"`, `"File"`, `"Section"`, `"Workspace"`, `"Scratchpad"` |
 | `include_paths` | string[] | null | Only return results whose ID starts with one of these prefixes |
 | `exclude_paths` | string[] | null | Exclude results whose ID starts with any of these prefixes |
+| `retrieval` | string | `"full"` | How much content to return: `"name"` (none), `"preview"` (~100 words), `"full"` (complete) |
 
 ### Result Shape
 
@@ -308,13 +329,15 @@ Each result includes:
   "id": "src/reconciler.rs::reconcile",
   "name": "reconcile",
   "score": 1.2345,
-  "content": "",
-  "metadata": "",
+  "line": 42,
+  "content": "pub fn reconcile_file(file_path: &Path, ...) { ... }",
   "type": "Function",
   "path": "src/reconciler.rs",
   "category": "module"
 }
 ```
+
+The `line` field is the 1-indexed line number of the declaration (extracted from metadata). The `content` field contains the full source text for Function and Class entities — the implementation is returned directly, eliminating the need for a follow-up `grep` + `read` to inspect the code. The `retrieval` parameter controls whether `content` is the full text, a ~100-word preview, or empty.
 
 The `category` field is derived from the entity's path:
 - `"module"` — project source code (not in node_modules, .venv, target, etc.)
@@ -647,3 +670,27 @@ Capture names are categorized by prefix in `parse_file()`:
 | **LSP starts but no CALLS edges created** | LSP server can't resolve definitions (file not part of a project, or needs indexing time) | For rust-analyzer: file must be part of a Cargo project. For pylsp: file should be on disk. Try reconciling the file a second time after a few seconds to give the LSP time to index. |
 | **CALLS edges attributed to file instead of function** | `find_enclosing_function()` returns `None` — wrong node kind string | Check the grammar's `node-types.json` for the correct function node kind (e.g. `function_item` for Rust, `function_definition` for Python). |
 | **`query_source()` won't compile** | Return type is `&'static str` — query must be a string literal | Use `r#"..."#` raw string literal, not `String::from()` or `format!()`. |
+
+## Roadmap
+
+### Document Adapter (Markdown Indexing)
+
+**Status:** Implemented.
+
+Markdown files (`.md`) are indexed as first-class graph citizens via a `DocumentAdapter` trait (parallel to `LanguageAdapter` for code files). The `MarkdownAdapter` parses headings into `Section` entities, extracts inline code references (`` `function_name` ``) and file path references (`src/file.rs`) for `REFERENCES` edges, and stores the full section body as the entity's `content`.
+
+| Aspect | Code Files | Document Files |
+|--------|-----------|----------------|
+| Parser | Tree-sitter grammar | Custom line-by-line markdown parser |
+| Entity types | `Function`, `Class` | `Section` (heading) |
+| Edge types | `CALLS`, `IMPORTS`, `DECLARED_IN` | `REFERENCES` (doc → code entity), `DECLARED_IN` (section → file) |
+| LSP | Per-language server | Not applicable (graph name-matching) |
+| Search value | Source code, call graphs | Prose explanations, architectural context |
+
+**Key design decisions:**
+- A heading is a separate `Section` entity with its body text as `content`.
+- `REFERENCES` edges are auto-detected by inline code name-matching against Function/Class names in the graph — no LSP required.
+- Nested sections include child content (a `## Foo` section's content includes `### Bar` text).
+- When code entities are re-reconciled, a reverse re-linking pass recreates `REFERENCES` edges from Sections to newly created entities.
+
+Config files (`.json`, `.yaml`, `.toml`) are **not** indexed — they are low prose-value and mostly redundant with the code that reads them.

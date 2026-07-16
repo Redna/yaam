@@ -58,6 +58,17 @@ pub trait LanguageAdapter: Send + Sync {
     /// `None` means cross-file resolution is not supported for this language
     /// (declarations will still be extracted via tree-sitter).
     fn lsp_command(&self) -> Option<LspCommand>;
+
+    /// Given a name capture node from a tree-sitter query, return the
+    /// enclosing declaration node whose full source text should be stored
+    /// as the entity's `content`.
+    ///
+    /// Default implementation returns the direct parent, which is correct
+    /// for all current languages (TypeScript, Python, Rust) because the
+    /// query captures the `name` field of the declaration node.
+    fn declaration_node<'a>(&self, name_node: Node<'a>) -> Option<Node<'a>> {
+        name_node.parent()
+    }
 }
 
 // ─── Language Registry ─────────────────────────────────────────────────────

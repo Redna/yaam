@@ -99,7 +99,7 @@ pub struct MemoryNode {
     pub name: String,
     pub content: String,
     pub metadata: String,
-    pub embedding: Option<Vec<f32>>,
+    pub embedding: Option<Vec<Vec<f32>>>,
 }
 
 /// A directed edge in the memory graph.
@@ -174,6 +174,27 @@ pub const RPC_METHOD_NOT_FOUND: i32 = -32601;
 pub const RPC_INVALID_PARAMS: i32 = -32602;
 pub const RPC_INTERNAL_ERROR: i32 = -32603;
 
+// ─── Retrieval Mode ───────────────────────────────────────────────────────
+
+/// Controls how much content is returned per node in search and query results.
+///
+/// - `Name`    — returns name + line number only (no content)
+/// - `Preview` — returns name + line number + first ~100 words of content
+/// - `Full`    — returns name + line number + full content (default)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RetrievalMode {
+    Name,
+    Preview,
+    Full,
+}
+
+impl Default for RetrievalMode {
+    fn default() -> Self {
+        RetrievalMode::Full
+    }
+}
+
 // ─── Query DSL Types ────────────────────────────────────────────────────────
 
 /// A read-only query expressed via the JSON DSL.
@@ -198,6 +219,10 @@ pub struct DslQuery {
     /// Which fields to return.
     #[serde(default, rename = "return")]
     pub return_fields: Option<Vec<String>>,
+
+    /// How much content to return per result.
+    #[serde(default)]
+    pub retrieval: Option<RetrievalMode>,
 
     /// Limit number of results.
     #[serde(default)]
@@ -288,6 +313,10 @@ pub struct SearchRequest {
     /// prefixes (e.g. ["node_modules/", ".venv/"]).
     #[serde(default)]
     pub exclude_paths: Option<Vec<String>>,
+
+    /// How much content to return per result. Default: Full.
+    #[serde(default)]
+    pub retrieval: Option<RetrievalMode>,
 }
 
 fn default_top_k() -> Option<usize> {

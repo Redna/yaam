@@ -94,10 +94,145 @@ impl EmbeddingModel {
 
         Ok(pooled)
     }
+
+    /// Count the number of tokens in `text` using the tokenizer.
+    /// Used by `embed_chunked` to determine chunk boundaries.
+    pub fn count_tokens(&self, text: &str) -> usize {
+        self.tokenizer
+            .encode(text, false)
+            .map(|enc| enc.get_ids().len())
+            .unwrap_or(0)
+    }
+
+    /// Embed text, splitting into overlapping chunks if it exceeds `max_tokens`.
+    ///
+    /// Returns a list of embedding vectors — one per chunk. Short text returns
+    /// a single-element list. Long text is split on paragraph boundaries first,
+    /// then sentence boundaries, with `overlap_tokens` of overlap between
+    /// consecutive chunks.
+    pub fn embed_chunked(
+        &self,
+        text: &str,
+        max_tokens: usize,
+        overlap_tokens: usize,
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        let total_tokens = self.count_tokens(text);
+        if total_tokens <= max_tokens {
+            return Ok(vec![self.embed(text)?]);
+        }
+
+        // Split into paragraphs first
+        let paragraphs: Vec<&str> = text.split("\n\n").collect();
+
+        // Group paragraphs into chunks that fit within max_tokens
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current_chunk = String::new();
+        let mut current_tokens = 0usize;
+
+        for para in &paragraphs {
+            let para_tokens = self.count_tokens(para);
+
+            // If a single paragraph exceeds max_tokens, split it on sentences
+            if para_tokens > max_tokens && current_chunk.is_empty() {
+                let sentences = split_sentences(para);
+                let mut sent_chunk = String::new();
+                let mut sent_tokens = 0usize;
+                for sent in sentences {
+                    let st = self.count_tokens(&sent);
+                    if sent_tokens + st > max_tokens && !sent_chunk.is_empty() {
+                        chunks.push(sent_chunk.clone());
+                        sent_chunk = overlap_text(&chunks, overlap_tokens);
+                        sent_tokens = self.count_tokens(&sent_chunk);
+                    }
+                    if !sent_chunk.is_empty() {
+                        sent_chunk.push(' ');
+                    }
+                    sent_chunk.push_str(&sent);
+                    sent_tokens += st;
+                }
+                if !sent_chunk.is_empty() {
+                    chunks.push(sent_chunk);
+                    current_chunk = overlap_text(&chunks, overlap_tokens);
+                    current_tokens = self.count_tokens(&current_chunk);
+                }
+                continue;
+            }
+
+            // Check if adding this paragraph would exceed the limit
+            if current_tokens + para_tokens > max_tokens && !current_chunk.is_empty() {
+                chunks.push(current_chunk.clone());
+                // Start next chunk with overlap from the end of the previous chunk
+                current_chunk = overlap_text(&chunks, overlap_tokens);
+                current_tokens = self.count_tokens(&current_chunk);
+            }
+
+            if !current_chunk.is_empty() {
+                current_chunk.push_str("\n\n");
+            }
+            current_chunk.push_str(para);
+            current_tokens += para_tokens;
+        }
+
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        // Embed each chunk
+        let mut embeddings = Vec::new();
+        for chunk in &chunks {
+            embeddings.push(self.embed(chunk)?);
+        }
+
+        Ok(embeddings)
+    }
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Split text into sentences on `. `, `! `, or `? ` boundaries.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        current.push(c);
+        if (c == '.' || c == '!' || c == '?') {
+            // Include trailing space if present
+            sentences.push(current.trim().to_string());
+            current.clear();
+        }
+    }
+    if !current.trim().is_empty() {
+        sentences.push(current.trim().to_string());
+    }
+    sentences
+}
+
+/// Extract approximately `overlap_tokens` worth of text from the end of the
+/// last chunk to use as overlap for the next chunk.
+/// This is a rough heuristic — it takes the last few sentences.
+fn overlap_text(chunks: &[String], overlap_tokens: usize) -> String {
+    if chunks.is_empty() || overlap_tokens == 0 {
+        return String::new();
+    }
+    let last = chunks.last().unwrap();
+    let sentences = split_sentences(last);
+    // Take sentences from the end until we have enough overlap
+    let mut overlap = String::new();
+    let mut approx_tokens = 0;
+    // Rough estimate: ~1.3 words per token, ~5 words per sentence
+    let target_sentences = (overlap_tokens / 7).max(1);
+    for sent in sentences.iter().rev().take(target_sentences) {
+        if !overlap.is_empty() {
+            overlap = format!("{} {}", sent, overlap);
+        } else {
+            overlap = sent.clone();
+        }
+        approx_tokens += sent.split_whitespace().count();
+    }
+    let _ = approx_tokens; // suppress unused warning
+    overlap
 }
 
 pub fn decay_weight(created_at: u64, current_time: u64) -> f32 {

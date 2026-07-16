@@ -7,6 +7,7 @@
 //! from the last active connection.
 
 pub mod embedding;
+mod document_adapter;
 mod graph;
 mod language_adapter;
 mod lsp_adapter;
@@ -166,3 +167,4 @@ async fn main() {
         });
     }
 }
+

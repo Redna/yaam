@@ -8,6 +8,31 @@ use crate::graph::MemoryEngine;
 use crate::types::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Truncate content to approximately `max_words` words, appending "..." if truncated.
+fn preview_content(content: &str, max_words: usize) -> String {
+    let words: Vec<&str> = content.split_whitespace().collect();
+    if words.len() <= max_words {
+        return content.to_string();
+    }
+    let truncated = words[..max_words].join(" ");
+    format!("{}...", truncated)
+}
+
+/// Extract the line number from a node's metadata JSON.
+fn extract_line_from_metadata(metadata: &str) -> Option<usize> {
+    if metadata.is_empty() {
+        return None;
+    }
+    let meta = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
+    if let Some(line) = meta.get("line").and_then(|v| v.as_u64()) {
+        return Some(line as usize);
+    }
+    if let Some(line) = meta.get("start_line").and_then(|v| v.as_u64()) {
+        return Some(line as usize);
+    }
+    None
+}
+
 /// Evaluate a DSL query against the memory engine, returning matching results as JSON.
 pub fn evaluate_query(engine: &MemoryEngine, query: &DslQuery) -> serde_json::Value {
     // Step 1: Gather initial candidate nodes via match clause
@@ -41,10 +66,11 @@ pub fn evaluate_query(engine: &MemoryEngine, query: &DslQuery) -> serde_json::Va
 
     // Step 6: Project return fields
     let return_fields = query.return_fields.as_deref();
+    let retrieval = query.retrieval.unwrap_or_default();
     let results: Vec<serde_json::Value> = limited
         .iter()
         .filter_map(|id| engine.get_node(id))
-        .map(|node| project_node(node, return_fields))
+        .map(|node| project_node(node, return_fields, retrieval))
         .collect();
 
     serde_json::json!(results)
@@ -271,10 +297,20 @@ fn apply_aggregation(
 }
 
 /// Project a node into a JSON object, optionally filtering to specific fields.
-fn project_node(node: &MemoryNode, return_fields: Option<&[String]>) -> serde_json::Value {
+/// The retrieval mode controls how much content is included.
+fn project_node(node: &MemoryNode, return_fields: Option<&[String]>, retrieval: RetrievalMode) -> serde_json::Value {
+    let line = extract_line_from_metadata(&node.metadata);
+
+    let content = match retrieval {
+        RetrievalMode::Name => String::new(),
+        RetrievalMode::Preview => preview_content(&node.content, 100),
+        RetrievalMode::Full => node.content.clone(),
+    };
+
     let full = serde_json::json!({
         "id": node.id,
         "name": node.name,
+        "line": line,
         "label": match &node.label {
             NodeLabel::Entity { entity_type, status, last_modified } => serde_json::json!({
                 "label": "Entity",
@@ -293,7 +329,7 @@ fn project_node(node: &MemoryNode, return_fields: Option<&[String]>) -> serde_js
                 "created_at": created_at,
             }),
         },
-        "content": node.content,
+        "content": content,
         "metadata": node.metadata,
     });
 

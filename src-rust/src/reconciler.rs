@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tree_sitter::{Parser, Query, QueryCursor};
@@ -14,6 +14,7 @@ pub struct ParsedDeclaration {
     pub entity_type: String,
     pub name: String,
     pub line: usize,
+    pub source_text: String,
 }
 
 pub struct ParsedReference {
@@ -89,11 +90,19 @@ pub fn parse_file(
 
                 let id = format!("{}:{}", file_path.display(), name);
 
+                // Extract full source text from the enclosing declaration node.
+                let source_text = adapter
+                    .declaration_node(node)
+                    .and_then(|decl_node| decl_node.utf8_text(source_code).ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+
                 declarations.push(ParsedDeclaration {
                     id,
                     entity_type: entity_type.to_string(),
                     name,
                     line: node.start_position().row + 1,
+                    source_text,
                 });
             }
         }
@@ -194,11 +203,18 @@ pub fn reconcile_file(
     });
 
     // 4. Resolve the language adapter for this file.
-    //    If the file type is not supported, we stop here — the file node is
-    //    upserted but no declarations or references are extracted.
+    //    If the file type is not supported as code, try a document adapter.
+    //    If neither is found, we stop here — the file node is upserted but no
+    //    declarations or references are extracted.
     let adapter = match get_adapter(file_path) {
         Some(a) => a,
-        None => return events,
+        None => {
+            // Try document adapter (markdown, etc.)
+            if let Some(doc_adapter) = crate::document_adapter::get_document_adapter(file_path) {
+                return reconcile_document(file_path, content_str, doc_adapter.as_ref(), engine);
+            }
+            return events;
+        }
     };
 
     // 5. Parse content
@@ -226,6 +242,17 @@ pub fn reconcile_file(
         entity_props.insert(
             "last_modified".to_string(),
             serde_json::Value::Number(serde_json::Number::from(timestamp)),
+        );
+        entity_props.insert(
+            "content".to_string(),
+            serde_json::Value::String(decl.source_text.clone()),
+        );
+        // Store line number in metadata so it's accessible from MemoryNode
+        // without needing to keep raw properties around.
+        let metadata = serde_json::json!({"line": decl.line}).to_string();
+        entity_props.insert(
+            "metadata".to_string(),
+            serde_json::Value::String(metadata),
         );
 
         events.push(Event {
@@ -299,4 +326,369 @@ pub fn reconcile_file(
     }
 
     events
+}
+
+// ─── Document Reconciliation (markdown, etc.) ─────────────────────────────────
+
+/// Reconcile a non-code document file (e.g., markdown).
+///
+/// Parses the document into `Section` entities, creates `DECLARED_IN` edges
+/// to the file node, and resolves `REFERENCES` edges to existing code entities
+/// via inline-code and file-path name matching against the graph.
+fn reconcile_document(
+    file_path: &Path,
+    content: &str,
+    doc_adapter: &dyn crate::document_adapter::DocumentAdapter,
+    engine: &crate::graph::MemoryEngine,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    let timestamp = get_timestamp();
+    let file_id = format!("{}", file_path.display());
+
+    // Parse the document into sections
+    let sections = doc_adapter.parse_document(file_path, content);
+
+    // Upsert Section entities and DECLARED_IN edges
+    for section in &sections {
+        let mut entity_props = HashMap::new();
+        entity_props.insert(
+            "entity_type".to_string(),
+            serde_json::Value::String("Section".to_string()),
+        );
+        entity_props.insert(
+            "name".to_string(),
+            serde_json::Value::String(section.name.clone()),
+        );
+        entity_props.insert(
+            "content".to_string(),
+            serde_json::Value::String(section.content.clone()),
+        );
+        entity_props.insert(
+            "status".to_string(),
+            serde_json::Value::String("active".to_string()),
+        );
+        entity_props.insert(
+            "last_modified".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(timestamp)),
+        );
+        // Store metadata: heading level and line range
+        let metadata = serde_json::json!({
+            "level": section.level,
+            "start_line": section.start_line,
+            "end_line": section.end_line,
+        });
+        entity_props.insert(
+            "metadata".to_string(),
+            serde_json::Value::String(metadata.to_string()),
+        );
+
+        events.push(Event {
+            version: EVENT_VERSION,
+            timestamp,
+            event_type: EventType::UpsertNode,
+            payload: EventPayload::UpsertNode(UpsertNodePayload {
+                id: section.id.clone(),
+                label: "Entity".to_string(),
+                properties: entity_props,
+            }),
+        });
+
+        events.push(Event {
+            version: EVENT_VERSION,
+            timestamp,
+            event_type: EventType::LinkNodes,
+            payload: EventPayload::LinkNodes(LinkNodesPayload {
+                from_id: section.id.clone(),
+                to_id: file_id.clone(),
+                relationship: "DECLARED_IN".to_string(),
+                properties: HashMap::new(),
+            }),
+        });
+    }
+
+    // Resolve REFERENCES edges via graph name-matching
+    let ref_events = resolve_document_references(&sections, engine);
+    events.extend(ref_events);
+
+    events
+}
+
+/// Resolve `REFERENCES` edges from document sections to existing code entities.
+///
+/// Uses inline-code matching (backtick-quoted identifiers) as the primary
+/// mechanism and file-path matching as a secondary mechanism. No LSP is used —
+/// the graph itself is the resolver.
+fn resolve_document_references(
+    sections: &[crate::document_adapter::ParsedSection],
+    engine: &crate::graph::MemoryEngine,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    let timestamp = get_timestamp();
+
+    // Build a name → node_ids index from existing Function and Class entities.
+    // This is O(n) once per file reconciliation, not per reference.
+    let mut name_index: HashMap<String, Vec<String>> = HashMap::new();
+    for node in engine.all_nodes() {
+        if let crate::types::NodeLabel::Entity { entity_type, .. } = &node.label {
+            if entity_type == "Function" || entity_type == "Class" {
+                name_index
+                    .entry(node.name.clone())
+                    .or_default()
+                    .push(node.id.clone());
+            }
+        }
+    }
+
+    // Also index File nodes by their ID for file-path matching
+    let file_index: std::collections::HashSet<String> = engine
+        .all_nodes()
+        .iter()
+        .filter(|n| matches!(&n.label, crate::types::NodeLabel::Entity { entity_type, .. } if entity_type == "File"))
+        .map(|n| n.id.clone())
+        .collect();
+
+    let mut seen_edges: std::collections::HashSet<(String, String)> = HashSet::new();
+
+    for section in sections {
+        // 1. Inline code matching (primary, high-precision)
+        for ref_name in &section.inline_code_refs {
+            if let Some(targets) = name_index.get(ref_name) {
+                for target_id in targets {
+                    let edge_key = (section.id.clone(), target_id.clone());
+                    if seen_edges.contains(&edge_key) {
+                        continue;
+                    }
+                    seen_edges.insert(edge_key.clone());
+
+                    let mut props = HashMap::new();
+                    props.insert(
+                        "match_type".to_string(),
+                        serde_json::json!("inline_code"),
+                    );
+                    props.insert(
+                        "matched_text".to_string(),
+                        serde_json::json!(ref_name),
+                    );
+
+                    events.push(Event {
+                        version: EVENT_VERSION,
+                        timestamp,
+                        event_type: EventType::LinkNodes,
+                        payload: EventPayload::LinkNodes(LinkNodesPayload {
+                            from_id: section.id.clone(),
+                            to_id: target_id.clone(),
+                            relationship: "REFERENCES".to_string(),
+                            properties: props,
+                        }),
+                    });
+                }
+            }
+        }
+
+        // 2. File path matching (secondary)
+        for path_ref in &section.file_path_refs {
+            // Try exact match against file IDs
+            if file_index.contains(path_ref) {
+                let edge_key = (section.id.clone(), path_ref.clone());
+                if seen_edges.contains(&edge_key) {
+                    continue;
+                }
+                seen_edges.insert(edge_key);
+
+                let mut props = HashMap::new();
+                props.insert(
+                    "match_type".to_string(),
+                    serde_json::json!("file_path"),
+                );
+                props.insert(
+                    "matched_text".to_string(),
+                    serde_json::json!(path_ref),
+                );
+
+                events.push(Event {
+                    version: EVENT_VERSION,
+                    timestamp,
+                    event_type: EventType::LinkNodes,
+                    payload: EventPayload::LinkNodes(LinkNodesPayload {
+                        from_id: section.id.clone(),
+                        to_id: path_ref.clone(),
+                        relationship: "REFERENCES".to_string(),
+                        properties: props,
+                    }),
+                });
+            }
+        }
+    }
+
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language_adapter::{RustAdapter, TypeScriptAdapter, PythonAdapter};
+
+    // ── 7.1 Source Text Extraction ───────────────────────────────────
+
+    #[test]
+    fn test_source_text_rust_function() {
+        let adapter = RustAdapter;
+        let content = r#"
+pub fn embed_chunked(
+    &self,
+    text: &str,
+    max_tokens: usize,
+) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let total_tokens = self.count_tokens(text);
+    if total_tokens <= max_tokens {
+        return Ok(vec![self.embed(text)?]);
+    }
+    Ok(vec![])
+}
+"#;
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.rs"),
+            content,
+            &adapter,
+        );
+        let func = declarations.iter().find(|d| d.name == "embed_chunked").unwrap();
+        assert_eq!(func.entity_type, "Function");
+        assert!(func.source_text.contains("pub fn embed_chunked"));
+        assert!(func.source_text.contains("max_tokens"));
+        assert!(func.source_text.contains("count_tokens"));
+    }
+
+    #[test]
+    fn test_source_text_rust_struct() {
+        let adapter = RustAdapter;
+        let content = r#"
+pub struct EmbeddingModel {
+    session: Mutex<Session>,
+    tokenizer: Tokenizer,
+}
+"#;
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.rs"),
+            content,
+            &adapter,
+        );
+        let class = declarations.iter().find(|d| d.name == "EmbeddingModel").unwrap();
+        assert_eq!(class.entity_type, "Class");
+        assert!(class.source_text.contains("pub struct EmbeddingModel"));
+        assert!(class.source_text.contains("session"));
+        assert!(class.source_text.contains("tokenizer"));
+    }
+
+    #[test]
+    fn test_source_text_typescript_arrow_function() {
+        let adapter = TypeScriptAdapter;
+        let content = r#"
+const foo = (x: number): number => {
+    return x + 1;
+};
+"#;
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.ts"),
+            content,
+            &adapter,
+        );
+        let func = declarations.iter().find(|d| d.name == "foo").unwrap();
+        assert_eq!(func.entity_type, "Function");
+        // The parent is variable_declarator, which includes the arrow function body
+        // but not the `const` keyword.
+        assert!(func.source_text.contains("foo"));
+        assert!(func.source_text.contains("=>"));
+        assert!(func.source_text.contains("return x + 1"));
+    }
+
+    #[test]
+    fn test_source_text_typescript_class() {
+        let adapter = TypeScriptAdapter;
+        let content = r#"
+class MyClass {
+    method() {
+        return 42;
+    }
+}
+"#;
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.ts"),
+            content,
+            &adapter,
+        );
+        let class = declarations.iter().find(|d| d.name == "MyClass").unwrap();
+        assert_eq!(class.entity_type, "Class");
+        assert!(class.source_text.contains("class MyClass"));
+        assert!(class.source_text.contains("method"));
+    }
+
+    #[test]
+    fn test_source_text_python_function() {
+        let adapter = PythonAdapter;
+        let content = r#"
+def compute_score(a, b):
+    result = a + b
+    return result
+"#;
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.py"),
+            content,
+            &adapter,
+        );
+        let func = declarations.iter().find(|d| d.name == "compute_score").unwrap();
+        assert_eq!(func.entity_type, "Function");
+        assert!(func.source_text.contains("def compute_score"));
+        assert!(func.source_text.contains("result = a + b"));
+        assert!(func.source_text.contains("return result"));
+    }
+
+    #[test]
+    fn test_source_text_python_class() {
+        let adapter = PythonAdapter;
+        let content = r#"
+class Parser:
+    def parse(self):
+        pass
+"#;
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.py"),
+            content,
+            &adapter,
+        );
+        let class = declarations.iter().find(|d| d.name == "Parser").unwrap();
+        assert_eq!(class.entity_type, "Class");
+        assert!(class.source_text.contains("class Parser"));
+        assert!(class.source_text.contains("def parse"));
+    }
+
+    #[test]
+    fn test_source_text_empty_function_body() {
+        // A trait method with no body (just a signature in a trait)
+        let adapter = RustAdapter;
+        let content = "trait Foo { fn bar(&self); }\n";
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.rs"),
+            content,
+            &adapter,
+        );
+        // If bar is captured, its source_text should contain at least the signature
+        if let Some(func) = declarations.iter().find(|d| d.name == "bar") {
+            assert!(func.source_text.contains("fn bar"));
+        }
+    }
+
+    #[test]
+    fn test_source_text_not_empty_for_normal_function() {
+        let adapter = RustAdapter;
+        let content = "fn simple() { let x = 1; }\n";
+        let (declarations, _) = parse_file(
+            std::path::Path::new("test.rs"),
+            content,
+            &adapter,
+        );
+        let func = declarations.iter().find(|d| d.name == "simple").unwrap();
+        assert!(!func.source_text.is_empty());
+        assert!(func.source_text.contains("fn simple"));
+        assert!(func.source_text.contains("let x = 1"));
+    }
 }
