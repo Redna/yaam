@@ -6,7 +6,8 @@
 use crate::embedding::EmbeddingModel;
 use crate::graph::MemoryEngine;
 use crate::query_dsl;
-use crate::search::BM25Index;
+use crate::search::BM25FieldIndex;
+use crate::ann_index::AnnIndex;
 use crate::storage::EventStore;
 use crate::types::*;
 use crate::lsp_adapter::{LspAdapter, StdioLspClient};
@@ -20,13 +21,22 @@ use std::path::PathBuf;
 pub struct AppState {
     pub engine: Arc<RwLock<MemoryEngine>>,
     pub store: Arc<RwLock<EventStore>>,
-    pub bm25: Arc<RwLock<BM25Index>>,
+    pub bm25: Arc<RwLock<BM25FieldIndex>>,
+    /// ANN index for dense vector search (Spec #1).
+    pub ann: Arc<RwLock<AnnIndex>>,
     pub embedder: Option<Arc<EmbeddingModel>>,
+    /// Cache of embedding text hashes to skip ONNX inference for unchanged entities (Spec #3).
+    pub embedding_cache: Arc<RwLock<EmbeddingCache>>,
     /// Lazily-started LSP clients, keyed by language_id (e.g. "typescript", "python").
     /// A client is only created the first time a file of that language is reconciled.
     pub lsp_clients: Arc<RwLock<HashMap<String, Arc<Mutex<StdioLspClient>>>>>,
     /// Project root directory, used as the LSP `rootUri` when starting servers.
     pub project_root: PathBuf,
+    /// Channel sender for background LSP reference resolution (Spec #2).
+    /// Pending references are sent here and processed by a background worker
+    /// spawned in main.rs, so reconcile can return immediately without
+    /// blocking on LSP round-trips.
+    pub ref_queue: Option<tokio::sync::mpsc::UnboundedSender<crate::reconciler::PendingReference>>,
 }
 
 impl AppState {
@@ -39,13 +49,26 @@ impl AppState {
         let mut engine = MemoryEngine::default();
         engine.load_from_events(&events);
 
-        let mut bm25 = BM25Index::new();
+        let mut bm25 = BM25FieldIndex::new();
         // Index all existing nodes for BM25
         for node in engine.all_nodes() {
-            let text = build_bm25_text(node);
-            if !text.is_empty() {
-                bm25.add_document(&node.id, &text);
+            let fields = build_bm25_fields(node);
+            if !fields.is_empty() {
+                bm25.add_document(&node.id, &fields);
             }
+        }
+
+        // Build ANN index from existing node embeddings (Spec #1)
+        let mut ann = AnnIndex::new();
+        for node in engine.all_nodes() {
+            if let Some(ref embeddings) = node.embedding {
+                if !embeddings.is_empty() {
+                    ann.add(&node.id, embeddings);
+                }
+            }
+        }
+        if ann.node_count() > 0 {
+            eprintln!("[YAAM] ANN index primed with {} nodes ({} vectors)", ann.node_count(), ann.vector_count());
         }
 
         let model_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
@@ -58,6 +81,25 @@ impl AppState {
             }
         };
 
+        // Build embedding cache from existing nodes (Spec #3).
+        // For each node that has an embedding, compute the hash of its embedding text
+        // so we can skip ONNX inference on future reconciles if the text hasn't changed.
+        let mut embedding_cache = EmbeddingCache::new();
+        for node in engine.all_nodes() {
+            if let Some(ref emb) = node.embedding {
+                if !emb.is_empty() {
+                    let text = build_embedding_text_from_node(node);
+                    if !text.is_empty() {
+                        let hash = EmbeddingCache::hash_text(&text);
+                        embedding_cache.set_hash(&node.id, hash);
+                    }
+                }
+            }
+        }
+        if embedding_cache.len() > 0 {
+            eprintln!("[YAAM] Embedding cache primed with {} entries", embedding_cache.len());
+        }
+
         // LSP clients are lazily started on first reconcile of each language.
         // No LSP servers are spawned at daemon startup.
 
@@ -65,9 +107,12 @@ impl AppState {
             engine: Arc::new(RwLock::new(engine)),
             store: Arc::new(RwLock::new(store)),
             bm25: Arc::new(RwLock::new(bm25)),
+            ann: Arc::new(RwLock::new(ann)),
             embedder,
+            embedding_cache: Arc::new(RwLock::new(embedding_cache)),
             lsp_clients: Arc::new(RwLock::new(HashMap::new())),
             project_root: dir.to_path_buf(),
+            ref_queue: None,
         })
     }
 }
@@ -112,30 +157,46 @@ fn apply_retrieval_mode(content: &str, mode: RetrievalMode) -> String {
     }
 }
 
-/// Build the text to index for BM25 from a node's relevant fields.
-fn build_bm25_text(node: &MemoryNode) -> String {
-    let mut parts = Vec::new();
+/// Build the per-field text map for BM25 indexing from a node's relevant fields.
+///
+/// Returns a `HashMap` with keys `"name"`, `"content"`, and `"doc"` mapping
+/// to the text to index for each field. Only non-empty fields are included.
+/// The caller (BM25FieldIndex) skips missing fields.
+///
+/// # Field assignment by entity type
+///
+/// | Entity Type | name | content | doc |
+/// |-------------|------|---------|-----|
+/// | Function/Class | entity name | full source text | docComment from metadata |
+/// | Section | entity name | heading + section body | — |
+/// | File | entity name | — | docComment from metadata |
+/// | Workspace | workspace name | description | — |
+/// | Scratchpad | scratchpad label | scratchpad content | — |
+fn build_bm25_fields(node: &MemoryNode) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
 
-    // Always index the name
+    // Name field — always present
     if !node.name.is_empty() {
-        parts.push(node.name.clone());
+        fields.insert("name".to_string(), node.name.clone());
     }
 
     match &node.label {
         NodeLabel::Entity { entity_type, .. } => {
             if entity_type == "Section" {
                 // Index heading + full section body for markdown sections
-                parts.push(node.content.clone());
+                if !node.content.is_empty() {
+                    fields.insert("content".to_string(), node.content.clone());
+                }
             } else if entity_type == "Function" || entity_type == "Class" {
                 // Index full source text for code entities
                 if !node.content.is_empty() {
-                    parts.push(node.content.clone());
+                    fields.insert("content".to_string(), node.content.clone());
                 }
-                // Also index docComment from metadata if present (forward-compatible)
+                // Also index docComment from metadata if present
                 if !node.metadata.is_empty() {
                     if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&node.metadata) {
                         if let Some(doc) = meta.get("docComment").and_then(|v| v.as_str()) {
-                            parts.push(doc.to_string());
+                            fields.insert("doc".to_string(), doc.to_string());
                         }
                     }
                 }
@@ -144,21 +205,23 @@ fn build_bm25_text(node: &MemoryNode) -> String {
                 if !node.metadata.is_empty() {
                     if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&node.metadata) {
                         if let Some(doc) = meta.get("docComment").and_then(|v| v.as_str()) {
-                            parts.push(doc.to_string());
+                            fields.insert("doc".to_string(), doc.to_string());
                         }
                     }
                 }
             }
         }
         NodeLabel::Workspace { description, .. } => {
-            parts.push(description.clone());
+            fields.insert("content".to_string(), description.clone());
         }
         NodeLabel::Scratchpad { .. } => {
-            parts.push(node.content.clone());
+            if !node.content.is_empty() {
+                fields.insert("content".to_string(), node.content.clone());
+            }
         }
     }
 
-    parts.join(" ")
+    fields
 }
 
 /// Build the text to embed for semantic search from a node's properties.
@@ -219,6 +282,124 @@ fn build_embedding_text_from_props(
             }
         }
         _ => name.to_string(),
+    }
+}
+
+// ─── Embedding Cache (Spec #3) ──────────────────────────────────────────────
+
+/// Cache of SHA-256 hashes of embedding text, keyed by entity ID.
+///
+/// Used to skip ONNX inference when an entity's embedding text hasn't
+/// changed since the last embedding was computed. On a cache hit, the
+/// existing embedding is copied from the graph instead of re-running the
+/// ONNX model.
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingCache {
+    /// Maps entity ID → SHA-256 hash of the embedding text.
+    hashes: HashMap<String, [u8; 32]>,
+}
+
+impl EmbeddingCache {
+    pub fn new() -> Self {
+        Self { hashes: HashMap::new() }
+    }
+
+    /// Compute SHA-256 hash of the given text.
+    fn hash_text(text: &str) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Check if the embedding text for `id` has changed since the last embedding.
+    /// Returns `Some(hash)` if the text is new or changed (caller should embed).
+    /// Returns `None` if the hash matches the cached value (caller should skip).
+    pub fn check_and_update(&mut self, id: &str, text: &str) -> CacheResult {
+        let hash = Self::hash_text(text);
+        if let Some(existing) = self.hashes.get(id) {
+            if *existing == hash {
+                return CacheResult::Unchanged;
+            }
+        }
+        CacheResult::Changed(hash)
+    }
+
+    /// Record the hash for an entity after embedding.
+    pub fn set_hash(&mut self, id: &str, hash: [u8; 32]) {
+        self.hashes.insert(id.to_string(), hash);
+    }
+
+    /// Remove an entity from the cache (on deletion).
+    pub fn remove(&mut self, id: &str) {
+        self.hashes.remove(id);
+    }
+
+    /// Number of cached entries.
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+}
+
+/// Result of an embedding cache check.
+pub enum CacheResult {
+    /// The text hash matches the cached value — skip embedding, reuse existing.
+    Unchanged,
+    /// The text is new or changed — embed and store the new hash.
+    Changed([u8; 32]),
+}
+
+/// Build the embedding text from a `MemoryNode`'s fields.
+///
+/// This is the inverse of `build_embedding_text_from_props` — it reconstructs
+/// the text from the node's name, content, and metadata fields using the same
+/// formatting logic. Used at startup to prime the `EmbeddingCache`.
+fn build_embedding_text_from_node(node: &MemoryNode) -> String {
+    match &node.label {
+        NodeLabel::Workspace { description, .. } => {
+            if node.name.is_empty() {
+                description.clone()
+            } else {
+                format!("{} {}", node.name, description)
+            }
+        }
+        NodeLabel::Scratchpad { .. } => {
+            node.content.clone()
+        }
+        NodeLabel::Entity { entity_type, .. } => {
+            match entity_type.as_str() {
+                "Section" => {
+                    if node.content.is_empty() {
+                        node.name.clone()
+                    } else {
+                        format!("{} {}", node.name, node.content)
+                    }
+                }
+                "Function" | "Class" => {
+                    if node.content.is_empty() {
+                        node.name.clone()
+                    } else {
+                        format!("{} {}", node.name, node.content)
+                    }
+                }
+                _ => {
+                    // File entities and other types: name + docComment from metadata
+                    let doc = if !node.metadata.is_empty() {
+                        serde_json::from_str::<serde_json::Value>(&node.metadata)
+                            .ok()
+                            .and_then(|m| m.get("docComment").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    if doc.is_empty() {
+                        node.name.clone()
+                    } else {
+                        format!("{} {}", node.name, doc)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -289,19 +470,36 @@ fn handle_upsert_node(
     })?;
 
     // Compute embedding for all node types (Workspace, Scratchpad, Entity)
+    // Uses embedding cache to skip ONNX inference when text hasn't changed (Spec #3).
     let mut payload = payload;
     if let Some(ref embedder) = state.embedder {
         let text_to_embed = build_embedding_text_from_props(&payload.label, &payload.properties);
         if !text_to_embed.is_empty() {
-            // Use embed_chunked for all entity types — it falls back to a single
-            // embedding for text under max_tokens, so there's no overhead for
-            // short functions or nodes with just a name.
-            match embedder.embed_chunked(&text_to_embed, 400, 50) {
-                Ok(vectors) => {
-                    payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+            let mut cache = state.embedding_cache.write().unwrap();
+            match cache.check_and_update(&payload.id, &text_to_embed) {
+                CacheResult::Unchanged => {
+                    // Hash matches — reuse existing embedding from the graph
+                    let engine = state.engine.read().unwrap();
+                    if let Some(node) = engine.get_node(&payload.id) {
+                        if let Some(ref existing_embedding) = node.embedding {
+                            payload.properties.insert(
+                                "embedding".to_string(),
+                                serde_json::to_value(existing_embedding).unwrap_or(serde_json::json!(null)),
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Failed to compute embedding: {}", e);
+                CacheResult::Changed(hash) => {
+                    // Text is new or changed — compute embedding
+                    match embedder.embed_chunked(&text_to_embed, 400, 50) {
+                        Ok(vectors) => {
+                            payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+                            cache.set_hash(&payload.id, hash);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to compute embedding: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -328,11 +526,18 @@ fn handle_upsert_node(
         // Update BM25 index
         let node = engine.get_node(&payload.id).cloned();
         if let Some(ref node) = node {
-            let text = build_bm25_text(node);
+            let fields = build_bm25_fields(node);
             let mut bm25 = state.bm25.write().unwrap();
-            bm25.remove_document(&payload.id);
-            if !text.is_empty() {
-                bm25.add_document(&payload.id, &text);
+            if !fields.is_empty() {
+                bm25.add_document(&payload.id, &fields);
+            }
+
+            // Update ANN index (Spec #1)
+            if let Some(ref embeddings) = node.embedding {
+                if !embeddings.is_empty() {
+                    let mut ann = state.ann.write().unwrap();
+                    ann.add(&payload.id, embeddings);
+                }
             }
         }
     }
@@ -398,6 +603,18 @@ fn handle_delete_node(
     {
         let mut bm25 = state.bm25.write().unwrap();
         bm25.remove_document(&payload.id);
+    }
+
+    // Update ANN index (Spec #1)
+    {
+        let mut ann = state.ann.write().unwrap();
+        ann.remove(&payload.id);
+    }
+
+    // Update embedding cache (Spec #3)
+    {
+        let mut cache = state.embedding_cache.write().unwrap();
+        cache.remove(&payload.id);
     }
 
     Ok(serde_json::json!({"status": "ok"}))
@@ -469,6 +686,264 @@ fn derive_category(path: &str) -> String {
     }
 }
 
+/// Extract the entity type string from a NodeLabel.
+fn entity_type_string(label: &NodeLabel) -> String {
+    match label {
+        NodeLabel::Entity { entity_type, .. } => entity_type.clone(),
+        NodeLabel::Workspace { .. } => "Workspace".to_string(),
+        NodeLabel::Scratchpad { .. } => "Scratchpad".to_string(),
+    }
+}
+
+/// Resolve graph relationships for the top-N search results.
+///
+/// For each of the top `resolve_top_k` results, query the graph engine
+/// for forward (outbound) and/or reverse (inbound) edges, filter by the
+/// requested relationship types, and return compact `NeighborNode` summaries.
+fn resolve_traversals(
+    engine: &MemoryEngine,
+    ranked: &[(String, f32)],
+    traverse: &SearchTraverseClause,
+) -> HashMap<String, SearchTraversal> {
+    let resolve_count = traverse.resolve_top_k.min(ranked.len());
+    let relationships: Option<&[String]> = traverse.relationship.as_deref();
+    let mut result = HashMap::new();
+
+    for (id, _) in ranked.iter().take(resolve_count) {
+        let mut neighbors = Vec::new();
+
+        // Outbound edges (this entity → others)
+        if traverse.direction == "outbound" || traverse.direction == "both" {
+            for edge in engine.get_forward_edges(id) {
+                if let Some(rels) = relationships {
+                    if !rels.iter().any(|r| r == &edge.relationship) {
+                        continue;
+                    }
+                }
+                if let Some(target) = engine.get_node(&edge.to_id) {
+                    neighbors.push(NeighborNode {
+                        id: target.id.clone(),
+                        name: target.name.clone(),
+                        entity_type: entity_type_string(&target.label),
+                        relationship: edge.relationship.clone(),
+                        direction: "outbound".to_string(),
+                    });
+                }
+            }
+        }
+
+        // Inbound edges (others → this entity)
+        if traverse.direction == "inbound" || traverse.direction == "both" {
+            for edge in engine.get_reverse_edges(id) {
+                if let Some(rels) = relationships {
+                    if !rels.iter().any(|r| r == &edge.relationship) {
+                        continue;
+                    }
+                }
+                if let Some(source) = engine.get_node(&edge.from_id) {
+                    neighbors.push(NeighborNode {
+                        id: source.id.clone(),
+                        name: source.name.clone(),
+                        entity_type: entity_type_string(&source.label),
+                        relationship: edge.relationship.clone(),
+                        direction: "inbound".to_string(),
+                    });
+                }
+            }
+        }
+
+        result.insert(id.clone(), SearchTraversal {
+            entity_id: id.clone(),
+            neighbors,
+        });
+    }
+
+    result
+}
+
+/// Split content into segments for snippet extraction.
+///
+/// For prose (markdown sections), splits on sentence boundaries.
+/// For code (source text), splits on newlines.
+fn split_for_snippet(content: &str) -> Vec<String> {
+    if content.contains("\n\n") {
+        // Prose: split into sentences
+        let mut segments = Vec::new();
+        for paragraph in content.split("\n\n") {
+            let mut current = String::new();
+            for c in paragraph.chars() {
+                current.push(c);
+                if c == '.' || c == '!' || c == '?' {
+                    let trimmed = current.trim();
+                    if !trimmed.is_empty() {
+                        segments.push(trimmed.to_string());
+                    }
+                    current.clear();
+                }
+            }
+            if !current.trim().is_empty() {
+                segments.push(current.trim().to_string());
+            }
+        }
+        segments
+    } else {
+        // Code: split into lines
+        content
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+}
+
+/// Extract the best-matching snippet from `content` for the given `query`.
+///
+/// Scores each segment by query token overlap, then expands outward from
+/// the best segment to approximately `max_tokens` tokens.
+fn extract_snippet(content: &str, query: &str, max_tokens: usize) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+
+    let query_tokens: std::collections::HashSet<String> = crate::search::tokenize(query)
+        .into_iter()
+        .collect();
+
+    if query_tokens.is_empty() {
+        return preview_content(content, max_tokens * 4);
+    }
+
+    let segments = split_for_snippet(content);
+    if segments.is_empty() {
+        return preview_content(content, max_tokens * 4);
+    }
+
+    // Score each segment by query token overlap count.
+    let mut best_idx = 0;
+    let mut best_score = 0;
+    for (i, segment) in segments.iter().enumerate() {
+        let segment_tokens: std::collections::HashSet<String> =
+            crate::search::tokenize(segment).into_iter().collect();
+        let overlap = query_tokens.intersection(&segment_tokens).count();
+        if overlap > best_score {
+            best_score = overlap;
+            best_idx = i;
+        }
+    }
+
+    // Build snippet: expand outward from best segment until max_tokens.
+    let mut snippet = String::new();
+    let mut token_count = 0;
+    let mut left = best_idx;
+    let mut right = best_idx;
+    let mut expanded = true;
+
+    while expanded && token_count < max_tokens {
+        expanded = false;
+
+        // Try expanding right
+        if right + 1 < segments.len() {
+            let addition_tokens = crate::search::tokenize(&segments[right + 1]).len();
+            if token_count + addition_tokens <= max_tokens {
+                right += 1;
+                token_count += addition_tokens;
+                expanded = true;
+            }
+        }
+
+        // Try expanding left
+        if left > 0 {
+            let addition_tokens = crate::search::tokenize(&segments[left - 1]).len();
+            if token_count + addition_tokens <= max_tokens {
+                left -= 1;
+                token_count += addition_tokens;
+                expanded = true;
+            }
+        }
+    }
+
+    for segment in segments.iter().skip(left).take(right - left + 1) {
+        if !snippet.is_empty() {
+            snippet.push(' ');
+        }
+        snippet.push_str(segment.trim());
+    }
+
+    if snippet.is_empty() {
+        return preview_content(content, max_tokens * 4);
+    }
+
+    snippet
+}
+
+/// Extract the file path from an entity ID.
+/// Entity IDs are formatted as "file_path::name" or "file_path:name".
+fn extract_path(id: &str) -> &str {
+    if let Some(pos) = id.rfind("::") {
+        &id[..pos]
+    } else if let Some(pos) = id.rfind(':') {
+        &id[..pos]
+    } else {
+        id
+    }
+}
+
+/// Compute path similarity between two entity paths.
+/// 1.0 if identical, 0.5 if same directory, 0.0 otherwise.
+fn path_similarity(a: &str, b: &str) -> f32 {
+    if a == b {
+        return 1.0;
+    }
+    let a_dir = a.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let b_dir = b.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    if a_dir == b_dir && !a_dir.is_empty() {
+        return 0.5;
+    }
+    0.0
+}
+
+/// Apply Maximal Marginal Relevance re-ranking to search results.
+///
+/// Balances relevance score with diversity by penalizing results
+/// from the same file as already-selected results.
+fn apply_mmr(ranked: &mut Vec<(String, f32)>, lambda: f32) {
+    if ranked.len() <= 1 || lambda >= 1.0 {
+        return;
+    }
+
+    // Normalize scores to [0, 1]
+    let max_score = ranked.iter().map(|(_, s)| *s).fold(0.0f32, f32::max).max(1e-9);
+    for (_, s) in ranked.iter_mut() {
+        *s /= max_score;
+    }
+
+    let mut selected: Vec<(String, f32)> = Vec::new();
+    let mut remaining: Vec<(String, f32)> = ranked.drain(..).collect();
+
+    while !remaining.is_empty() {
+        let mut best_idx = 0;
+        let mut best_mmr = f32::NEG_INFINITY;
+
+        for (i, (id, rel)) in remaining.iter().enumerate() {
+            let candidate_path = extract_path(id);
+            let max_sim = selected
+                .iter()
+                .map(|(sel_id, _)| path_similarity(candidate_path, extract_path(sel_id)))
+                .fold(0.0f32, f32::max);
+
+            let mmr = lambda * rel - (1.0 - lambda) * max_sim;
+            if mmr > best_mmr {
+                best_mmr = mmr;
+                best_idx = i;
+            }
+        }
+
+        selected.push(remaining.remove(best_idx));
+    }
+
+    *ranked = selected;
+}
+
 fn handle_search(
     state: &AppState,
     params: &serde_json::Value,
@@ -478,15 +953,32 @@ fn handle_search(
     })?;
 
     let top_k = request.top_k.unwrap_or(10);
+
+    // ── Reciprocal Rank Fusion (RRF) ──────────────────────────────────────
+    //
+    // Instead of naively adding BM25 * 0.1 + cosine_sim (which is fragile
+    // because BM25 scores are unbounded), we use RRF: each retrieval system
+    // produces a ranked list, and we fuse them by summing reciprocal ranks:
+    //
+    //   rrf_score(d) = Σ  1 / (k + rank_i(d))
+    //
+    // where k = 60 (the standard constant from the original RRF paper) and
+    // rank_i(d) is the 1-based rank of document d in system i's result list.
+    //
+    // RRF is robust because it only depends on rank position, not on the
+    // magnitude or distribution of raw scores — no normalization needed.
+    const RRF_K: f32 = 60.0;
     let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
 
-    // 1. BM25 keyword search
+    // 1. BM25 keyword search (field-level: name, content, doc)
     {
         let bm25 = state.bm25.read().unwrap();
-        let bm25_results = bm25.search(&request.text, top_k * 2);
-        for (id, score) in bm25_results {
-            // Normalize BM25 score roughly (just an approximation for hybrid merge)
-            scores.insert(id, score * 0.1);
+        // Fetch a larger candidate pool for RRF — rank position matters,
+        // not score magnitude, so more candidates improve fusion quality.
+        let bm25_results = bm25.search(&request.text, top_k.saturating_mul(5).max(50));
+        for (rank, (id, _)) in bm25_results.iter().enumerate() {
+            let rrf_score = 1.0 / (RRF_K + (rank + 1) as f32);
+            *scores.entry(id.clone()).or_insert(0.0) += rrf_score;
         }
     }
 
@@ -500,24 +992,47 @@ fn handle_search(
                 .unwrap_or_default()
                 .as_secs();
 
-            for node in engine.all_nodes() {
-                if let Some(ref embeddings) = node.embedding {
-                    // Take the best (max) similarity across all chunk embeddings
-                    let best_sim = embeddings.iter()
-                        .map(|emb| crate::embedding::cosine_similarity(&query_embedding, emb))
-                        .fold(0.0f32, f32::max);
-                    
-                    let mut sim = best_sim;
-                    
-                    // Apply temporal decay for scratchpads
-                    if let NodeLabel::Scratchpad { created_at } = node.label {
-                        let decay = crate::embedding::decay_weight(created_at, current_time);
-                        sim *= decay;
-                    }
-                    
-                    // Combine with BM25 score if it exists
-                    *scores.entry(node.id.clone()).or_insert(0.0) += sim;
+            // Dense semantic search via ANN index (Spec #1)
+            // Replaces the O(n) linear scan over all graph nodes with an indexed lookup.
+            // The ANN index stores flattened chunk vectors with composite keys.
+            // We retrieve top candidates, group by node_id (taking max sim across chunks),
+            // and apply temporal decay for scratchpads.
+            let pool = top_k.saturating_mul(5).max(50);
+            let ann = state.ann.read().unwrap();
+            let ann_results = ann.search(&query_embedding, pool);
+
+            // Group by node_id, take max similarity across chunks
+            let mut sem_scores: HashMap<String, f32> = HashMap::new();
+            for (ann_key, sim) in &ann_results {
+                if let Some((node_id, _chunk_idx)) = ann.resolve_key(ann_key) {
+                    let current = sem_scores.get(node_id).copied().unwrap_or(f32::NEG_INFINITY);
+                    sem_scores.insert(node_id.clone(), current.max(*sim));
                 }
+            }
+
+            // Apply temporal decay for scratchpads and build ranked list
+            let mut sem_ranked: Vec<(String, f32)> = sem_scores
+                .into_iter()
+                .map(|(id, mut sim)| {
+                    if let Some(node) = engine.get_node(&id) {
+                        if let NodeLabel::Scratchpad { created_at } = node.label {
+                            let decay = crate::embedding::decay_weight(created_at, current_time);
+                            sim *= decay;
+                        }
+                    }
+                    (id, sim)
+                })
+                .collect();
+
+            // Sort by similarity descending to produce ranked list for RRF
+            sem_ranked.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Contribute RRF scores from semantic ranking
+            for (rank, (id, _)) in sem_ranked.iter().enumerate() {
+                let rrf_score = 1.0 / (RRF_K + (rank + 1) as f32);
+                *scores.entry(id.clone()).or_insert(0.0) += rrf_score;
             }
         }
     }
@@ -582,10 +1097,29 @@ fn handle_search(
         })
         .collect();
 
-    let limited: Vec<(String, f32)> = filtered.into_iter().take(top_k).collect();
+    let mut limited: Vec<(String, f32)> = filtered.into_iter().take(top_k).collect();
+
+    // Apply MMR re-ranking if requested
+    if let Some(lambda) = request.diversity_lambda {
+        if (0.0..1.0).contains(&lambda) {
+            apply_mmr(&mut limited, lambda);
+        }
+    }
 
     // Resolve retrieval mode (default: Full)
     let retrieval = request.retrieval.unwrap_or_default();
+
+    // Determine whether to use the structured response shape
+    let has_traverse = request.traverse.is_some();
+    let has_snippet = request.snippet.is_some();
+    let structured_response = has_traverse || has_snippet;
+
+    // Resolve graph traversals for top-N results if requested
+    let traversals: HashMap<String, SearchTraversal> = if let Some(ref trav) = request.traverse {
+        resolve_traversals(&engine, &limited, trav)
+    } else {
+        HashMap::new()
+    };
 
     // Build result payloads
     let results: Vec<serde_json::Value> = limited
@@ -612,7 +1146,7 @@ fn handle_search(
 
                 let line = extract_line(node);
 
-                serde_json::json!({
+                let mut hit = serde_json::json!({
                     "id": node.id,
                     "name": node.name,
                     "score": score,
@@ -621,12 +1155,30 @@ fn handle_search(
                     "type": entity_type_str,
                     "path": file_path,
                     "category": category,
-                })
+                });
+
+                // Add snippet if requested
+                if has_snippet {
+                    hit["snippet"] = serde_json::json!(
+                        extract_snippet(&node.content, &request.text, 64)
+                    );
+                }
+
+                // Add traversal data if available for this result
+                if let Some(trav) = traversals.get(id) {
+                    hit["traversal"] = serde_json::json!(trav);
+                }
+
+                hit
             })
         })
         .collect();
 
-    Ok(serde_json::json!(results))
+    if structured_response {
+        Ok(serde_json::json!({ "results": results }))
+    } else {
+        Ok(serde_json::json!(results))
+    }
 }
 
 // ─── Reconciliation Handlers ────────────────────────────────────────────────
@@ -704,38 +1256,135 @@ fn handle_reconcile(
 
     let path = std::path::Path::new(&request.file_path);
 
-    // Lazily obtain (or start) an LSP server for the file's language.
-    // Returns an owned Arc so we can lock it without borrowing `state`.
-    let lsp_client_arc = get_or_create_lsp(state, path);
-
-    // Lock the client and hold the guard for the duration of reconcile_file.
-    let mut lsp_guard = lsp_client_arc.as_ref().map(|arc| arc.lock().unwrap());
-    let lsp_dyn: Option<&mut dyn crate::lsp_adapter::LspAdapter> = match &mut lsp_guard {
-        Some(ref mut guard) => Some(&mut **guard),
-        None => None,
-    };
-
-    let mut events = {
+    // Phase 1 (Spec #2): Parse with tree-sitter, upsert entities, collect references.
+    // LSP is NOT passed here — references are collected for background resolution.
+    let (mut events, pending_refs) = {
         let engine = state.engine.read().unwrap();
-        crate::reconciler::reconcile_file(path, request.content.as_deref(), lsp_dyn, &engine)
+        crate::reconciler::reconcile_file(path, request.content.as_deref(), None, &engine)
     };
 
     // Compute embeddings for Entity UpsertNode events before persistence.
-    // This ensures embeddings are written to JSONL and loaded into MemoryNode.embedding.
+    // Uses embedding cache to skip ONNX inference for unchanged entities (Spec #3).
+    // Batch-embeds all cache misses in a single ONNX forward pass for efficiency.
     if let Some(ref embedder) = state.embedder {
-        for event in events.iter_mut() {
-            if let EventPayload::UpsertNode(ref mut payload) = event.payload {
-                if payload.label == "Entity" {
-                    let text = build_embedding_text_from_props(&payload.label, &payload.properties);
-                    if !text.is_empty() {
-                        // Use embed_chunked for all entity types — it falls back
-                        // to a single embedding for text under max_tokens.
-                        match embedder.embed_chunked(&text, 400, 50) {
-                            Ok(vectors) => {
-                                payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+        // Phase A: Check cache for all entities, collect texts that need embedding
+        // (cache misses). Reuse existing embeddings for cache hits.
+        let mut texts_to_embed: Vec<(usize, String, [u8; 32])> = Vec::new(); // (event_index, text, hash)
+        let mut event_indices: Vec<usize> = Vec::new();
+
+        {
+            let mut cache = state.embedding_cache.write().unwrap();
+            let engine = state.engine.read().unwrap();
+
+            for (idx, event) in events.iter().enumerate() {
+                if let EventPayload::UpsertNode(ref payload) = event.payload {
+                    if payload.label == "Entity" {
+                        let text = build_embedding_text_from_props(&payload.label, &payload.properties);
+                        if text.is_empty() { continue; }
+
+                        match cache.check_and_update(&payload.id, &text) {
+                            CacheResult::Unchanged => {
+                                // Hash matches — reuse existing embedding from the graph
+                                if let Some(node) = engine.get_node(&payload.id) {
+                                    if let Some(ref existing_embedding) = node.embedding {
+                                        // We'll set this in Phase B (need mutable access)
+                                        texts_to_embed.push((idx, String::new(), [0u8; 32])); // marker: reuse
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("Failed to compute embedding for {}: {}", payload.id, e);
+                            CacheResult::Changed(hash) => {
+                                // Text is new or changed — needs embedding
+                                texts_to_embed.push((idx, text, hash));
+                                event_indices.push(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase B: Batch-embed all cache misses in one ONNX forward pass
+        // Separate the texts that actually need embedding (non-empty text)
+        let embed_texts: Vec<&str> = texts_to_embed
+            .iter()
+            .filter(|(_, text, _)| !text.is_empty())
+            .map(|(_, text, _)| text.as_str())
+            .collect();
+
+        let batch_results = if !embed_texts.is_empty() {
+            embedder.embed_batch(&embed_texts)
+        } else {
+            Ok(Vec::new())
+        };
+
+        // Phase C: Assign results back to events
+        let mut batch_idx = 0;
+        let mut cache = state.embedding_cache.write().unwrap();
+
+        match batch_results {
+            Ok(embeddings) => {
+                for (event_idx, text, hash) in &texts_to_embed {
+                    if text.is_empty() {
+                        // Cache hit — reuse existing embedding from graph
+                        if let EventPayload::UpsertNode(ref payload) = events[*event_idx].payload {
+                            let engine = state.engine.read().unwrap();
+                            if let Some(node) = engine.get_node(&payload.id) {
+                                if let Some(ref existing) = node.embedding {
+                                    if let EventPayload::UpsertNode(ref mut payload) = events[*event_idx].payload {
+                                        payload.properties.insert(
+                                            "embedding".to_string(),
+                                            serde_json::to_value(existing).unwrap_or(serde_json::json!(null)),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Cache miss — use batched result
+                        if batch_idx < embeddings.len() {
+                            if let EventPayload::UpsertNode(ref mut payload) = events[*event_idx].payload {
+                                // embed_batch returns single vectors; for long text that needs chunking,
+                                // we need to use embed_chunked instead. Check if text needs chunking.
+                                let token_count = embedder.count_tokens(text);
+                                if token_count > 400 {
+                                    // Long text — fall back to embed_chunked for this entity
+                                    match embedder.embed_chunked(text, 400, 50) {
+                                        Ok(vectors) => {
+                                            payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+                                            cache.set_hash(&payload.id, *hash);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to compute chunked embedding for {}: {}", payload.id, e);
+                                        }
+                                    }
+                                } else {
+                                    // Short text — use batched result directly
+                                    payload.properties.insert(
+                                        "embedding".to_string(),
+                                        serde_json::json!(vec![embeddings[batch_idx].clone()]),
+                                    );
+                                    cache.set_hash(&payload.id, *hash);
+                                }
+                            }
+                        }
+                        batch_idx += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Batch embedding failed, falling back to per-entity: {}", e);
+                // Fallback: embed each text individually
+                for (event_idx, text, hash) in &texts_to_embed {
+                    if !text.is_empty() {
+                        if let EventPayload::UpsertNode(ref mut payload) = events[*event_idx].payload {
+                            match embedder.embed_chunked(text, 400, 50) {
+                                Ok(vectors) => {
+                                    payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+                                    cache.set_hash(&payload.id, *hash);
+                                }
+                                Err(e2) => {
+                                    eprintln!("Failed to compute embedding for {}: {}", payload.id, e2);
+                                }
                             }
                         }
                     }
@@ -795,11 +1444,20 @@ fn handle_reconcile(
                     
                     // Update BM25 index
                     if let Some(node) = engine.get_node(&payload.id) {
-                        let text = crate::rpc::build_bm25_text(node);
+                        let fields = crate::rpc::build_bm25_fields(node);
                         let mut bm25 = state.bm25.write().unwrap();
-                        bm25.remove_document(&payload.id);
-                        if !text.is_empty() {
-                            bm25.add_document(&payload.id, &text);
+                        if !fields.is_empty() {
+                            bm25.add_document(&payload.id, &fields);
+                        }
+                    }
+
+                    // Update ANN index (Spec #1)
+                    if let Some(node) = engine.get_node(&payload.id) {
+                        if let Some(ref embeddings) = node.embedding {
+                            if !embeddings.is_empty() {
+                                let mut ann = state.ann.write().unwrap();
+                                ann.add(&payload.id, embeddings);
+                            }
                         }
                     }
                 }
@@ -892,13 +1550,101 @@ fn handle_reconcile(
         }
     }
 
+    // ── Phase 2 (Spec #2): Queue pending references for background LSP resolution ──
+    // References are sent to a background worker via tokio channel.
+    // The worker resolves them via LSP and applies LinkNodes events asynchronously.
+    // This ensures reconcile returns immediately without blocking on LSP round-trips.
+    let edges_pending = pending_refs.len();
+    if edges_pending > 0 {
+        if let Some(ref tx) = state.ref_queue {
+            for pref in pending_refs {
+                let _ = tx.send(pref);  // Non-blocking — never blocks the caller
+            }
+        }
+    }
+
     Ok(serde_json::json!({
         "status": "ok",
-        "upserted_nodes": generated_ids
+        "upserted_nodes": generated_ids,
+        "edges_pending": edges_pending
     }))
 }
 
-// ─── Lifecycle Handlers ─────────────────────────────────────────────────────
+// ─── Background LSP Resolution (Spec #2) ────────────────────────────────────
+
+/// Resolve a single pending reference via LSP and apply the resulting edge.
+///
+/// Called by the background worker in main.rs via `spawn_blocking`.
+/// This function is synchronous and blocking — it locks the LSP client,
+/// calls `get_definition`, and applies the resulting `LinkNodes` event
+/// to storage and the memory graph.
+pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::PendingReference) {
+    use crate::reconciler::PendingReference;
+    use crate::lsp_adapter::LspAdapter;
+
+    let path = std::path::Path::new(&pref.source_file);
+
+    // 1. Get or create LSP client for the file's language
+    let lsp_arc = match get_or_create_lsp(state, path) {
+        Some(c) => c,
+        None => return,  // LSP not available for this language
+    };
+
+    // 2. Lock the LSP client
+    let mut lsp = lsp_arc.lock().unwrap();
+
+    // 3. Notify open (idempotent — LSP servers handle duplicate notifications)
+    let _ = lsp.notify_open(&pref.source_file_uri, &pref.content, &pref.language_id);
+
+    // 4. Resolve definition
+    let locations = match lsp.get_definition(&pref.source_file_uri, pref.line, pref.col) {
+        Ok(locs) => locs,
+        Err(_) => return,  // LSP failed — skip this reference
+    };
+    drop(lsp);  // Release LSP lock as early as possible
+
+    // 5. Create LinkNodes event(s)
+    if let Some(loc) = locations.first() {
+        let absolute_path = if let Some(stripped) = loc.uri.strip_prefix("file://") {
+            stripped.to_string()
+        } else {
+            loc.uri.clone()
+        };
+        let target_file_path = std::path::Path::new(&absolute_path)
+            .strip_prefix(std::env::current_dir().unwrap_or_default())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(absolute_path);
+        let target_id = format!("{}:{}", target_file_path, pref.ref_name);
+
+        let event = Event {
+            version: EVENT_VERSION,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            event_type: EventType::LinkNodes,
+            payload: EventPayload::LinkNodes(LinkNodesPayload {
+                from_id: pref.source_id,
+                to_id: target_id,
+                relationship: pref.ref_type,
+                properties: HashMap::new(),
+            }),
+        };
+
+        // 6. Persist + apply
+        {
+            let store = state.store.write().unwrap();
+            if let Err(e) = store.append(&event) {
+                eprintln!("Failed to append background LSP event: {}", e);
+                return;
+            }
+        }
+        let mut engine = state.engine.write().unwrap();
+        engine.apply_event(&event);
+    }
+}
+
+// ─── Lifecycle Handlers ────────────────────────────────────────────────────
 
 fn handle_initialize(
     _state: &AppState,
@@ -1005,43 +1751,51 @@ mod tests {
     }
 
     #[test]
-    fn test_bm25_text_function_with_content() {
+    fn test_bm25_fields_function_with_content() {
         let node = make_function_node(
             "embed_chunked",
             "pub fn embed_chunked(&self, text: &str, max_tokens: usize) -> Result<Vec<Vec<f32>>",
         );
-        let text = build_bm25_text(&node);
-        assert!(text.contains("embed_chunked"));
-        assert!(text.contains("max_tokens"));
-        assert!(text.contains("text"));
+        let fields = build_bm25_fields(&node);
+        // Name field should contain the function name
+        assert_eq!(fields.get("name"), Some(&"embed_chunked".to_string()));
+        // Content field should contain the source text
+        let content = fields.get("content").expect("content field should exist");
+        assert!(content.contains("embed_chunked"));
+        assert!(content.contains("max_tokens"));
+        assert!(content.contains("text"));
     }
 
     #[test]
-    fn test_bm25_text_function_empty_content() {
+    fn test_bm25_fields_function_empty_content() {
         let node = make_function_node("simple", "");
-        let text = build_bm25_text(&node);
-        // Should fall back to just the name
-        assert_eq!(text, "simple");
+        let fields = build_bm25_fields(&node);
+        // Should have only the name field
+        assert_eq!(fields.get("name"), Some(&"simple".to_string()));
+        assert!(!fields.contains_key("content"));
     }
 
     #[test]
-    fn test_bm25_text_class_with_content() {
+    fn test_bm25_fields_class_with_content() {
         let node = make_class_node(
             "EmbeddingModel",
             "pub struct EmbeddingModel { session: Mutex<Session> }",
         );
-        let text = build_bm25_text(&node);
-        assert!(text.contains("EmbeddingModel"));
-        assert!(text.contains("session"));
-        assert!(text.contains("Mutex"));
+        let fields = build_bm25_fields(&node);
+        assert_eq!(fields.get("name"), Some(&"EmbeddingModel".to_string()));
+        let content = fields.get("content").expect("content field should exist");
+        assert!(content.contains("EmbeddingModel"));
+        assert!(content.contains("session"));
+        assert!(content.contains("Mutex"));
     }
 
     #[test]
-    fn test_bm25_text_file_entity_no_content() {
+    fn test_bm25_fields_file_entity_no_content() {
         let node = make_file_node("test.rs");
-        let text = build_bm25_text(&node);
-        // File entities don't have content; should return just name
-        assert_eq!(text, "test.rs");
+        let fields = build_bm25_fields(&node);
+        // File entities don't have content; should have only the name field
+        assert_eq!(fields.get("name"), Some(&"test.rs".to_string()));
+        assert!(!fields.contains_key("content"));
     }
 
     // ── 7.3 Embedding Text ─────────────────────────────────────────────
@@ -1208,5 +1962,519 @@ mod tests {
         let node = make_function_node("test", "content");
         let line = extract_line(&node);
         assert_eq!(line, None);
+    }
+
+    // ── Traversal Resolution Tests ───────────────────────────────────────
+
+    #[test]
+    fn test_entity_type_string_entity() {
+        let label = NodeLabel::Entity {
+            entity_type: "Function".to_string(),
+            status: "active".to_string(),
+            last_modified: 0,
+        };
+        assert_eq!(entity_type_string(&label), "Function");
+    }
+
+    #[test]
+    fn test_entity_type_string_workspace() {
+        let label = NodeLabel::Workspace {
+            description: "test".to_string(),
+            status: "active".to_string(),
+            closed_at: None,
+        };
+        assert_eq!(entity_type_string(&label), "Workspace");
+    }
+
+    #[test]
+    fn test_entity_type_string_scratchpad() {
+        let label = NodeLabel::Scratchpad { created_at: 0 };
+        assert_eq!(entity_type_string(&label), "Scratchpad");
+    }
+
+    // ── Snippet Extraction Tests ────────────────────────────────────────
+
+    #[test]
+    fn test_extract_snippet_empty_content() {
+        let result = extract_snippet("", "query", 64);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_snippet_empty_query() {
+        let content = "some content here without any query match";
+        let result = extract_snippet(content, "", 64);
+        // Empty query falls back to preview
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_snippet_code_matches_query() {
+        let content = "pub fn embed_chunked(&self, text: &str, max_tokens: usize, overlap_tokens: usize) -> Result<Vec<Vec<f32>>> {\n    let total_tokens = self.count_tokens(text);\n    if total_tokens <= max_tokens {\n        return Ok(vec![self.embed(text)?]);\n    }\n}";
+        let result = extract_snippet(content, "max_tokens overlap_tokens", 64);
+        // Should find the line containing max_tokens and overlap_tokens
+        assert!(result.contains("max_tokens"));
+        assert!(result.contains("overlap_tokens"));
+    }
+
+    #[test]
+    fn test_extract_snippet_prose_matches_query() {
+        let content = "This is an introduction paragraph.\n\nThe function handles chunking with max_tokens. It splits on paragraph boundaries.\n\nThe overlap parameter controls context sharing.";
+        let result = extract_snippet(content, "chunking max_tokens", 64);
+        assert!(result.contains("chunking") || result.contains("max_tokens"));
+    }
+
+    #[test]
+    fn test_extract_snippet_no_match_returns_preview() {
+        let content = "completely unrelated text about nothing";
+        let result = extract_snippet(content, "nonexistent_query_terms", 64);
+        // No query tokens match any segment, best_score stays 0, best_idx stays 0
+        // Falls back to returning content from the first segment
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_split_for_snippet_code() {
+        let content = "line1\nline2\nline3";
+        let segments = split_for_snippet(content);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], "line1");
+    }
+
+    #[test]
+    fn test_split_for_snippet_prose() {
+        let content = "First sentence. Second sentence.\n\nThird paragraph here.";
+        let segments = split_for_snippet(content);
+        // Splits on sentence boundaries within paragraphs
+        assert!(segments.len() >= 3);
+        assert!(segments[0].contains("First sentence"));
+    }
+
+    // ── MMR Tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mmr_no_change_with_lambda_one() {
+        let mut ranked = vec![
+            ("a.rs::foo".to_string(), 0.9),
+            ("a.rs::bar".to_string(), 0.8),
+            ("b.rs::baz".to_string(), 0.7),
+        ];
+        let original = ranked.clone();
+        apply_mmr(&mut ranked, 1.0);
+        assert_eq!(ranked, original);
+    }
+
+    #[test]
+    fn test_mmr_single_result_noop() {
+        let mut ranked = vec![("a.rs::foo".to_string(), 0.9)];
+        apply_mmr(&mut ranked, 0.5);
+        assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn test_mmr_diversifies_same_file() {
+        let mut ranked = vec![
+            ("a.rs::foo".to_string(), 0.9),
+            ("a.rs::bar".to_string(), 0.85),
+            ("a.rs::baz".to_string(), 0.8),
+            ("b.rs::qux".to_string(), 0.75),
+        ];
+        apply_mmr(&mut ranked, 0.5);
+        // First result is always pure relevance
+        assert_eq!(ranked[0].0, "a.rs::foo");
+        // With diversity, b.rs::qux should be promoted (different file)
+        let top3: Vec<&str> = ranked.iter().take(3).map(|(id, _)| id.as_str()).collect();
+        assert!(top3.contains(&"b.rs::qux"), "b.rs::qux should be in top 3 with diversity");
+    }
+
+    #[test]
+    fn test_mmr_pure_diversity_maximally_spreads() {
+        let mut ranked = vec![
+            ("a.rs::foo".to_string(), 0.9),
+            ("a.rs::bar".to_string(), 0.8),
+            ("b.rs::baz".to_string(), 0.7),
+        ];
+        apply_mmr(&mut ranked, 0.0);
+        // First is always pure relevance
+        assert_eq!(ranked[0].0, "a.rs::foo");
+        // Second should be from a different file (b.rs::baz)
+        assert_eq!(ranked[1].0, "b.rs::baz");
+    }
+
+    // ── Path Similarity Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_path_similarity_identical() {
+        assert_eq!(path_similarity("src/foo.rs", "src/foo.rs"), 1.0);
+    }
+
+    #[test]
+    fn test_path_similarity_same_dir() {
+        assert_eq!(path_similarity("src/foo.rs", "src/bar.rs"), 0.5);
+    }
+
+    #[test]
+    fn test_path_similarity_different_dir() {
+        assert_eq!(path_similarity("src/foo.rs", "lib/bar.rs"), 0.0);
+    }
+
+    #[test]
+    fn test_path_similarity_no_dir() {
+        assert_eq!(path_similarity("foo.rs", "bar.rs"), 0.0);
+    }
+
+    #[test]
+    fn test_extract_path_double_colon() {
+        assert_eq!(extract_path("src-rust/src/rpc.rs::handle_search"), "src-rust/src/rpc.rs");
+    }
+
+    #[test]
+    fn test_extract_path_single_colon() {
+        assert_eq!(extract_path("README.md:Architecture"), "README.md");
+    }
+
+    #[test]
+    fn test_extract_path_no_colon() {
+        assert_eq!(extract_path("some-workspace"), "some-workspace");
+    }
+
+    // ── 7.4 RRF Fusion Tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_rrf_fusion_basic() {
+        // Simulate RRF fusion: two ranked lists with overlapping results.
+        let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        const RRF_K: f32 = 60.0;
+
+        let bm25_results = vec![
+            ("doc_a".to_string(), 10.0),
+            ("doc_b".to_string(), 5.0),
+            ("doc_c".to_string(), 1.0),
+        ];
+        for (rank, (id, _)) in bm25_results.iter().enumerate() {
+            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f32);
+        }
+
+        let sem_results = vec![
+            ("doc_b".to_string(), 0.9),
+            ("doc_a".to_string(), 0.8),
+            ("doc_d".to_string(), 0.7),
+        ];
+        for (rank, (id, _)) in sem_results.iter().enumerate() {
+            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f32);
+        }
+
+        // doc_a: rank 1 in BM25 + rank 2 in semantic = 1/61 + 1/62
+        // doc_b: rank 2 in BM25 + rank 1 in semantic = 1/62 + 1/61
+        // Should be equal (both at rank 1 and 2 across lists)
+        let score_a = scores.get("doc_a").copied().unwrap_or(0.0);
+        let score_b = scores.get("doc_b").copied().unwrap_or(0.0);
+        assert!((score_a - score_b).abs() < 1e-10);
+
+        let score_c = scores.get("doc_c").copied().unwrap_or(0.0);
+        assert!(score_a > score_c, "doc_a should outrank doc_c");
+
+        // doc_d (only in semantic at rank 3) gets same RRF as doc_c (only in BM25 at rank 3)
+        let score_d = scores.get("doc_d").copied().unwrap_or(0.0);
+        assert!((score_c - score_d).abs() < 1e-10, "doc_c and doc_d should have equal RRF scores");
+    }
+
+    #[test]
+    fn test_rrf_score_range() {
+        let rrf_max = 1.0 / 61.0;
+        let combined_max = 2.0 * rrf_max;
+        assert!(combined_max < 0.04, "RRF scores should be small and bounded");
+        assert!(combined_max > 0.0, "RRF scores should be positive");
+    }
+
+    // ── 7.5 Field-Level BM25 Integration Tests ─────────────────────────
+
+    #[test]
+    fn test_field_level_bm25_name_boost() {
+        use crate::search::BM25FieldIndex;
+        let mut index = BM25FieldIndex::new();
+
+        let mut f1 = HashMap::new();
+        f1.insert("name".to_string(), "search".to_string());
+        f1.insert("content".to_string(), "performs a linear scan across all nodes".to_string());
+        index.add_document("fn1", &f1);
+
+        let mut f2 = HashMap::new();
+        f2.insert("name".to_string(), "linearScan".to_string());
+        f2.insert("content".to_string(), "search search search search search".to_string());
+        index.add_document("fn2", &f2);
+
+        let results = index.search("search", 10);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, "fn1", "name match should outrank repeated content match");
+    }
+
+    #[test]
+    fn test_field_level_bm25_doc_comment_boost() {
+        use crate::search::BM25FieldIndex;
+        let mut index = BM25FieldIndex::new();
+
+        // Add filler docs so corpus statistics are realistic (avoids
+        // degenerate IDF when a field index has only 1 document).
+        for i in 0..5 {
+            let mut f = HashMap::new();
+            f.insert("name".to_string(), format!("func{}", i));
+            f.insert("content".to_string(), format!("does thing number {}", i));
+            f.insert("doc".to_string(), "Unrelated documentation".to_string());
+            index.add_document(&format!("filler{}", i), &f);
+        }
+
+        // fn1: has "search" in doc field (1 of 6 docs in doc index)
+        let mut f1 = HashMap::new();
+        f1.insert("name".to_string(), "doScan".to_string());
+        f1.insert("content".to_string(), "let x = 1; let y = 2;".to_string());
+        f1.insert("doc".to_string(), "Searches the index for matching terms".to_string());
+        index.add_document("fn1", &f1);
+
+        // fn2: has "search" only in content (1 of 7 docs in content index)
+        let mut f2 = HashMap::new();
+        f2.insert("name".to_string(), "otherFunc".to_string());
+        f2.insert("content".to_string(), "search and replace".to_string());
+        index.add_document("fn2", &f2);
+
+        let results = index.search("search", 10);
+        assert!(!results.is_empty());
+        // With realistic corpus stats, doc match (weight 2.0) should beat
+        // single content match (weight 1.0)
+        assert_eq!(results[0].0, "fn1", "docComment match should outrank single content match");
+    }
+
+    // ── Embedding Cache Tests (Spec #3) ───────────────────────────────
+
+    #[test]
+    fn test_embedding_cache_new_is_empty() {
+        let cache = EmbeddingCache::new();
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_embedding_cache_first_check_is_changed() {
+        let mut cache = EmbeddingCache::new();
+        let result = cache.check_and_update("entity1", "some text");
+        assert!(matches!(result, CacheResult::Changed(_)));
+    }
+
+    #[test]
+    fn test_embedding_cache_same_text_is_unchanged() {
+        let mut cache = EmbeddingCache::new();
+        let result = cache.check_and_update("entity1", "some text");
+        if let CacheResult::Changed(hash) = result {
+            cache.set_hash("entity1", hash);
+        }
+        // Check again with the same text — should be Unchanged
+        let result2 = cache.check_and_update("entity1", "some text");
+        assert!(matches!(result2, CacheResult::Unchanged));
+    }
+
+    #[test]
+    fn test_embedding_cache_different_text_is_changed() {
+        let mut cache = EmbeddingCache::new();
+        let result = cache.check_and_update("entity1", "some text");
+        if let CacheResult::Changed(hash) = result {
+            cache.set_hash("entity1", hash);
+        }
+        // Different text — should be Changed
+        let result2 = cache.check_and_update("entity1", "different text");
+        assert!(matches!(result2, CacheResult::Changed(_)));
+    }
+
+    #[test]
+    fn test_embedding_cache_name_change_detected() {
+        // Even if body is the same, changing the name changes the embedding text
+        // (since embedding text = "{name} {content}")
+        let mut cache = EmbeddingCache::new();
+        let text1 = "old_name function body here";
+        let result = cache.check_and_update("file:old_name", text1);
+        if let CacheResult::Changed(hash) = result {
+            cache.set_hash("file:old_name", hash);
+        }
+        // Same body, different name in the text
+        let text2 = "new_name function body here";
+        let result2 = cache.check_and_update("file:new_name", text2);
+        assert!(matches!(result2, CacheResult::Changed(_)));
+    }
+
+    #[test]
+    fn test_embedding_cache_remove() {
+        let mut cache = EmbeddingCache::new();
+        let result = cache.check_and_update("entity1", "text");
+        if let CacheResult::Changed(hash) = result {
+            cache.set_hash("entity1", hash);
+        }
+        assert_eq!(cache.len(), 1);
+        cache.remove("entity1");
+        assert_eq!(cache.len(), 0);
+        // After removal, the same text should be Changed again
+        let result2 = cache.check_and_update("entity1", "text");
+        assert!(matches!(result2, CacheResult::Changed(_)));
+    }
+
+    #[test]
+    fn test_embedding_cache_independent_entities() {
+        let mut cache = EmbeddingCache::new();
+        let r1 = cache.check_and_update("e1", "text a");
+        if let CacheResult::Changed(h) = r1 { cache.set_hash("e1", h); }
+        let r2 = cache.check_and_update("e2", "text b");
+        if let CacheResult::Changed(h) = r2 { cache.set_hash("e2", h); }
+        assert_eq!(cache.len(), 2);
+        // Both should be Unchanged on re-check
+        assert!(matches!(cache.check_and_update("e1", "text a"), CacheResult::Unchanged));
+        assert!(matches!(cache.check_and_update("e2", "text b"), CacheResult::Unchanged));
+    }
+
+    #[test]
+    fn test_embedding_cache_hash_deterministic() {
+        // Same text always produces the same hash
+        let h1 = EmbeddingCache::hash_text("hello world");
+        let h2 = EmbeddingCache::hash_text("hello world");
+        assert_eq!(h1, h2);
+        // Different text produces different hash
+        let h3 = EmbeddingCache::hash_text("hello earth");
+        assert_ne!(h1, h3);
+    }
+
+    // ── build_embedding_text_from_node Tests (Spec #3) ─────────────────
+
+    #[test]
+    fn test_build_embedding_text_from_node_function() {
+        let node = make_function_node("embed_chunked", "pub fn embed_chunked(&self, text: &str)");
+        let text = build_embedding_text_from_node(&node);
+        assert!(text.starts_with("embed_chunked"));
+        assert!(text.contains("pub fn embed_chunked"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_function_empty_content() {
+        let node = make_function_node("simple", "");
+        let text = build_embedding_text_from_node(&node);
+        assert_eq!(text, "simple");
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_class() {
+        let node = make_class_node("MyClass", "class MyClass { method() {} }");
+        let text = build_embedding_text_from_node(&node);
+        assert!(text.starts_with("MyClass"));
+        assert!(text.contains("method"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_file_entity() {
+        let node = make_file_node("test.rs");
+        let text = build_embedding_text_from_node(&node);
+        assert_eq!(text, "test.rs");
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_file_with_doccomment() {
+        let mut node = make_file_node("test.rs");
+        node.metadata = serde_json::json!({"docComment": "Handles authentication."}).to_string();
+        let text = build_embedding_text_from_node(&node);
+        assert!(text.contains("test.rs"));
+        assert!(text.contains("authentication"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_section() {
+        let node = MemoryNode {
+            id: "doc.md:Architecture".to_string(),
+            label: NodeLabel::Entity {
+                entity_type: "Section".to_string(),
+                status: "active".to_string(),
+                last_modified: 0,
+            },
+            name: "Architecture".to_string(),
+            content: "The system uses a reconciler pattern.".to_string(),
+            metadata: String::new(),
+            embedding: None,
+        };
+        let text = build_embedding_text_from_node(&node);
+        assert!(text.starts_with("Architecture"));
+        assert!(text.contains("reconciler"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_workspace() {
+        let node = MemoryNode {
+            id: "ws-1".to_string(),
+            label: NodeLabel::Workspace {
+                description: "Fix auth flow".to_string(),
+                status: "active".to_string(),
+                closed_at: None,
+            },
+            name: "auth-fix".to_string(),
+            content: String::new(),
+            metadata: String::new(),
+            embedding: None,
+        };
+        let text = build_embedding_text_from_node(&node);
+        assert!(text.contains("auth-fix"));
+        assert!(text.contains("Fix auth flow"));
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_scratchpad() {
+        let node = MemoryNode {
+            id: "sp-1".to_string(),
+            label: NodeLabel::Scratchpad { created_at: 0 },
+            name: "notes".to_string(),
+            content: "Decided to use JWT".to_string(),
+            metadata: String::new(),
+            embedding: None,
+        };
+        let text = build_embedding_text_from_node(&node);
+        assert_eq!(text, "Decided to use JWT");
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_matches_props_for_function() {
+        // Verify that build_embedding_text_from_node and build_embedding_text_from_props
+        // produce identical output for the same entity — this is critical for cache correctness.
+        let name = "embed_chunked";
+        let content = "pub fn embed_chunked(&self, text: &str, max_tokens: usize) -> Vec<Vec<f32>>";
+
+        let node = make_function_node(name, content);
+        let text_from_node = build_embedding_text_from_node(&node);
+
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+        props.insert("entity_type".to_string(), serde_json::Value::String("Function".to_string()));
+        props.insert("content".to_string(), serde_json::Value::String(content.to_string()));
+        let text_from_props = build_embedding_text_from_props("Entity", &props);
+
+        assert_eq!(text_from_node, text_from_props, "build_embedding_text_from_node must match build_embedding_text_from_props");
+    }
+
+    #[test]
+    fn test_build_embedding_text_from_node_matches_props_for_file_with_doccomment() {
+        let doc_comment = "This file handles authentication.";
+        let metadata = serde_json::json!({"docComment": doc_comment}).to_string();
+
+        let node = MemoryNode {
+            id: "test.rs".to_string(),
+            label: NodeLabel::Entity {
+                entity_type: "File".to_string(),
+                status: "active".to_string(),
+                last_modified: 0,
+            },
+            name: "test.rs".to_string(),
+            content: String::new(),
+            metadata: metadata.clone(),
+            embedding: None,
+        };
+        let text_from_node = build_embedding_text_from_node(&node);
+
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), serde_json::Value::String("test.rs".to_string()));
+        props.insert("entity_type".to_string(), serde_json::Value::String("File".to_string()));
+        props.insert("metadata".to_string(), serde_json::Value::String(metadata));
+        let text_from_props = build_embedding_text_from_props("Entity", &props);
+
+        assert_eq!(text_from_node, text_from_props, "File entity embedding text must match");
     }
 }

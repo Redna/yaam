@@ -12,7 +12,8 @@
       "./index.ts"
     ],
     "skills": [
-      "./skills/yaam-memory-manager"
+      "./skills/yaam-memory-manager",
+      "./skills/yaam-code-discovery"
     ]
   },
   "scripts": {

@@ -3,6 +3,7 @@ import * as net from 'node:net';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 export interface RpcRequest {
   jsonrpc: "2.0";
@@ -57,8 +58,15 @@ export class YaamEngineClient {
 
     // Spawn new daemon
     // Starting YAAM daemon in the background
-    const cargoTomlPath = path.resolve(process.cwd(), 'src-rust', 'Cargo.toml');
-    const binPath = path.resolve(process.cwd(), 'src-rust', 'target', 'release', 'yaam-engine');
+    //
+    // The Rust daemon binary lives inside the YAAM extension install directory,
+    // NOT the user's current project. Resolve it relative to this extension file
+    // (via import.meta.url) so the daemon can be launched from any project cwd.
+    // The port file and events.jsonl remain project-scoped (process.cwd()).
+    const extDir = path.dirname(fileURLToPath(import.meta.url)); // .../yaam/src
+    const yaamRoot = path.resolve(extDir, '..');                  // .../yaam
+    const cargoTomlPath = path.resolve(yaamRoot, 'src-rust', 'Cargo.toml');
+    const binPath = path.resolve(yaamRoot, 'src-rust', 'target', 'release', 'yaam-engine');
 
     if (fs.existsSync(binPath)) {
       spawn(binPath, [this.eventsPath], {
@@ -75,7 +83,7 @@ export class YaamEngineClient {
 
     // Wait for the port file to be written
     let retries = 0;
-    while (retries < 50) { // 5 seconds max
+    while (retries < 300) { // 30 seconds max (model load + event replay headroom)
       if (fs.existsSync(portFilePath)) {
         const portStr = fs.readFileSync(portFilePath, 'utf-8').trim();
         const port = parseInt(portStr, 10);
@@ -227,7 +235,19 @@ export class YaamEngineClient {
       id,
     };
 
-    this.pendingRequests.set(id, { resolve, reject });
+    // Timeout: if the daemon doesn't respond within 30s, reject the promise.
+    // This prevents the agent from hanging forever if the daemon panics or
+    // an LSP server deadlocks.
+    const timeoutHandle = setTimeout(() => {
+      if (this.pendingRequests.delete(id)) {
+        reject(new Error(`RPC '${method}' timed out after 30s`));
+      }
+    }, 30000);
+
+    this.pendingRequests.set(id, {
+      resolve: (res: any) => { clearTimeout(timeoutHandle); resolve(res); },
+      reject: (err: any) => { clearTimeout(timeoutHandle); reject(err); },
+    });
     this.socket.write(JSON.stringify(request) + '\n');
   }
 
@@ -253,7 +273,7 @@ export class YaamEngineClient {
     return this.call('query', dsl);
   }
 
-  public async search(payload: { text: string; top_k?: number; workspace?: string; entity_types?: string[]; include_paths?: string[]; exclude_paths?: string[] }): Promise<any[]> {
+  public async search(payload: { text: string; top_k?: number; workspace?: string; entity_types?: string[]; include_paths?: string[]; exclude_paths?: string[]; traverse?: { relationship?: string[]; direction?: string; resolve_top_k?: number }; snippet?: string; diversity_lambda?: number }): Promise<any> {
     return this.call('search', payload);
   }
 

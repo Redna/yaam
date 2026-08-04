@@ -317,8 +317,90 @@ pub struct SearchRequest {
     /// How much content to return per result. Default: Full.
     #[serde(default)]
     pub retrieval: Option<RetrievalMode>,
+
+    /// Optional: resolve graph relationships for the top-N search results.
+    /// When specified, the response is `{ "results": [...] }` instead of a
+    /// flat array, and each of the top `resolve_top_k` results includes a
+    /// `traversal` object with neighbor nodes.
+    #[serde(default)]
+    pub traverse: Option<SearchTraverseClause>,
+
+    /// Optional: extract a snippet (best-matching passage) from each result's
+    /// content. When specified, the response is `{ "results": [...] }`.
+    #[serde(default)]
+    pub snippet: Option<SnippetMode>,
+
+    /// Optional: MMR diversity lambda (0.0 = max diversity, 1.0 = max
+    /// relevance). When omitted, pure relevance ranking is used (backward
+    /// compatible).
+    #[serde(default)]
+    pub diversity_lambda: Option<f32>,
 }
 
 fn default_top_k() -> Option<usize> {
     Some(10)
+}
+
+/// Traversal spec for search results.
+///
+/// Applied to the top `resolve_top_k` search hits. Each hit's edges
+/// (filtered by relationship and direction) are returned as compact
+/// neighbor summaries — no content, no embeddings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchTraverseClause {
+    /// Relationship types to follow. If omitted, all relationships are included.
+    /// Examples: ["CALLS"], ["CALLS", "IMPORTS"], ["REFERENCES"]
+    #[serde(default)]
+    pub relationship: Option<Vec<String>>,
+
+    /// Direction: "outbound" (default), "inbound", or "both".
+    #[serde(default = "default_traverse_direction")]
+    pub direction: String,
+
+    /// How many of the top search results to resolve edges for.
+    /// Remaining results are returned as plain search hits (no edges).
+    /// Default: 3.
+    #[serde(default = "default_resolve_top_k")]
+    pub resolve_top_k: usize,
+}
+
+fn default_traverse_direction() -> String {
+    "both".to_string()
+}
+
+fn default_resolve_top_k() -> usize {
+    3
+}
+
+/// Controls snippet extraction in search results.
+///
+/// When enabled, each result includes a `snippet` field containing the
+/// passage from the entity's content that best matches the query.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SnippetMode {
+    /// Extract a snippet of approximately 64 tokens centered on the
+    /// highest-scoring sentence/line.
+    Auto,
+}
+
+/// A single neighbor node discovered via traversal from a search result.
+///
+/// Compact representation — only identity fields, no content or embeddings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeighborNode {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    pub relationship: String,
+    pub direction: String,
+}
+
+/// Traversal results for a single search hit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchTraversal {
+    /// The search result's entity ID (for correlation).
+    pub entity_id: String,
+    /// Neighbor nodes found via traversal.
+    pub neighbors: Vec<NeighborNode>,
 }

@@ -74,8 +74,8 @@ export default function yaamExtension(pi: ExtensionAPI) {
       if (wsRows.length > 0) {
         const ws = wsRows[0];
         parts.push(`Active workspace: ${ws.id}`);
-        if (ws.properties?.description) {
-          parts.push(`  Task: ${ws.properties.description}`);
+        if (ws.label?.description) {
+          parts.push(`  Task: ${ws.label.description}`);
         }
 
         // Fetch recent scratchpad notes
@@ -108,7 +108,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
     try {
       await engine.start();
       setStatus(ctx, "yaam", "Ready ✅");
-      reconciler.scheduleFull();
+      reconciler.scheduleFull().catch(() => {});
 
       // Phase 1: Send context IMMEDIATELY from the persisted graph.
       // The daemon already loaded everything from events.jsonl on startup,
@@ -182,7 +182,18 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
     if (["write", "edit", "bash", "read"].includes(toolName)) {
       startStatusPolling(ctx);
-      await trackAccessedFile(toolName, toolInput, engine, process.cwd());
+      // Fire workspace mapping in the background — does NOT block the agent.
+      // trackAccessedFile queries existing graph entities instead of
+      // performing a full reconcile, so it's lightweight. It waits for any
+      // ongoing reconciliation to finish before linking entities.
+      trackAccessedFile(toolName, toolInput, engine, process.cwd(), reconciler)
+        .catch(() => {});
+      // Queue the touched file for incremental reconciliation.
+      // - write/edit: queues the specific file via payload.path
+      // - bash: scans for mtime changes (can't know which files were touched)
+      // - read: scheduleIncremental ignores it (read-only, no changes)
+      // The hash check in runSync() ensures unchanged files are skipped.
+      reconciler.scheduleIncremental(toolName, toolInput);
     }
   });
 
@@ -274,10 +285,9 @@ EXAMPLES:
     }),
     async execute(_toolCallId, params) {
       try {
-        // Schedule a full reconcile to ensure topology is current (non-blocking)
-        reconciler.scheduleFull();
-
-        // Optimistic background save
+        // Optimistic background save — no full reconcile needed.
+        // The graph is already kept current by incremental syncs from
+        // tool_result hooks and the session_start full sync.
         initializeWorkspace(params.name, params.description, engine)
           .catch(e => {}); // Workspace init error suppressed
         
@@ -334,7 +344,7 @@ EXAMPLES:
     name: "yaam_search",
     label: "YAAM Hybrid Search",
     description:
-      `Performs a hybrid semantic + keyword search across the YAAM memory graph.\n\nCombines BM25 keyword matching with dense ONNX embeddings (gte-small) to find relevant code entities, workspaces, and scratchpad notes by natural language meaning — not just exact keyword matches.\n\nUse this when you need to find code by concept or behavior (e.g. "file reconciliation logic", "workspace tracking") rather than exact names. Results are ranked by combined BM25 + cosine similarity score.\n\nParameters:\n- text (required): Natural language or keyword query\n- top_k (optional): Max results to return (default: 10)\n- workspace (optional): Scope results to entities mapped to a specific workspace\n- entity_types (optional): Filter by entity type (e.g. ["Function", "Class", "File"]\n- include_paths (optional): Include only results whose path starts with one of these prefixes (e.g. ["src/"]\n- exclude_paths (optional): Exclude results whose path starts with one of these prefixes (e.g. ["node_modules/", ".venv/"]\n\nResults include a \"category\" field: "module" for project source code, "library" for dependencies.\nUse exclude_paths to scope searches to your own code.`,
+      `Performs a hybrid semantic + keyword search across the YAAM memory graph.\n\nCombines BM25 keyword matching with dense ONNX embeddings (gte-small) to find relevant code entities, workspaces, and scratchpad notes by natural language meaning — not just exact keyword matches.\n\nUse this when you need to find code by concept or behavior (e.g. "file reconciliation logic", "workspace tracking") rather than exact names. Results are ranked by combined BM25 + cosine similarity score.\n\nParameters:\n- text (required): Natural language or keyword query\n- top_k (optional): Max results to return (default: 10)\n- workspace (optional): Scope results to entities mapped to a specific workspace\n- entity_types (optional): Filter by entity type (e.g. ["Function", "Class", "File"]\n- include_paths (optional): Include only results whose path starts with one of these prefixes (e.g. ["src/"]\n- exclude_paths (optional): Exclude results whose path starts with one of these prefixes (e.g. ["node_modules/", ".venv/"]\n- traverse (optional): Resolve graph relationships for the top-N search results. Each of the top resolve_top_k (default: 3) results includes a "traversal" object with neighbor nodes (inbound/outbound edges). Neighbors contain only id, name, entity_type, relationship, and direction — no content.\n  - traverse.relationship (optional): Filter to specific edge types (e.g. ["CALLS", "IMPORTS"])\n  - traverse.direction (optional): "outbound", "inbound", or "both" (default: "both")\n  - traverse.resolve_top_k (optional): How many top results to resolve edges for (default: 3)\n- snippet (optional): Set to "auto" to extract the best-matching passage from each result's content as a "snippet" field\n- diversity_lambda (optional): MMR diversity lambda (0.0 = max diversity, 1.0 = max relevance). Default: 1.0 (pure relevance). Lower values reduce redundant results from the same file.\n\nWhen traverse or snippet is specified, the response is { "results": [...] } instead of a flat array. Each result may include:\n  - snippet: the best-matching passage from the entity's content\n  - traversal: { entity_id, neighbors: [{ id, name, entity_type, relationship, direction }] } for the top resolve_top_k results\n\nResults include a "category" field: "module" for project source code, "library" for dependencies.\nUse exclude_paths to scope searches to your own code.`,
     promptSnippet: "Search YAAM memory by semantic meaning + keywords",
     promptGuidelines: [
       "Use yaam_search for natural-language discovery of code entities and notes — it combines BM25 keyword search with dense semantic embeddings to find relevant nodes by meaning, not just exact text matches.",
@@ -346,17 +356,30 @@ EXAMPLES:
       entity_types: Type.Optional(Type.Array(Type.String(), { description: "Optional: filter results by entity type (e.g. [\"Function\", \"Class\"])." })),
       include_paths: Type.Optional(Type.Array(Type.String(), { description: "Optional: include only results whose path starts with one of these prefixes (e.g. [\"src/\"])." })),
       exclude_paths: Type.Optional(Type.Array(Type.String(), { description: "Optional: exclude results whose path starts with one of these prefixes (e.g. [\"node_modules/\", \".venv/\"])." })),
+      traverse: Type.Optional(Type.Object({
+        relationship: Type.Optional(Type.Array(Type.String(), { description: "Optional: filter to specific edge types (e.g. [\"CALLS\", \"IMPORTS\"]). If omitted, all relationships are included." })),
+        direction: Type.Optional(Type.String({ description: "Optional: 'outbound', 'inbound', or 'both' (default: 'both')." })),
+        resolve_top_k: Type.Optional(Type.Number({ description: "Optional: how many top results to resolve edges for (default: 3)." })),
+      }, { description: "Optional: resolve graph relationships for the top-N search results. Neighbors contain only id, name, entity_type, relationship, direction — no content." })),
+      snippet: Type.Optional(Type.String({ description: "Optional: set to 'auto' to extract the best-matching passage from each result's content as a 'snippet' field." })),
+      diversity_lambda: Type.Optional(Type.Number({ description: "Optional: MMR diversity lambda (0.0 = max diversity, 1.0 = max relevance). Default: 1.0 (pure relevance)." })),
     }),
     async execute(_toolCallId, params) {
       try {
-        const results = await engine.search({
+        const response = await engine.search({
           text: params.text,
           top_k: params.top_k,
           workspace: params.workspace,
           entity_types: params.entity_types,
           include_paths: params.include_paths,
           exclude_paths: params.exclude_paths,
+          traverse: params.traverse,
+          snippet: params.snippet,
+          diversity_lambda: params.diversity_lambda,
         });
+
+        // Response can be a flat array (backward compat) or { results: [...] }
+        const results: any[] = Array.isArray(response) ? response : (response?.results || []);
 
         if (!results || results.length === 0) {
           return {
@@ -365,9 +388,21 @@ EXAMPLES:
           };
         }
 
-        const formatted = results.map((r: any) =>
-          `[${r.type}] ${r.id} (score: ${typeof r.score === 'number' ? r.score.toFixed(4) : r.score})${r.name ? ' — ' + r.name : ''}${r.content ? '\n  ' + r.content.substring(0, 200) : ''}`
-        ).join('\n');
+        const formatted = results.map((r: any) => {
+          let line = `[${r.type}] ${r.id} (score: ${typeof r.score === 'number' ? r.score.toFixed(4) : r.score})${r.name ? ' — ' + r.name : ''}`;
+          if (r.snippet) {
+            line += `\n  snippet: ${r.snippet.substring(0, 300)}`;
+          } else if (r.content) {
+            line += `\n  ${r.content.substring(0, 200)}`;
+          }
+          if (r.traversal && r.traversal.neighbors && r.traversal.neighbors.length > 0) {
+            const neighbors = r.traversal.neighbors.map((n: any) =>
+              `    ${n.direction} ${n.relationship} → ${n.id} (${n.entity_type})`
+            ).join('\n');
+            line += `\n  traversal:\n${neighbors}`;
+          }
+          return line;
+        }).join('\n\n');
 
         return {
           content: [{ type: "text" as const, text: `Search results for "${params.text}":\n\n${formatted}` }],
@@ -407,8 +442,7 @@ EXAMPLES:
         });
 
         const wsRows = await engine.query({
-          match: { label: "Workspace" },
-          where: { field: "status", op: "eq", value: "active" }
+          match: { label: "Workspace", status: "active" }
         });
 
         const activeWs = wsRows.length > 0 ? wsRows[0].id : null;
@@ -416,9 +450,8 @@ EXAMPLES:
 
         if (activeWs) {
           notesRows = await engine.query({
-            match: { label: "Workspace" },
-            where: { field: "id", op: "eq", value: activeWs },
-            traverse: { relationship: "HAS_SCRATCHPAD", direction: "outbound" },
+            match: { label: "Workspace", id: activeWs },
+            traverse: { relationship: "HAS_SCRATCHPAD", direction: "outbound", max_depth: 1 },
             limit: 5
           });
         }
@@ -429,9 +462,8 @@ EXAMPLES:
         if (typeRows.length === 0) {
           output += "  (empty)\n";
         } else {
-          // The DSL aggregate returns an array of { group, value }
           for (const row of typeRows) {
-            output += `  ${row.group}: ${row.value}\n`;
+            output += `  ${row.type}: ${row.count}\n`;
           }
         }
 
@@ -441,7 +473,7 @@ EXAMPLES:
         } else {
           const ws = wsRows[0];
           output += `  Name: ${ws.id}\n`;
-          output += `  Description: ${ws.properties.description}\n`;
+          output += `  Description: ${ws.label?.description ?? '(no description)'}\n`;
         }
 
         output += "\n🗒️  Recent Notes:\n";
@@ -449,8 +481,8 @@ EXAMPLES:
           output += "  (none)\n";
         } else {
           for (const note of notesRows) {
-            const date = new Date(note.properties.created_at * 1000).toLocaleString();
-            const preview = note.properties.content.substring(0, 80);
+            const date = new Date((note.label?.created_at ?? 0) * 1000).toLocaleString();
+            const preview = (note.content || '').substring(0, 80);
             output += `  [${date}] ${preview}...\n`;
           }
         }

@@ -25,6 +25,33 @@ pub struct ParsedReference {
     pub enclosing_function_id: Option<String>, // ID of the function containing this reference
 }
 
+/// A reference extracted by tree-sitter that needs async LSP resolution (Spec #2).
+///
+/// When `reconcile_file` is called with `lsp: None`, references are collected
+/// into this struct instead of being resolved inline. The caller queues them
+/// for background LSP resolution via a tokio channel.
+#[derive(Debug, Clone)]
+pub struct PendingReference {
+    /// Relative file path (e.g. "src/index.ts")
+    pub source_file: String,
+    /// Absolute file:// URI for LSP (e.g. "file:///home/user/project/src/index.ts")
+    pub source_file_uri: String,
+    /// ID of the enclosing function (or file ID for top-level references)
+    pub source_id: String,
+    /// Name of the referenced identifier
+    pub ref_name: String,
+    /// "CALLS" or "IMPORTS"
+    pub ref_type: String,
+    /// 0-indexed line for LSP
+    pub line: u32,
+    /// 0-indexed column for LSP
+    pub col: u32,
+    /// Full file content for LSP notify_open
+    pub content: String,
+    /// Language ID for LSP (e.g. "typescript", "python")
+    pub language_id: String,
+}
+
 /// Parse a source file using the given language adapter.
 ///
 /// Extracts declarations (functions, classes) and references (calls, imports)
@@ -131,7 +158,7 @@ pub fn reconcile_file(
     content: Option<&str>,
     lsp: Option<&mut dyn crate::lsp_adapter::LspAdapter>,
     engine: &crate::graph::MemoryEngine,
-) -> Vec<Event> {
+) -> (Vec<Event>, Vec<PendingReference>) {
     let mut events = Vec::new();
     let timestamp = get_timestamp();
     let file_id = format!("{}", file_path.display());
@@ -161,7 +188,7 @@ pub fn reconcile_file(
                 id: file_id.clone(),
             }),
         });
-        return events;
+        return (events, Vec::new());
     }
 
     let content_str = content.unwrap();
@@ -211,9 +238,12 @@ pub fn reconcile_file(
         None => {
             // Try document adapter (markdown, etc.)
             if let Some(doc_adapter) = crate::document_adapter::get_document_adapter(file_path) {
-                return reconcile_document(file_path, content_str, doc_adapter.as_ref(), engine);
+                return {
+                    let (evs, refs) = reconcile_document(file_path, content_str, doc_adapter.as_ref(), engine);
+                    (evs, refs)
+                };
             }
-            return events;
+            return (events, Vec::new());
         }
     };
 
@@ -279,16 +309,14 @@ pub fn reconcile_file(
         });
     }
 
-    // 7. Resolve references via LSP
-    if let Some(lsp_client) = lsp {
-        // Use absolute path for the file URI so the LSP can resolve it correctly.
-        let abs_path = std::env::current_dir()
-            .unwrap_or_default()
-            .join(file_path);
-        let file_uri = format!("file://{}", abs_path.display());
+    // 7. Resolve references via LSP or collect for background resolution (Spec #2)
+    let abs_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join(file_path);
+    let file_uri = format!("file://{}", abs_path.display());
 
-        // Notify the LSP about this file's content so it can resolve definitions
-        // even if the on-disk content differs or hasn't been indexed yet.
+    if let Some(lsp_client) = lsp {
+        // Inline LSP resolution (backward-compatible path)
         let _ = lsp_client.notify_open(&file_uri, content_str, adapter.language_id());
 
         for rf in references {
@@ -303,8 +331,6 @@ pub fn reconcile_file(
                         .unwrap_or(absolute_path);
                     let target_id = format!("{}:{}", target_file_path, rf.name);
 
-                    // Use the enclosing function as the source of the edge.
-                    // Fall back to the file node if the call is at the top level.
                     let source_id = rf
                         .enclosing_function_id
                         .unwrap_or_else(|| file_id.clone());
@@ -323,9 +349,31 @@ pub fn reconcile_file(
                 }
             }
         }
+        (events, Vec::new())
+    } else {
+        // No LSP provided — collect references for background resolution (Spec #2)
+        let pending: Vec<PendingReference> = references
+            .iter()
+            .map(|rf| {
+                let source_id = rf
+                    .enclosing_function_id
+                    .clone()
+                    .unwrap_or_else(|| file_id.clone());
+                PendingReference {
+                    source_file: file_id.clone(),
+                    source_file_uri: file_uri.clone(),
+                    source_id,
+                    ref_name: rf.name.clone(),
+                    ref_type: rf.ref_type.clone(),
+                    line: rf.line as u32,
+                    col: rf.col as u32,
+                    content: content_str.to_string(),
+                    language_id: adapter.language_id().to_string(),
+                }
+            })
+            .collect();
+        (events, pending)
     }
-
-    events
 }
 
 // ─── Document Reconciliation (markdown, etc.) ─────────────────────────────────
@@ -340,7 +388,7 @@ fn reconcile_document(
     content: &str,
     doc_adapter: &dyn crate::document_adapter::DocumentAdapter,
     engine: &crate::graph::MemoryEngine,
-) -> Vec<Event> {
+) -> (Vec<Event>, Vec<PendingReference>) {
     let mut events = Vec::new();
     let timestamp = get_timestamp();
     let file_id = format!("{}", file_path.display());
@@ -410,7 +458,7 @@ fn reconcile_document(
     let ref_events = resolve_document_references(&sections, engine);
     events.extend(ref_events);
 
-    events
+    (events, Vec::new())
 }
 
 /// Resolve `REFERENCES` edges from document sections to existing code entities.

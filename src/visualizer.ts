@@ -423,7 +423,7 @@ export async function startServerIfNeeded(client: YaamEngineClient, port: number
                         type: type,
                         category: category,
                         content: n.content,
-                        description: n.properties?.description,
+                        description: n.label?.description,
                         metadata: n.metadata
                     }
                 });

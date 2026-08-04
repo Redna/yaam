@@ -95,6 +95,121 @@ impl EmbeddingModel {
         Ok(pooled)
     }
 
+    /// Embed multiple texts in a single ONNX forward pass (batch inference).
+    ///
+    /// All texts are tokenized with padding to the longest sequence, then
+    /// processed in one `session.run()` call. This is significantly faster
+    /// than calling `embed()` N times because:
+    /// - One kernel launch instead of N
+    /// - Larger matrix multiplies are better parallelized by SIMD
+    /// - Amortized session lock + tokenizer overhead
+    ///
+    /// Returns one L2-normalized 384-dim vector per input text, in order.
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if texts.len() == 1 {
+            return Ok(vec![self.embed(texts[0])?]);
+        }
+
+        // Batch tokenize with padding
+        let encodings = self.tokenizer.encode_batch(texts.to_vec(), true)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+
+        let batch_size = encodings.len();
+        let max_seq_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        if max_seq_len == 0 {
+            return Ok(vec![vec![0.0f32; 384]; batch_size]); // fallback
+        }
+
+        // Flatten into (batch_size, max_seq_len) tensors
+        let mut input_ids_flat = Vec::with_capacity(batch_size * max_seq_len);
+        let mut attention_mask_flat = Vec::with_capacity(batch_size * max_seq_len);
+        let mut token_type_ids_flat = Vec::with_capacity(batch_size * max_seq_len);
+        let mut attention_masks: Vec<Vec<u32>> = Vec::with_capacity(batch_size);
+
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let type_ids = enc.get_type_ids();
+            let seq_len = ids.len();
+
+            input_ids_flat.extend(ids.iter().map(|&x| x as i64));
+            attention_mask_flat.extend(mask.iter().map(|&x| x as i64));
+            token_type_ids_flat.extend(type_ids.iter().map(|&x| x as i64));
+            attention_masks.push(mask.to_vec());
+
+            // Pad to max_seq_len if this sequence is shorter
+            for _ in seq_len..max_seq_len {
+                input_ids_flat.push(0);
+                attention_mask_flat.push(0);
+                token_type_ids_flat.push(0);
+            }
+        }
+
+        let input_ids_tensor = Tensor::from_array(
+            Array2::from_shape_vec((batch_size, max_seq_len), input_ids_flat)?
+        )?;
+        let attention_mask_tensor = Tensor::from_array(
+            Array2::from_shape_vec((batch_size, max_seq_len), attention_mask_flat)?
+        )?;
+        let token_type_ids_tensor = Tensor::from_array(
+            Array2::from_shape_vec((batch_size, max_seq_len), token_type_ids_flat)?
+        )?;
+
+        let mut session_guard = self.session.lock().unwrap();
+        let outputs = if session_guard.inputs().iter().any(|i| i.name() == "token_type_ids") {
+            session_guard.run(ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "token_type_ids" => token_type_ids_tensor,
+            ])?
+        } else {
+            session_guard.run(ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            ])?
+        };
+
+        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
+        let output_shape = output_tensor.0;
+        let output_data = output_tensor.1;
+        let hidden_size = output_shape[2] as usize;
+
+        // Mean-pool each sequence using its own attention mask, then L2-normalize
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let mask = &attention_masks[i];
+            let mut pooled = vec![0.0f32; hidden_size];
+            let mut mask_sum = 0.0f32;
+
+            for j in 0..max_seq_len {
+                if mask[j] == 1 {
+                    let offset = (i * max_seq_len + j) * hidden_size;
+                    for k in 0..hidden_size {
+                        pooled[k] += output_data[offset + k];
+                    }
+                    mask_sum += 1.0;
+                }
+            }
+
+            let mut norm_sq = 0.0f32;
+            for k in 0..hidden_size {
+                pooled[k] /= mask_sum.max(1e-9);
+                norm_sq += pooled[k] * pooled[k];
+            }
+            let norm = norm_sq.sqrt().max(1e-9);
+            for k in 0..hidden_size {
+                pooled[k] /= norm;
+            }
+
+            results.push(pooled);
+        }
+
+        Ok(results)
+    }
+
     /// Count the number of tokens in `text` using the tokenizer.
     /// Used by `embed_chunked` to determine chunk boundaries.
     pub fn count_tokens(&self, text: &str) -> usize {
@@ -177,11 +292,9 @@ impl EmbeddingModel {
             chunks.push(current_chunk);
         }
 
-        // Embed each chunk
-        let mut embeddings = Vec::new();
-        for chunk in &chunks {
-            embeddings.push(self.embed(chunk)?);
-        }
+        // Embed all chunks in a single batched ONNX forward pass
+        let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+        let embeddings = self.embed_batch(&chunk_refs)?;
 
         Ok(embeddings)
     }

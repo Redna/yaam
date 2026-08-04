@@ -7,6 +7,7 @@
 //! from the last active connection.
 
 pub mod embedding;
+mod ann_index;
 mod document_adapter;
 mod graph;
 mod language_adapter;
@@ -50,13 +51,39 @@ async fn main() {
     };
 
     // Initialize application state
-    let state = match AppState::new(&events_path) {
+    let mut state = match AppState::new(&events_path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("Failed to initialize YAAM engine: {}", e);
             std::process::exit(1);
         }
     };
+
+    // ── Background LSP reference resolution worker (Spec #2) ──
+    //
+    // Pending references from reconcile are sent through an unbounded channel
+    // to a background worker. The worker resolves each reference via LSP and
+    // applies the resulting LinkNodes event to storage and the graph.
+    // This ensures reconcile returns immediately without blocking on LSP.
+    let (ref_tx, mut ref_rx) = tokio::sync::mpsc::unbounded_channel::<crate::reconciler::PendingReference>();
+    // SAFETY: We need to set ref_queue on the Arc<AppState>. Since we just created
+    // the Arc and have exclusive ownership (no other references exist yet), we can
+    // safely get a mutable reference via Arc::get_mut.
+    {
+        let state_mut = Arc::get_mut(&mut state).expect("state should be uniquely owned at startup");
+        state_mut.ref_queue = Some(ref_tx);
+    }
+
+    // Spawn the background worker task
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(pref) = ref_rx.recv().await {
+            let s = worker_state.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::rpc::resolve_reference_sync(s.as_ref(), pref);
+            }).await.ok();
+        }
+    });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("Failed to bind to random port");
     let port = listener.local_addr().unwrap().port();

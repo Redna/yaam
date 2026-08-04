@@ -9,8 +9,7 @@ export async function initializeWorkspace(
 ): Promise<string> {
   // Deactivate all existing active workspaces
   const dsl = {
-    match: { label: "Workspace" },
-    where: { field: "status", op: "eq", value: "active" }
+    match: { label: "Workspace", status: "active" }
   };
   const activeWorkspaces = await client.query(dsl);
   
@@ -18,7 +17,11 @@ export async function initializeWorkspace(
     await client.upsertNode({
       id: ws.id,
       label: "Workspace",
-      properties: { ...ws.properties, status: "inactive" }
+      properties: {
+        description: ws.label?.description ?? "",
+        status: "inactive",
+        closed_at: ws.label?.closed_at ?? null
+      }
     });
   }
 
@@ -56,15 +59,27 @@ export async function appendNote(
   return `Note added to workspace '${workspace}'.`;
 }
 
+/** Minimal interface for checking reconciler status (avoids circular import). */
+export interface ReconcilerStatus {
+  isRunning: boolean;
+}
+
 /**
  * Track a file accessed by a pi tool to the active workspace.
  * Uses pi's actual tool names: read, write, edit.
+ *
+ * This function is designed to be called fire-and-forget (not awaited by the
+ * caller). It queries existing graph entities for the file and links them to
+ * the active workspace via MAPPED_TO edges. It does NOT reconcile the file —
+ * that is handled by `Reconciler.runSync()` via `scheduleIncremental()`, which
+ * avoids a duplicate (and expensive) tree-sitter + LSP + embedding round-trip.
  */
 export async function trackAccessedFile(
   toolName: string,
   toolInput: any,
   client: YaamEngineClient,
-  projectRoot: string
+  projectRoot: string,
+  reconciler?: ReconcilerStatus
 ): Promise<void> {
   let filePath = '';
 
@@ -86,8 +101,7 @@ export async function trackAccessedFile(
   let wsName: string | null = null;
   try {
     const dsl = {
-      match: { label: "Workspace" },
-      where: { field: "status", op: "eq", value: "active" }
+      match: { label: "Workspace", status: "active" }
     };
     const active = await client.query(dsl);
     if (active.length > 0) {
@@ -99,18 +113,33 @@ export async function trackAccessedFile(
 
   if (!wsName) return;
 
-  // Reconcile the file content via AST if it exists
+  // Wait for any ongoing reconciliation to finish so entities are current.
+  // This is non-blocking to the agent since trackAccessedFile is fire-and-forget.
+  // Timeout after 30s to avoid infinite wait if reconciliation is stuck.
+  if (reconciler) {
+    let waitMs = 0;
+    while (reconciler.isRunning && waitMs < 30000) {
+      await new Promise(r => setTimeout(r, 200));
+      waitMs += 200;
+    }
+  }
+
+  // Query existing entities declared in this file and link them to the workspace.
+  // We no longer call client.reconcile() here — that was duplicating the
+  // reconciliation already performed by Reconciler.runSync() via
+  // scheduleIncremental(). Entity IDs are deterministic (file_path:name), so
+  // MAPPED_TO edges remain valid even after re-reconciliation recreates them.
   try {
     if (fs.existsSync(resolvedPath)) {
-      const content = fs.readFileSync(resolvedPath, 'utf-8');
-      const res = await client.reconcile({ file_path: relPath, content });
-      
-      // Link the workspace to the reconciled entities
+      const entities = await client.query({
+        match: { label: "Entity" },
+        where: { edge_to: { id: relPath, relationship: "DECLARED_IN" } }
+      });
       const timestamp = Math.floor(Date.now() / 1000);
-      for (const entityId of res.upserted_nodes) {
+      for (const entity of entities) {
         await client.linkNodes({
           from_id: wsName,
-          to_id: entityId,
+          to_id: entity.id,
           relationship: "MAPPED_TO",
           properties: { created_at: timestamp, is_stale: false }
         });

@@ -4,6 +4,13 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// Timeout for a single LSP definition request. If the LSP server doesn't
+/// respond within this duration, the process is killed and an error is
+/// returned. The LSP server will be restarted on next use.
+const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Location {
@@ -79,31 +86,94 @@ impl StdioLspClient {
     }
 
     fn read_message(&mut self) -> Result<Value, Box<dyn Error>> {
+        // Used during initialize — generous timeout for server startup.
+        self.read_message_with_timeout(Duration::from_secs(60))
+    }
+
+    /// Read a single LSP message with a timeout.
+    ///
+    /// Spawns a reader thread that performs the blocking I/O. If the thread
+    /// doesn't produce a message within `timeout`, the LSP process is killed
+    /// (causing the thread to unblock) and an error is returned. The caller
+    /// should expect that the LSP client is no longer usable after a timeout —
+    /// `get_or_create_lsp` will start a fresh server on next use.
+    fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<Value, Box<dyn Error>> {
         let process = self.process.as_mut().ok_or("LSP process not running")?;
-        let stdout = process.stdout.as_mut().ok_or("Failed to get stdout")?;
+        let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
 
-        let mut headers = String::new();
-        let mut buf = [0; 1];
-        loop {
-            stdout.read_exact(&mut buf)?;
-            headers.push(buf[0] as char);
-            if headers.ends_with("\r\n\r\n") {
-                break;
+        let (tx, rx) = mpsc::channel::<Result<(Value, std::process::ChildStdout), String>>();
+
+        let handle = std::thread::spawn(move || {
+            let mut stdout = stdout;
+            let result = (|| -> Result<(Value, std::process::ChildStdout), String> {
+                // Read headers byte-by-byte until \r\n\r\n.
+                let mut headers = String::new();
+                let mut buf = [0u8; 1];
+                loop {
+                    stdout.read_exact(&mut buf).map_err(|e| e.to_string())?;
+                    headers.push(buf[0] as char);
+                    if headers.ends_with("\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                // Parse Content-Length.
+                let mut content_length = 0usize;
+                for line in headers.lines() {
+                    if line.starts_with("Content-Length: ") {
+                        content_length = line["Content-Length: ".len()..]
+                            .parse()
+                            .map_err(|e: std::num::ParseIntError| e.to_string())?;
+                    }
+                }
+
+                // Read body.
+                let mut body = vec![0u8; content_length];
+                stdout.read_exact(&mut body).map_err(|e| e.to_string())?;
+                let value: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+                Ok((value, stdout))
+            })();
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok((value, stdout))) => {
+                // Success — put stdout back and return the value.
+                if let Some(ref mut process) = self.process {
+                    process.stdout = Some(stdout);
+                }
+                Ok(value)
+            }
+            Ok(Err(e)) => {
+                // Reader thread returned an error (e.g., EOF or parse failure).
+                // stdout is lost — kill the process so it will be restarted.
+                if let Some(mut proc) = self.process.take() {
+                    let _ = proc.kill();
+                    let _ = proc.wait();
+                }
+                let _ = handle.join();
+                Err(format!("LSP read error: {}", e).into())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Timeout! Kill the LSP process to unblock the reader thread,
+                // then join the thread to clean up.
+                if let Some(mut proc) = self.process.take() {
+                    let _ = proc.kill();
+                    let _ = proc.wait();
+                }
+                let _ = handle.join();
+                Err("LSP read timed out — process killed, will restart on next use".into())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Channel closed before any message — reader thread panicked.
+                if let Some(mut proc) = self.process.take() {
+                    let _ = proc.kill();
+                    let _ = proc.wait();
+                }
+                let _ = handle.join();
+                Err("LSP reader thread disconnected".into())
             }
         }
-
-        let mut content_length = 0;
-        for line in headers.lines() {
-            if line.starts_with("Content-Length: ") {
-                content_length = line["Content-Length: ".len()..].parse()?;
-            }
-        }
-
-        let mut body = vec![0; content_length];
-        stdout.read_exact(&mut body)?;
-
-        let value: Value = serde_json::from_slice(&body)?;
-        Ok(value)
     }
 }
 
@@ -166,7 +236,7 @@ impl LspAdapter for StdioLspClient {
         let req_id = self.send_request("textDocument/definition", params)?;
 
         loop {
-            let msg = self.read_message()?;
+            let msg = self.read_message_with_timeout(LSP_REQUEST_TIMEOUT)?;
             if msg.get("id").and_then(|i| i.as_u64()) == Some(req_id as u64) {
                 if let Some(error) = msg.get("error") {
                     return Err(format!("LSP Error: {}", error).into());
