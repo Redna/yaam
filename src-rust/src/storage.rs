@@ -75,35 +75,53 @@ impl EventStore {
 
     // ── Replay ──────────────────────────────────────────────────────────
 
-    /// Read every event from the store in insertion order.
-    ///
-    /// Malformed lines (e.g. from a crash mid-write) are skipped with a
-    /// warning printed to stderr.  Returns all successfully parsed events.
     pub fn replay(&self) -> std::io::Result<Vec<Event>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
 
         let file = OpenOptions::new().read(true).open(&self.path)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
         let mut events = Vec::new();
+        let mut buf = Vec::new();
+        let mut line_no = 0;
 
-        for (line_no, line) in reader.lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
+        while let Ok(bytes_read) = reader.read_until(b'\n', &mut buf) {
+            if bytes_read == 0 {
+                break;
             }
-            match serde_json::from_str::<Event>(&line) {
-                Ok(event) => events.push(event),
-                Err(err) => {
-                    eprintln!(
-                        "WARNING: skipping malformed event at {}:{}: {}",
-                        self.path.display(),
-                        line_no + 1,
-                        err,
-                    );
+            line_no += 1;
+
+            let mut slice = buf.as_slice();
+            while let Some(&last) = slice.last() {
+                if last.is_ascii_whitespace() {
+                    slice = &slice[..slice.len() - 1];
+                } else {
+                    break;
                 }
             }
+            while let Some(&first) = slice.first() {
+                if first.is_ascii_whitespace() {
+                    slice = &slice[1..];
+                } else {
+                    break;
+                }
+            }
+
+            if !slice.is_empty() {
+                match serde_json::from_slice::<Event>(slice) {
+                    Ok(event) => events.push(event),
+                    Err(err) => {
+                        eprintln!(
+                            "WARNING: skipping malformed event at {}:{}: {}",
+                            self.path.display(),
+                            line_no,
+                            err,
+                        );
+                    }
+                }
+            }
+            buf.clear();
         }
 
         Ok(events)

@@ -50,23 +50,31 @@ impl AppState {
         engine.load_from_events(&events);
 
         let mut bm25 = BM25FieldIndex::new();
-        // Index all existing nodes for BM25
+        let mut ann = AnnIndex::new();
+        let mut embedding_cache = EmbeddingCache::new();
+
+        // Single pass over all nodes to build indices (BM25, ANN, Embedding Cache)
         for node in engine.all_nodes() {
+            // 1. BM25
             let fields = build_bm25_fields(node);
             if !fields.is_empty() {
                 bm25.add_document(&node.id, &fields);
             }
-        }
 
-        // Build ANN index from existing node embeddings (Spec #1)
-        let mut ann = AnnIndex::new();
-        for node in engine.all_nodes() {
+            // 2. ANN and Embedding Cache
             if let Some(ref embeddings) = node.embedding {
                 if !embeddings.is_empty() {
                     ann.add(&node.id, embeddings);
+                    
+                    let text = build_embedding_text_from_node(node);
+                    if !text.is_empty() {
+                        let hash = EmbeddingCache::hash_text(&text);
+                        embedding_cache.set_hash(&node.id, hash);
+                    }
                 }
             }
         }
+
         if ann.node_count() > 0 {
             eprintln!("[YAAM] ANN index primed with {} nodes ({} vectors)", ann.node_count(), ann.vector_count());
         }
@@ -81,21 +89,6 @@ impl AppState {
             }
         };
 
-        // Build embedding cache from existing nodes (Spec #3).
-        // For each node that has an embedding, compute the hash of its embedding text
-        // so we can skip ONNX inference on future reconciles if the text hasn't changed.
-        let mut embedding_cache = EmbeddingCache::new();
-        for node in engine.all_nodes() {
-            if let Some(ref emb) = node.embedding {
-                if !emb.is_empty() {
-                    let text = build_embedding_text_from_node(node);
-                    if !text.is_empty() {
-                        let hash = EmbeddingCache::hash_text(&text);
-                        embedding_cache.set_hash(&node.id, hash);
-                    }
-                }
-            }
-        }
         if embedding_cache.len() > 0 {
             eprintln!("[YAAM] Embedding cache primed with {} entries", embedding_cache.len());
         }
