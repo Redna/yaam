@@ -148,6 +148,11 @@ export class YaamEngineClient {
             // Failed to parse YAAM engine response
           }
         });
+        
+        rl.on('error', (err) => {
+          // Swallow readline errors to prevent unhandled exceptions.
+          // The underlying socket error is already caught by the socket's 'error' listener.
+        });
       });
 
       this.socket.on('error', (err) => {
