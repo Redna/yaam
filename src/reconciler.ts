@@ -49,7 +49,11 @@ export class Reconciler {
     const walkPath = require('path');
 
     const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
-    const SKIP_DIRS = ['node_modules', 'dist', '.git', 'target', '.chunks', '.yaam'];
+    const SKIP_DIRS = [
+      'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
+      '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
+      '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out'
+    ];
 
     const walkSync = (dir: string, filelist: string[] = []) => {
       if (!fs.existsSync(dir)) return filelist;
@@ -110,7 +114,11 @@ export class Reconciler {
     const walkPath = require('path');
 
     const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
-    const SKIP_DIRS = ['node_modules', 'dist', '.git', 'target', '.chunks', '.yaam'];
+    const SKIP_DIRS = [
+      'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
+      '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
+      '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out'
+    ];
 
     const walkSync = (dir: string, filelist: string[] = []) => {
       if (!fs.existsSync(dir)) return filelist;
