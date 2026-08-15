@@ -47,7 +47,7 @@ pub struct PendingReference {
     /// 0-indexed column for LSP
     pub col: u32,
     /// Full file content for LSP notify_open
-    pub content: String,
+    pub content: std::sync::Arc<String>,
     /// Language ID for LSP (e.g. "typescript", "python")
     pub language_id: String,
 }
@@ -352,6 +352,7 @@ pub fn reconcile_file(
         (events, Vec::new())
     } else {
         // No LSP provided — collect references for background resolution (Spec #2)
+        let content_arc = std::sync::Arc::new(content_str.to_string());
         let pending: Vec<PendingReference> = references
             .iter()
             .map(|rf| {
@@ -367,7 +368,7 @@ pub fn reconcile_file(
                     ref_type: rf.ref_type.clone(),
                     line: rf.line as u32,
                     col: rf.col as u32,
-                    content: content_str.to_string(),
+                    content: std::sync::Arc::clone(&content_arc),
                     language_id: adapter.language_id().to_string(),
                 }
             })
