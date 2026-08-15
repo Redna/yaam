@@ -189,8 +189,10 @@ impl LanguageAdapter for TypeScriptAdapter {
 
     fn lsp_command(&self) -> Option<LspCommand> {
         Some(LspCommand {
-            command: "npx".to_string(),
+            command: "env".to_string(),
             args: vec![
+                "NODE_OPTIONS=--max-old-space-size=1024".to_string(),
+                "npx".to_string(),
                 "typescript-language-server".to_string(),
                 "--stdio".to_string(),
             ],
