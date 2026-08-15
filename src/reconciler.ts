@@ -168,6 +168,12 @@ export class Reconciler {
         const stat = fs.statSync(absPath);
         const lastReconciled = graphFiles.get(relPath) ?? 0;
 
+        // Prevent OOM from parsing/reading massive files
+        if (stat.size > 1_000_000) {
+          this.fileMtimes.set(relPath, stat.mtimeMs);
+          continue;
+        }
+
         if (stat.mtimeMs > lastReconciled) {
           // File changed since last reconciliation (or is new) — queue it
           this.syncQueue.add(relPath);
