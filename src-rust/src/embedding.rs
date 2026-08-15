@@ -159,7 +159,8 @@ impl EmbeddingModel {
             .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
         let batch_size = encodings.len();
-        let max_seq_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let mut max_seq_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        max_seq_len = std::cmp::min(max_seq_len, 512);
         if max_seq_len == 0 {
             return Ok(vec![vec![0.0f32; 384]; batch_size]); // fallback
         }
@@ -174,12 +175,12 @@ impl EmbeddingModel {
             let ids = enc.get_ids();
             let mask = enc.get_attention_mask();
             let type_ids = enc.get_type_ids();
-            let seq_len = ids.len();
+            let seq_len = std::cmp::min(ids.len(), 512);
 
-            input_ids_flat.extend(ids.iter().map(|&x| x as i64));
-            attention_mask_flat.extend(mask.iter().map(|&x| x as i64));
-            token_type_ids_flat.extend(type_ids.iter().map(|&x| x as i64));
-            attention_masks.push(mask.to_vec());
+            input_ids_flat.extend(ids[..seq_len].iter().map(|&x| x as i64));
+            attention_mask_flat.extend(mask[..seq_len].iter().map(|&x| x as i64));
+            token_type_ids_flat.extend(type_ids[..seq_len].iter().map(|&x| x as i64));
+            attention_masks.push(mask[..seq_len].to_vec());
 
             // Pad to max_seq_len if this sequence is shorter
             for _ in seq_len..max_seq_len {
