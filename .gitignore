@@ -8,4 +8,5 @@ node_modules/
 !.yaam/config.json
 
 # Rust build artifacts
-src-rust/target/events.jsonl.bak-*
+src-rust/target/
+events.jsonl.bak-*

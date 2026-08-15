@@ -108,6 +108,14 @@ export default function yaamExtension(pi: ExtensionAPI) {
     try {
       await engine.start();
       setStatus(ctx, "yaam", "Ready ✅");
+      
+      // Auto-compact on startup to clear historical churn and archive old workspaces
+      try {
+        await (engine as any).request("compact", {});
+      } catch (e) {
+        // Ignore compaction errors
+      }
+
       reconciler.scheduleFull().catch(() => {});
 
       // Phase 1: Send context IMMEDIATELY from the persisted graph.
@@ -430,6 +438,18 @@ EXAMPLES:
           ctx.ui.notify(`YAAM Graph Visualizer is running at: ${url}`, "info");
         } catch (e: any) {
           ctx.ui.notify(`YAAM visualization error: ${e.message || String(e)}`, "error");
+        }
+        return;
+      }
+
+      // ─── Subcommand: compact ──────────────────────────────────────────
+      if (typeof args === 'string' && args.trim() === 'compact') {
+        try {
+          ctx.ui.notify("Compacting YAAM memory log...", "info");
+          const result = await (engine as any).request("compact", {});
+          ctx.ui.notify(`Compaction successful. Archived ${result.archived_events_count || 0} old events, compacted graph to ${result.compacted_events_count || 0} events.`, "info");
+        } catch (e: any) {
+          ctx.ui.notify(`YAAM compaction error: ${e.message || String(e)}`, "error");
         }
         return;
       }

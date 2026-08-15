@@ -126,6 +126,68 @@ impl EventStore {
 
         Ok(events)
     }
+
+    // ── Compaction / Archiving ──────────────────────────────────────────
+
+    /// Atomically rewrite the events.jsonl file with a new set of events.
+    /// This is used during compaction to drop historical churn.
+    pub fn rewrite(&self, events: &[Event]) -> std::io::Result<()> {
+        let tmp_path = self.path.with_extension("tmp.jsonl");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+
+        // Acquire exclusive lock on the tmp file
+        file.lock_exclusive()?;
+
+        let result = (|| -> std::io::Result<()> {
+            for event in events {
+                let mut line = serde_json::to_string(event)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                line.push('\n');
+                file.write_all(line.as_bytes())?;
+            }
+            file.flush()?;
+            Ok(())
+        })();
+
+        // Unlock before rename just to be safe
+        file.unlock()?;
+        
+        result?;
+
+        // Atomically replace the old events.jsonl with the compacted tmp file
+        std::fs::rename(&tmp_path, &self.path)?;
+        Ok(())
+    }
+
+    /// Append events to an archive file (e.g. events.archive.jsonl)
+    pub fn append_to_archive(&self, events: &[Event]) -> std::io::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let archive_path = self.path.with_extension("archive.jsonl");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&archive_path)?;
+
+        file.lock_exclusive()?;
+        let result = (|| -> std::io::Result<()> {
+            for event in events {
+                let mut line = serde_json::to_string(event)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                line.push('\n');
+                file.write_all(line.as_bytes())?;
+            }
+            file.flush()?;
+            Ok(())
+        })();
+        file.unlock()?;
+        result
+    }
 }
 
 // ─── Event Construction Helpers ─────────────────────────────────────────────

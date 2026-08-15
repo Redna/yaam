@@ -285,6 +285,170 @@ impl MemoryEngine {
             self.apply_event(event);
         }
     }
+
+    // ── Compaction / Archiving ──────────────────────────────────────────
+
+    /// Find old inactive Workspaces (and their Scratchpads), generate deletion
+    /// events for them (which can be archived), and remove them from the graph.
+    /// `max_age_seconds` is compared against `closed_at`.
+    pub fn prune_old_workspaces(&mut self, max_age_seconds: u64) -> Vec<Event> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut to_delete = Vec::new();
+        let mut archive_events = Vec::new();
+
+        // 1. Identify stale Workspaces
+        for node in self.nodes.values() {
+            if let NodeLabel::Workspace { status, closed_at, description: _ } = &node.label {
+                if status == "inactive" {
+                    if let Some(closed) = closed_at {
+                        if now > *closed && now - *closed > max_age_seconds {
+                            to_delete.push(node.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Identify associated Scratchpads
+        let mut new_to_delete = Vec::new();
+        for ws_id in &to_delete {
+            for edge in self.get_forward_edges(ws_id) {
+                if edge.relationship == "HAS_SCRATCHPAD" {
+                    new_to_delete.push(edge.to_id.clone());
+                }
+            }
+        }
+        to_delete.extend(new_to_delete);
+
+        // Deduplicate
+        to_delete.sort();
+        to_delete.dedup();
+
+        // 3. Generate UPSERT events for them (to save their final state in archive)
+        // and DELETE events to clean up.
+        for id in &to_delete {
+            if let Some(node) = self.nodes.get(id) {
+                // Synthesize properties
+                let mut props = HashMap::new();
+                if !node.name.is_empty() {
+                    props.insert("name".to_string(), serde_json::json!(node.name));
+                }
+                if !node.content.is_empty() {
+                    props.insert("content".to_string(), serde_json::json!(node.content));
+                }
+                if !node.metadata.is_empty() {
+                    props.insert("metadata".to_string(), serde_json::json!(node.metadata));
+                }
+                if let Some(ref emb) = node.embedding {
+                    props.insert("embedding".to_string(), serde_json::json!(emb));
+                }
+                
+                match &node.label {
+                    NodeLabel::Workspace { description, status, closed_at } => {
+                        props.insert("description".to_string(), serde_json::json!(description));
+                        props.insert("status".to_string(), serde_json::json!(status));
+                        if let Some(c) = closed_at {
+                            props.insert("closed_at".to_string(), serde_json::json!(c));
+                        }
+                    }
+                    NodeLabel::Scratchpad { created_at } => {
+                        props.insert("created_at".to_string(), serde_json::json!(created_at));
+                    }
+                    NodeLabel::Entity { entity_type, status, last_modified } => {
+                        props.insert("entity_type".to_string(), serde_json::json!(entity_type));
+                        props.insert("status".to_string(), serde_json::json!(status));
+                        props.insert("last_modified".to_string(), serde_json::json!(last_modified));
+                    }
+                }
+                archive_events.push(crate::storage::upsert_node_event(
+                    node.id.clone(),
+                    node_label_str(&node.label).to_string(),
+                    props
+                ));
+            }
+        }
+
+        // 4. Archive associated edges
+        for id in &to_delete {
+            let fwd = self.get_forward_edges(id).to_vec();
+            for edge in fwd {
+                // If it's internal to the deleted set, or external, we archive the edge
+                archive_events.push(crate::storage::link_nodes_event(
+                    edge.from_id.clone(),
+                    edge.to_id.clone(),
+                    edge.relationship.clone(),
+                    edge.properties.clone(),
+                ));
+            }
+        }
+
+        // 5. Delete them from memory
+        for id in &to_delete {
+            self.delete_node(id);
+        }
+
+        archive_events
+    }
+
+    /// Dump the ENTIRE current graph into a minimal sequence of Upsert and Link events.
+    pub fn synthesize_current_state(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+
+        // 1. All Nodes
+        for node in self.nodes.values() {
+            let mut props = HashMap::new();
+            if !node.name.is_empty() {
+                props.insert("name".to_string(), serde_json::json!(node.name));
+            }
+            if !node.content.is_empty() {
+                props.insert("content".to_string(), serde_json::json!(node.content));
+            }
+            if !node.metadata.is_empty() {
+                props.insert("metadata".to_string(), serde_json::json!(node.metadata));
+            }
+            if let Some(ref emb) = node.embedding {
+                props.insert("embedding".to_string(), serde_json::json!(emb));
+            }
+
+            match &node.label {
+                NodeLabel::Entity { entity_type, status, last_modified } => {
+                    props.insert("entity_type".to_string(), serde_json::json!(entity_type));
+                    props.insert("status".to_string(), serde_json::json!(status));
+                    props.insert("last_modified".to_string(), serde_json::json!(last_modified));
+                }
+                NodeLabel::Workspace { description, status, closed_at } => {
+                    props.insert("description".to_string(), serde_json::json!(description));
+                    props.insert("status".to_string(), serde_json::json!(status));
+                    if let Some(c) = closed_at {
+                        props.insert("closed_at".to_string(), serde_json::json!(c));
+                    }
+                }
+                NodeLabel::Scratchpad { created_at } => {
+                    props.insert("created_at".to_string(), serde_json::json!(created_at));
+                }
+            }
+
+            events.push(crate::storage::upsert_node_event(
+                node.id.clone(),
+                node_label_str(&node.label).to_string(),
+                props,
+            ));
+        }
+
+        // 2. All Edges
+        for edges in self.forward_edges.values() {
+            for edge in edges {
+                events.push(crate::storage::link_nodes_event(
+                    edge.from_id.clone(),
+                    edge.to_id.clone(),
+                    edge.relationship.clone(),
+                    edge.properties.clone(),
+                ));
+            }
+        }
+
+        events
+    }
 }
 
 impl Default for MemoryEngine {

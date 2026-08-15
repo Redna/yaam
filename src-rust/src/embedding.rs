@@ -109,6 +109,47 @@ impl EmbeddingModel {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Dynamically adjust batch size based on available system memory
+        let mut available_mb = 1024; // Default to 1GB if we can't read meminfo
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                for line in meminfo.lines() {
+                    if line.starts_with("MemAvailable:") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(kb) = parts[1].parse::<u64>() {
+                                available_mb = kb / 1024;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        let batch_size_limit = if available_mb > 4000 {
+            64
+        } else if available_mb > 2000 {
+            32
+        } else if available_mb > 1000 {
+            16
+        } else if available_mb > 500 {
+            8
+        } else {
+            2
+        };
+
+        if texts.len() > batch_size_limit {
+            let mut all_results = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(batch_size_limit) {
+                let res = self.embed_batch(chunk)?;
+                all_results.extend(res);
+            }
+            return Ok(all_results);
+        }
+
         if texts.len() == 1 {
             return Ok(vec![self.embed(texts[0])?]);
         }

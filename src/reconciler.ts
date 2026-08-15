@@ -52,7 +52,8 @@ export class Reconciler {
     const SKIP_DIRS = [
       'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
       '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
-      '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out'
+      '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out',
+      '.pi', '.pi-web'
     ];
 
     const walkSync = (dir: string, filelist: string[] = []) => {
@@ -117,7 +118,8 @@ export class Reconciler {
     const SKIP_DIRS = [
       'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
       '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
-      '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out'
+      '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out',
+      '.pi', '.pi-web'
     ];
 
     const walkSync = (dir: string, filelist: string[] = []) => {
@@ -233,8 +235,17 @@ export class Reconciler {
       try {
         const resolved = path.resolve(file);
         if (fs.existsSync(resolved)) {
-          const content = fs.readFileSync(resolved, 'utf-8');
+          const stat = fs.statSync(resolved);
           const relPath = path.relative(process.cwd(), resolved);
+          
+          // Prevent OOM from parsing massive files (e.g. minified JS > 1MB)
+          if (stat.size > 1_000_000) {
+            skipped++;
+            this.fileMtimes.set(relPath, stat.mtimeMs);
+            return;
+          }
+
+          const content = fs.readFileSync(resolved, 'utf-8');
 
           // Skip if content hasn't changed since last reconciliation.
           const newHash = this.hashContent(content);
