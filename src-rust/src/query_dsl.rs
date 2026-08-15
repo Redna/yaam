@@ -57,12 +57,9 @@ pub fn evaluate_query(engine: &MemoryEngine, query: &DslQuery) -> serde_json::Va
         return apply_aggregation(engine, &traversed, aggregate);
     }
 
-    // Step 5: Apply limit
-    let limited = if let Some(limit) = query.limit {
-        traversed.into_iter().take(limit).collect()
-    } else {
-        traversed
-    };
+    // Step 5: Apply limit (cap at 1000 to prevent massive JSON payloads OOMing Node.js)
+    let limit = query.limit.unwrap_or(1000).min(1000);
+    let limited: Vec<_> = traversed.into_iter().take(limit).collect();
 
     // Step 6: Project return fields
     let return_fields = query.return_fields.as_deref();
