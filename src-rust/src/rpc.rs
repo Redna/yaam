@@ -44,10 +44,11 @@ impl AppState {
         let path = std::path::Path::new(events_path);
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         let store = EventStore::new(dir)?;
-        let events = store.replay()?;
-
         let mut engine = MemoryEngine::default();
-        engine.load_from_events(&events);
+        
+        store.replay(|event| {
+            engine.apply_event(&event);
+        })?;
 
         let mut bm25 = BM25FieldIndex::new();
         let mut ann = AnnIndex::new();

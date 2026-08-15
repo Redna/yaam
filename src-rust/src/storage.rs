@@ -75,14 +75,16 @@ impl EventStore {
 
     // ── Replay ──────────────────────────────────────────────────────────
 
-    pub fn replay(&self) -> std::io::Result<Vec<Event>> {
+    pub fn replay<F>(&self, mut callback: F) -> std::io::Result<()>
+    where
+        F: FnMut(Event),
+    {
         if !self.path.exists() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let file = OpenOptions::new().read(true).open(&self.path)?;
         let mut reader = BufReader::new(file);
-        let mut events = Vec::new();
         let mut buf = Vec::new();
         let mut line_no = 0;
 
@@ -110,7 +112,7 @@ impl EventStore {
 
             if !slice.is_empty() {
                 match serde_json::from_slice::<Event>(slice) {
-                    Ok(event) => events.push(event),
+                    Ok(event) => callback(event),
                     Err(err) => {
                         eprintln!(
                             "WARNING: skipping malformed event at {}:{}: {}",
@@ -124,7 +126,7 @@ impl EventStore {
             buf.clear();
         }
 
-        Ok(events)
+        Ok(())
     }
 
     // ── Compaction / Archiving ──────────────────────────────────────────
@@ -293,7 +295,8 @@ mod tests {
         store.append(&e3).unwrap();
         store.append(&e4).unwrap();
 
-        let events = store.replay().unwrap();
+        let mut events = Vec::new();
+        store.replay(|e| events.push(e)).unwrap();
         assert_eq!(events.len(), 4);
 
         // Verify event types round-tripped correctly.
@@ -329,7 +332,8 @@ mod tests {
         let e2 = delete_node_event("good2");
         store.append(&e2).unwrap();
 
-        let events = store.replay().unwrap();
+        let mut events = Vec::new();
+        store.replay(|e| events.push(e)).unwrap();
         assert_eq!(
             events.len(),
             2,
@@ -342,7 +346,8 @@ mod tests {
     #[test]
     fn replay_empty_store() {
         let (_dir, store) = temp_store();
-        let events = store.replay().unwrap();
+        let mut events = Vec::new();
+        store.replay(|e| events.push(e)).unwrap();
         assert!(events.is_empty(), "empty store should replay zero events");
     }
 
@@ -367,7 +372,8 @@ mod tests {
         f.lock_exclusive().expect("lock should be available");
         f.unlock().unwrap();
 
-        let events = store.replay().unwrap();
+        let mut events = Vec::new();
+        store.replay(|e| events.push(e)).unwrap();
         assert_eq!(events.len(), 2);
     }
 
