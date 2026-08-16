@@ -66,7 +66,7 @@ export class Reconciler {
         return filelist;
       }
       
-      const workers = files.map(async (file) => {
+      for (const file of files) {
         const filepath = walkPath.join(dir, file);
         try {
           const stat = await fs.stat(filepath);
@@ -78,8 +78,7 @@ export class Reconciler {
             filelist.push(filepath);
           }
         } catch { /* skip unreadable files */ }
-      });
-      await Promise.all(workers);
+      }
       return filelist;
     };
 
@@ -140,7 +139,7 @@ export class Reconciler {
           return filelist;
         }
         
-        const workers = files.map(async (file) => {
+        for (const file of files) {
           const filepath = walkPath.join(dir, file);
           try {
             const stat = await fs.stat(filepath);
@@ -152,8 +151,7 @@ export class Reconciler {
               filelist.push(filepath);
             }
           } catch { /* skip unreadable files */ }
-        });
-        await Promise.all(workers);
+        }
         return filelist;
       };
 
@@ -177,8 +175,8 @@ export class Reconciler {
       let queued = 0;
       let primed = 0;
 
-      // Process file stats concurrently
-      const statWorkers = allFiles.map(async (absPath) => {
+      // Process file stats sequentially to prevent Node.js OOM
+      for (const absPath of allFiles) {
         const relPath = walkPath.relative(process.cwd(), absPath);
         try {
           const stat = await fs.stat(absPath);
@@ -187,7 +185,7 @@ export class Reconciler {
           // Prevent OOM from parsing/reading massive files
           if (stat.size > 1_000_000) {
             this.fileMtimes.set(relPath, stat.mtimeMs);
-            return;
+            continue;
           }
 
           if (stat.mtimeMs > lastReconciled) {
@@ -203,9 +201,7 @@ export class Reconciler {
           // Always update mtime baseline
           this.fileMtimes.set(relPath, stat.mtimeMs);
         } catch { /* skip */ }
-      });
-
-      await Promise.all(statWorkers);
+      }
 
       // Delete stale files (in graph but not on disk).
       for (const [fileId, _] of graphFiles) {
