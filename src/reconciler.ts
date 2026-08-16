@@ -42,11 +42,12 @@ export class Reconciler {
    *  full reconcile because it only stats files (no read, no engine call).
    *  The hash check in runSync() provides a second layer of filtering.
    *  Skipped if scheduleFull() is running — it will handle modified files. */
-  private scanForModifiedFiles() {
+  private async scanForModifiedFiles() {
     if (this.isPriming) return; // Full sync in progress — it handles everything
 
-    const fs = require('fs');
+    const fs = await import('fs/promises');
     const walkPath = require('path');
+    const { existsSync } = require('fs');
 
     const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
     const SKIP_DIRS = [
@@ -56,32 +57,39 @@ export class Reconciler {
       '.pi', '.pi-web'
     ];
 
-    const walkSync = (dir: string, filelist: string[] = []) => {
-      if (!fs.existsSync(dir)) return filelist;
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
+    const walkAsync = async (dir: string, filelist: string[] = []): Promise<string[]> => {
+      if (!existsSync(dir)) return filelist;
+      let files;
+      try {
+        files = await fs.readdir(dir);
+      } catch {
+        return filelist;
+      }
+      
+      const workers = files.map(async (file) => {
         const filepath = walkPath.join(dir, file);
         try {
-          const stat = fs.statSync(filepath);
+          const stat = await fs.stat(filepath);
           if (stat.isDirectory()) {
             if (!SKIP_DIRS.includes(file)) {
-              walkSync(filepath, filelist);
+              await walkAsync(filepath, filelist);
             }
           } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {
             filelist.push(filepath);
           }
         } catch { /* skip unreadable files */ }
-      }
+      });
+      await Promise.all(workers);
       return filelist;
     };
 
     try {
-      const allFiles = walkSync(process.cwd());
+      const allFiles = await walkAsync(process.cwd());
       let found = 0;
       for (const absPath of allFiles) {
         const relPath = walkPath.relative(process.cwd(), absPath);
         try {
-          const stat = fs.statSync(absPath);
+          const stat = await fs.stat(absPath);
           const lastMtime = this.fileMtimes.get(relPath) ?? 0;
           if (stat.mtimeMs > lastMtime) {
             this.syncQueue.add(relPath);
@@ -111,98 +119,107 @@ export class Reconciler {
   public async scheduleFull() {
     this.isPriming = true;
     try {
-      const fs = require('fs');
-    const walkPath = require('path');
+      const fs = await import('fs/promises');
+      const walkPath = require('path');
+      const { existsSync } = require('fs');
 
-    const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
-    const SKIP_DIRS = [
-      'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
-      '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
-      '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out',
-      '.pi', '.pi-web'
-    ];
+      const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
+      const SKIP_DIRS = [
+        'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
+        '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
+        '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out',
+        '.pi', '.pi-web'
+      ];
 
-    const walkSync = (dir: string, filelist: string[] = []) => {
-      if (!fs.existsSync(dir)) return filelist;
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
-        const filepath = walkPath.join(dir, file);
+      const walkAsync = async (dir: string, filelist: string[] = []): Promise<string[]> => {
+        if (!existsSync(dir)) return filelist;
+        let files;
         try {
-          const stat = fs.statSync(filepath);
-          if (stat.isDirectory()) {
-            if (!SKIP_DIRS.includes(file)) {
-              walkSync(filepath, filelist);
+          files = await fs.readdir(dir);
+        } catch {
+          return filelist;
+        }
+        
+        const workers = files.map(async (file) => {
+          const filepath = walkPath.join(dir, file);
+          try {
+            const stat = await fs.stat(filepath);
+            if (stat.isDirectory()) {
+              if (!SKIP_DIRS.includes(file)) {
+                await walkAsync(filepath, filelist);
+              }
+            } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {
+              filelist.push(filepath);
             }
-          } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {
-            filelist.push(filepath);
-          }
-        } catch { /* skip unreadable files */ }
-      }
-      return filelist;
-    };
+          } catch { /* skip unreadable files */ }
+        });
+        await Promise.all(workers);
+        return filelist;
+      };
 
-    // Query the graph for existing File entities and their last_modified timestamps.
-    // Uses entity_type (not type) — the DSL field is entity_type.
-    let graphFiles: Map<string, number> = new Map();
-    try {
-      const fileNodes = await this.engine.query({
-        match: { label: "Entity", entity_type: "File" }
-      });
-      for (const node of fileNodes) {
-        const lastMod = node.label?.last_modified ?? 0;
-        graphFiles.set(node.id, lastMod);
-      }
-    } catch {
-      // If query fails, graphFiles stays empty — all files will be queued
-    }
-
-    const allFiles = walkSync(process.cwd());
-    const allFilesSet = new Set(allFiles.map((f: string) => walkPath.relative(process.cwd(), f)));
-
-    let queued = 0;
-    let primed = 0;
-
-    for (const absPath of allFiles) {
-      const relPath = walkPath.relative(process.cwd(), absPath);
+      // Query the graph for existing File entities and their last_modified timestamps.
+      let graphFiles: Map<string, number> = new Map();
       try {
-        const stat = fs.statSync(absPath);
-        const lastReconciled = graphFiles.get(relPath) ?? 0;
-
-        // Prevent OOM from parsing/reading massive files
-        if (stat.size > 1_000_000) {
-          this.fileMtimes.set(relPath, stat.mtimeMs);
-          continue;
+        const fileNodes = await this.engine.query({
+          match: { label: "Entity", entity_type: "File" }
+        });
+        for (const node of fileNodes) {
+          const lastMod = node.label?.last_modified ?? 0;
+          graphFiles.set(node.id, lastMod);
         }
-
-        if (stat.mtimeMs > lastReconciled) {
-          // File changed since last reconciliation (or is new) — queue it
-          this.syncQueue.add(relPath);
-          queued++;
-        } else {
-          // File unchanged — prime the hash so runSync() skips it
-          const content = fs.readFileSync(absPath, 'utf-8');
-          this.contentHashes.set(relPath, this.hashContent(content));
-          primed++;
-        }
-        // Always update mtime baseline
-        this.fileMtimes.set(relPath, stat.mtimeMs);
-      } catch { /* skip */ }
-    }
-
-    // Delete stale files (in graph but not on disk).
-    // Only iterates File entities — not Functions/Classes/Sections.
-    for (const [fileId, _] of graphFiles) {
-      if (!allFilesSet.has(fileId)) {
-        try {
-          await this.engine.reconcile({ file_path: fileId, content: "" });
-          this.contentHashes.delete(fileId);
-        } catch { /* ignore */ }
+      } catch {
+        // If query fails, graphFiles stays empty — all files will be queued
       }
-    }
 
-    if (queued > 0 || this.syncQueue.size > 0) {
-      this.triggerSync();
-    }
+      const allFiles = await walkAsync(process.cwd());
+      const allFilesSet = new Set(allFiles.map((f: string) => walkPath.relative(process.cwd(), f)));
+
+      let queued = 0;
+      let primed = 0;
+
+      // Process file stats concurrently
+      const statWorkers = allFiles.map(async (absPath) => {
+        const relPath = walkPath.relative(process.cwd(), absPath);
+        try {
+          const stat = await fs.stat(absPath);
+          const lastReconciled = graphFiles.get(relPath) ?? 0;
+
+          // Prevent OOM from parsing/reading massive files
+          if (stat.size > 1_000_000) {
+            this.fileMtimes.set(relPath, stat.mtimeMs);
+            return;
+          }
+
+          if (stat.mtimeMs > lastReconciled) {
+            // File changed since last reconciliation (or is new) — queue it
+            this.syncQueue.add(relPath);
+            queued++;
+          } else {
+            // File unchanged — prime the hash so runSync() skips it
+            const content = await fs.readFile(absPath, 'utf-8');
+            this.contentHashes.set(relPath, this.hashContent(content));
+            primed++;
+          }
+          // Always update mtime baseline
+          this.fileMtimes.set(relPath, stat.mtimeMs);
+        } catch { /* skip */ }
+      });
+
+      await Promise.all(statWorkers);
+
+      // Delete stale files (in graph but not on disk).
+      for (const [fileId, _] of graphFiles) {
+        if (!allFilesSet.has(fileId)) {
+          try {
+            await this.engine.reconcile({ file_path: fileId, content: "" });
+            this.contentHashes.delete(fileId);
+          } catch { /* ignore */ }
+        }
+      }
+
+      if (queued > 0 || this.syncQueue.size > 0) {
+        this.triggerSync();
+      }
     } catch {
       // Full sync error — trigger sync as fallback
       this.triggerSync();
@@ -226,7 +243,8 @@ export class Reconciler {
 
     this.progress = { current: 0, total: filesToSync.length, detail: "Processing..." };
 
-    const fs = await import('fs');
+    const fs = await import('fs/promises');
+    const { existsSync } = await import('fs');
     let skipped = 0;
     let reconciled = 0;
     let completed = 0;
@@ -240,8 +258,8 @@ export class Reconciler {
     const processFile = async (file: string) => {
       try {
         const resolved = path.resolve(file);
-        if (fs.existsSync(resolved)) {
-          const stat = fs.statSync(resolved);
+        if (existsSync(resolved)) {
+          const stat = await fs.stat(resolved);
           const relPath = path.relative(process.cwd(), resolved);
           
           // Prevent OOM from parsing massive files (e.g. minified JS > 1MB)
@@ -251,22 +269,22 @@ export class Reconciler {
             return;
           }
 
-          const content = fs.readFileSync(resolved, 'utf-8');
+          const content = await fs.readFile(resolved, 'utf-8');
 
           // Skip if content hasn't changed since last reconciliation.
           const newHash = this.hashContent(content);
           const existingHash = this.contentHashes.get(relPath);
           if (existingHash === newHash) {
             skipped++;
-            const stat = fs.statSync(resolved);
-            this.fileMtimes.set(relPath, stat.mtimeMs);
+            const newStat = await fs.stat(resolved);
+            this.fileMtimes.set(relPath, newStat.mtimeMs);
             return;
           }
 
           await this.engine.reconcile({ file_path: relPath, content });
           this.contentHashes.set(relPath, newHash);
-          const stat = fs.statSync(resolved);
-          this.fileMtimes.set(relPath, stat.mtimeMs);
+          const finalStat = await fs.stat(resolved);
+          this.fileMtimes.set(relPath, finalStat.mtimeMs);
           reconciled++;
         }
       } catch (e) {
