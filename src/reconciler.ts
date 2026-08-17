@@ -169,6 +169,8 @@ export class Reconciler {
         // If query fails, graphFiles stays empty — all files will be queued
       }
 
+      console.log(`[YAAM Reconciler] Loaded ${graphFiles.size} File entities from graph.`);
+
       const allFiles = await walkAsync(process.cwd());
       const allFilesSet = new Set(allFiles.map((f: string) => walkPath.relative(process.cwd(), f)));
 
@@ -202,6 +204,8 @@ export class Reconciler {
           this.fileMtimes.set(relPath, stat.mtimeMs);
         } catch { /* skip */ }
       }
+
+      console.log(`[YAAM Reconciler] scheduleFull completed. Queued: ${queued}, Primed (Skipped): ${primed}`);
 
       // Delete stale files (in graph but not on disk).
       for (const [fileId, _] of graphFiles) {

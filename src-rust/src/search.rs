@@ -387,7 +387,10 @@ impl Default for BM25FieldIndex {
 #[derive(Debug, Clone)]
 pub struct BM25Index {
     /// token → Vec<(doc_id, term_frequency)>
-    pub inverted_index: HashMap<String, Vec<(String, f32)>>,
+    pub inverted_index: HashMap<String, Vec<(u32, f32)>>,
+    pub id_map: HashMap<String, u32>,
+    pub rev_id_map: HashMap<u32, String>,
+    pub next_id: u32,
     /// doc_id → document length (number of tokens)
     pub doc_lengths: HashMap<String, f32>,
     /// Average document length across all indexed documents.
@@ -401,6 +404,9 @@ impl BM25Index {
     pub fn new() -> Self {
         Self {
             inverted_index: HashMap::new(),
+            id_map: HashMap::new(),
+            rev_id_map: HashMap::new(),
+            next_id: 1,
             doc_lengths: HashMap::new(),
             avg_doc_length: 0.0,
             doc_count: 0,
@@ -437,12 +443,19 @@ impl BM25Index {
             *tf_map.entry(token.clone()).or_insert(0.0) += 1.0;
         }
 
+        let internal_id = *self.id_map.entry(doc_id.to_string()).or_insert_with(|| {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.rev_id_map.insert(id, doc_id.to_string());
+            id
+        });
+
         // Insert into inverted index.
         for (token, freq) in tf_map {
             self.inverted_index
                 .entry(token)
                 .or_insert_with(Vec::new)
-                .push((doc_id.to_string(), freq));
+                .push((internal_id, freq));
         }
 
         self.doc_lengths.insert(doc_id.to_string(), doc_len);
@@ -460,14 +473,23 @@ impl BM25Index {
         }
         self.doc_count -= 1;
 
+        let internal_id = match self.id_map.get(doc_id) {
+            Some(&id) => id,
+            None => return,
+        };
+
         // Remove doc_id from every posting list; drop empty lists.
         let mut empty_tokens = Vec::new();
         for (token, postings) in self.inverted_index.iter_mut() {
-            postings.retain(|(id, _)| id != doc_id);
+            postings.retain(|(id, _)| *id != internal_id);
             if postings.is_empty() {
                 empty_tokens.push(token.clone());
             }
+            postings.shrink_to_fit(); // Prevent capacity leaks!
         }
+        
+        self.id_map.remove(doc_id);
+        self.rev_id_map.remove(&internal_id);
         for token in empty_tokens {
             self.inverted_index.remove(&token);
         }
@@ -475,36 +497,17 @@ impl BM25Index {
         self.recompute_avg();
     }
 
-    /// Search the index and return the top-k documents ranked by BM25 score.
-    ///
-    /// The query is tokenized identically to documents. For each query token
-    /// the BM25 score contribution is accumulated per document. Results are
-    /// returned as `(doc_id, score)` pairs sorted descending by score.
-    ///
-    /// # BM25 Formula
-    ///
-    /// ```text
-    /// score(D, Q) = Σ IDF(qi) · ( tf(qi, D) · (k1 + 1) )
-    ///                           / ( tf(qi, D) + k1 · (1 - b + b · |D| / avgdl) )
-    /// ```
-    ///
-    /// where IDF uses the Robertson–Spärck Jones formula:
-    ///
-    /// ```text
-    /// IDF(qi) = ln( (N - n(qi) + 0.5) / (n(qi) + 0.5) + 1 )
-    /// ```
     pub fn search(&self, query: &str, top_k: usize) -> Vec<(String, f32)> {
         if self.doc_count == 0 {
             return Vec::new();
         }
 
         let query_tokens = tokenize(query);
-        let mut scores: HashMap<String, f32> = HashMap::new();
-
         let n = self.doc_count as f32;
+        let mut scores: HashMap<u32, f32> = HashMap::new();
 
-        for token in &query_tokens {
-            let postings = match self.inverted_index.get(token) {
+        for token in query_tokens {
+            let postings = match self.inverted_index.get(&token) {
                 Some(p) => p,
                 None => continue,
             };
@@ -513,18 +516,23 @@ impl BM25Index {
             // Robertson–Spärck Jones IDF with +1 to avoid negative values.
             let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
 
-            for (doc_id, tf) in postings {
+            for &(internal_id, tf) in postings {
+                let doc_id = self.rev_id_map.get(&internal_id).unwrap();
                 let doc_len = self.doc_lengths.get(doc_id).copied().unwrap_or(0.0);
                 let numerator = tf * (K1 + 1.0);
                 let denominator = tf + K1 * (1.0 - B + B * doc_len / self.avg_doc_length);
                 let score = idf * numerator / denominator;
 
-                *scores.entry(doc_id.clone()).or_insert(0.0) += score;
+                *scores.entry(internal_id).or_insert(0.0) += score;
             }
         }
 
-        // Sort by score descending, then by doc_id ascending for stability.
-        let mut results: Vec<(String, f32)> = scores.into_iter().collect();
+        let mut results: Vec<(String, f32)> = Vec::new();
+        for (internal_id, score) in scores {
+            if let Some(doc_id) = self.rev_id_map.get(&internal_id) {
+                results.push((doc_id.clone(), score));
+            }
+        }
         results.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)

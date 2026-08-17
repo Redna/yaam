@@ -290,23 +290,28 @@ impl MemoryEngine {
 
     /// Find old inactive Workspaces (and their Scratchpads), generate deletion
     /// events for them (which can be archived), and remove them from the graph.
-    /// `max_age_seconds` is compared against `closed_at`.
-    pub fn prune_old_workspaces(&mut self, max_age_seconds: u64) -> Vec<Event> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let mut to_delete = Vec::new();
-        let mut archive_events = Vec::new();
+    /// Retains up to `max_inactive_count` inactive workspaces (newest first).
+    pub fn prune_old_workspaces(&mut self, max_inactive_count: usize) -> Vec<Event> {
+        let mut inactive_workspaces = Vec::new();
 
-        // 1. Identify stale Workspaces
+        // 1. Identify all inactive Workspaces
         for node in self.nodes.values() {
             if let NodeLabel::Workspace { status, closed_at, description: _ } = &node.label {
                 if status == "inactive" {
-                    if let Some(closed) = closed_at {
-                        if now > *closed && now - *closed > max_age_seconds {
-                            to_delete.push(node.id.clone());
-                        }
-                    }
+                    inactive_workspaces.push((node.id.clone(), closed_at.unwrap_or(0)));
                 }
             }
+        }
+
+        // Sort by closed_at descending (newest first)
+        inactive_workspaces.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut to_delete = Vec::new();
+        let mut archive_events = Vec::new();
+
+        // Mark any inactive workspace beyond the limit for deletion
+        for (id, _) in inactive_workspaces.into_iter().skip(max_inactive_count) {
+            to_delete.push(id);
         }
 
         // 2. Identify associated Scratchpads

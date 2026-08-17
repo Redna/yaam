@@ -8,6 +8,14 @@ import { startServerIfNeeded } from "./visualizer.js";
 import * as path from "path";
 
 export default function yaamExtension(pi: ExtensionAPI) {
+  const os = require('os');
+  // Prevent YAAM from running in the home directory (e.g., when loaded globally by pi-web-sessiond)
+  // because scanning the entire home directory will cause massive OOM crashes.
+  if (process.cwd() === os.homedir()) {
+    console.warn("[YAAM] Refusing to start in home directory to prevent OOM.");
+    return;
+  }
+
   const eventsPath = path.resolve(process.cwd(), "events.jsonl");
   const engine = new YaamEngineClient(eventsPath);
   const reconciler = new Reconciler(engine);
@@ -103,11 +111,12 @@ export default function yaamExtension(pi: ExtensionAPI) {
     }
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
-    try {
-      await engine.start();
-      setStatus(ctx, "yaam", "Ready ✅");
+    (async () => {
+      try {
+        await engine.start();
+        setStatus(ctx, "yaam", "Ready ✅");
       
       // Auto-compact on startup to clear historical churn and archive old workspaces
       try {
@@ -157,10 +166,11 @@ export default function yaamExtension(pi: ExtensionAPI) {
           }, { deliverAs: "nextTurn" });
         }
       })();
-    } catch (e: any) {
-      setStatus(ctx, "yaam", `Error ❌`);
-      ctx.ui.notify(`Failed to start YAAM Engine: ${e.message}`, "error");
-    }
+      } catch (e: any) {
+        setStatus(ctx, "yaam", `Error ❌`);
+        ctx.ui.notify(`Failed to start YAAM Engine: ${e.message}`, "error");
+      }
+    })();
   });
 
   // NOTE: Do NOT modify the system prompt via before_agent_start.

@@ -667,8 +667,8 @@ fn handle_delete_edges(
 fn handle_compact(state: &AppState) -> Result<serde_json::Value, RpcResponse> {
     let (archive_events, new_state_events) = {
         let mut engine = state.engine.write().unwrap();
-        // Prune workspaces closed > 30 days ago (30 * 24 * 60 * 60 = 2592000 seconds)
-        let archive_events = engine.prune_old_workspaces(2592000);
+        // Prune inactive workspaces, keeping only the 20 most recent
+        let archive_events = engine.prune_old_workspaces(20);
         let new_state_events = engine.synthesize_current_state();
         (archive_events, new_state_events)
     };
