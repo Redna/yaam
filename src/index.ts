@@ -119,10 +119,12 @@ export default function yaamExtension(pi: ExtensionAPI) {
         setStatus(ctx, "yaam", "Ready ✅");
       
       // Auto-compact on startup to clear historical churn and archive old workspaces
-      try {
-        await (engine as any).request("compact", {});
-      } catch (e) {
-        // Ignore compaction errors
+      if (process.env.YAAM_DISABLE_AUTO_COMPACT !== "true") {
+        try {
+          await (engine as any).request("compact", {});
+        } catch (e) {
+          // Ignore compaction errors
+        }
       }
 
       reconciler.scheduleFull().catch(() => {});
