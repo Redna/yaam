@@ -5,8 +5,8 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 
 async fn get_daemon_connection() -> Result<TcpStream, String> {
-    // Attempt up to 30 times (3 seconds) to connect
-    for _ in 0..30 {
+    let mut spawned = false;
+    for _ in 0..50 {
         if let Ok(port_str) = std::fs::read_to_string(".yaam/daemon.port") {
             if let Ok(port) = port_str.trim().parse::<u16>() {
                 if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
@@ -15,10 +15,14 @@ async fn get_daemon_connection() -> Result<TcpStream, String> {
             }
         }
         
-        // If we get here, either port file doesn't exist, is invalid, or connection failed.
-        // We fork the daemon.
-        let _ = std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "yaam-engine".into()))
-            .spawn();
+        if !spawned {
+            let _ = std::fs::remove_file(".yaam/daemon.port");
+            let _ = std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "yaam-engine".into()))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            spawned = true;
+        }
             
         sleep(Duration::from_millis(100)).await;
     }
@@ -110,10 +114,10 @@ pub async fn run_mcp_bridge() {
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "query": { "type": "string" },
+                                    "text": { "type": "string" },
                                     "limit": { "type": "number" }
                                 },
-                                "required": ["query"]
+                                "required": ["text"]
                             }
                         },
                         {
