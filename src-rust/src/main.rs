@@ -12,6 +12,7 @@ mod document_adapter;
 mod graph;
 mod language_adapter;
 mod lsp_adapter;
+mod mcp;
 mod query_dsl;
 mod reconciler;
 mod rpc;
@@ -34,6 +35,11 @@ async fn main() {
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
     
+    if args.get(1).map(|s| s.as_str()) == Some("mcp") {
+        mcp::run_mcp_bridge().await;
+        std::process::exit(0);
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("setup") {
         eprintln!("Downloading ONNX model and tokenizer from HuggingFace...");
         if let Err(e) = embedding::download_model_files().await {
