@@ -430,7 +430,7 @@ export async function startServerIfNeeded(client: YaamEngineClient, port: number
             }
 
             const cyEdges: any[] = [];
-            const edgeRels = ["CALLS", "DECLARED_IN", "IMPORTS", "MAPPED_TO", "HAS_SCRATCHPAD", "IMPLEMENTS", "INHERITS_FROM"];
+            const edgeRels = ["CALLS", "DECLARED_IN", "IMPORTS", "MAPPED_TO", "HAS_SCRATCHPAD", "IMPLEMENTS", "INHERITS_FROM", "REFERENCES"];
             
             // Reconstruct edges via DSL traversal
             // 1 level outbound from each node for each relationship
