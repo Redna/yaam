@@ -56,6 +56,48 @@ export async function appendNote(
     properties: {}
   });
 
+  try {
+    // 1. Link to files mentioned by path or @filename
+    const fileEntities = await client.query({ match: { label: "Entity", entity_type: "File" }, return: ["id"] });
+    for (const f of fileEntities) {
+      if (!f.id) continue;
+      const basename = path.basename(f.id);
+      if (content.includes(f.id) || content.includes(`@${basename}`)) {
+        await client.linkNodes({
+          from_id: noteId,
+          to_id: f.id,
+          relationship: "ATTACHED_TO",
+          properties: {}
+        });
+      }
+    }
+
+    // 2. Link to entities mentioned by #Entity or @Entity
+    const entityRefs = new Set<string>();
+    const entRegex = /[@#]([a-zA-Z_]\w+)/g;
+    let match;
+    while ((match = entRegex.exec(content)) !== null) {
+      entityRefs.add(match[1]);
+    }
+
+    if (entityRefs.size > 0) {
+      const allEntities = await client.query({ match: { label: "Entity" }, return: ["id", "name"] });
+      for (const ent of allEntities) {
+        if (ent.name && entityRefs.has(ent.name)) {
+          await client.linkNodes({
+            from_id: noteId,
+            to_id: ent.id,
+            relationship: "REFERENCES",
+            properties: {}
+          });
+        }
+      }
+    }
+  } catch (e) {
+    // Fail silently so we don't break note saving if semantic linking fails
+    console.error("[YAAM] Semantic linking failed:", e);
+  }
+
   return `Note added to workspace '${workspace}'.`;
 }
 
@@ -64,16 +106,6 @@ export interface ReconcilerStatus {
   isRunning: boolean;
 }
 
-/**
- * Track a file accessed by a pi tool to the active workspace.
- * Uses pi's actual tool names: read, write, edit.
- *
- * This function is designed to be called fire-and-forget (not awaited by the
- * caller). It queries existing graph entities for the file and links them to
- * the active workspace via MAPPED_TO edges. It does NOT reconcile the file —
- * that is handled by `Reconciler.runSync()` via `scheduleIncremental()`, which
- * avoids a duplicate (and expensive) tree-sitter + LSP + embedding round-trip.
- */
 export async function trackAccessedFile(
   toolName: string,
   toolInput: any,
@@ -113,9 +145,6 @@ export async function trackAccessedFile(
 
   if (!wsName) return;
 
-  // Wait for any ongoing reconciliation to finish so entities are current.
-  // This is non-blocking to the agent since trackAccessedFile is fire-and-forget.
-  // Timeout after 30s to avoid infinite wait if reconciliation is stuck.
   if (reconciler) {
     let waitMs = 0;
     while (reconciler.isRunning && waitMs < 30000) {
@@ -124,11 +153,6 @@ export async function trackAccessedFile(
     }
   }
 
-  // Query existing entities declared in this file and link them to the workspace.
-  // We no longer call client.reconcile() here — that was duplicating the
-  // reconciliation already performed by Reconciler.runSync() via
-  // scheduleIncremental(). Entity IDs are deterministic (file_path:name), so
-  // MAPPED_TO edges remain valid even after re-reconciliation recreates them.
   try {
     if (fs.existsSync(resolvedPath)) {
       const entities = await client.query({
@@ -145,7 +169,5 @@ export async function trackAccessedFile(
         });
       }
     }
-  } catch (e) {
-    // Error mapping workspace to file
-  }
+  } catch (e) {}
 }

@@ -15,7 +15,7 @@ impl EmbeddingModel {
         let model_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
 
-        let session = Session::builder()?.commit_from_file(model_path)?;
+        let session = Session::builder()?.with_intra_threads(2)?.with_inter_threads(1)?.commit_from_file(model_path)?;
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 

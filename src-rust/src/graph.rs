@@ -59,6 +59,16 @@ impl MemoryEngine {
             "Scratchpad" => NodeLabel::Scratchpad {
                 created_at: extract_u64(props, "created_at"),
             },
+            "Issue" => NodeLabel::Issue {
+                title: extract_string(props, "title"),
+                status: extract_string(props, "status"),
+                created_at: extract_u64(props, "created_at"),
+            },
+            "PullRequest" => NodeLabel::PullRequest {
+                title: extract_string(props, "title"),
+                status: extract_string(props, "status"),
+                created_at: extract_u64(props, "created_at"),
+            },
             other => {
                 // Treat unknown labels as Entity with the raw label as entity_type.
                 NodeLabel::Entity {
@@ -359,6 +369,16 @@ impl MemoryEngine {
                     NodeLabel::Scratchpad { created_at } => {
                         props.insert("created_at".to_string(), serde_json::json!(created_at));
                     }
+                    NodeLabel::Issue { title, status, created_at } => {
+                        props.insert("title".to_string(), serde_json::json!(title));
+                        props.insert("status".to_string(), serde_json::json!(status));
+                        props.insert("created_at".to_string(), serde_json::json!(created_at));
+                    }
+                    NodeLabel::PullRequest { title, status, created_at } => {
+                        props.insert("title".to_string(), serde_json::json!(title));
+                        props.insert("status".to_string(), serde_json::json!(status));
+                        props.insert("created_at".to_string(), serde_json::json!(created_at));
+                    }
                     NodeLabel::Entity { entity_type, status, last_modified } => {
                         props.insert("entity_type".to_string(), serde_json::json!(entity_type));
                         props.insert("status".to_string(), serde_json::json!(status));
@@ -431,6 +451,16 @@ impl MemoryEngine {
                 NodeLabel::Scratchpad { created_at } => {
                     props.insert("created_at".to_string(), serde_json::json!(created_at));
                 }
+                NodeLabel::Issue { title, status, created_at } => {
+                    props.insert("title".to_string(), serde_json::json!(title));
+                    props.insert("status".to_string(), serde_json::json!(status));
+                    props.insert("created_at".to_string(), serde_json::json!(created_at));
+                }
+                NodeLabel::PullRequest { title, status, created_at } => {
+                    props.insert("title".to_string(), serde_json::json!(title));
+                    props.insert("status".to_string(), serde_json::json!(status));
+                    props.insert("created_at".to_string(), serde_json::json!(created_at));
+                }
             }
 
             events.push(crate::storage::upsert_node_event(
@@ -470,6 +500,8 @@ fn node_label_str(label: &NodeLabel) -> &'static str {
         NodeLabel::Entity { .. } => "Entity",
         NodeLabel::Workspace { .. } => "Workspace",
         NodeLabel::Scratchpad { .. } => "Scratchpad",
+        NodeLabel::Issue { .. } => "Issue",
+        NodeLabel::PullRequest { .. } => "PullRequest",
     }
 }
 

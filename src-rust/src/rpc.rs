@@ -213,6 +213,12 @@ fn build_bm25_fields(node: &MemoryNode) -> HashMap<String, String> {
                 fields.insert("content".to_string(), node.content.clone());
             }
         }
+        NodeLabel::Issue { title, .. } | NodeLabel::PullRequest { title, .. } => {
+            fields.insert("title".to_string(), title.clone());
+            if !node.content.is_empty() {
+                fields.insert("content".to_string(), node.content.clone());
+            }
+        }
     }
 
     fields
@@ -359,6 +365,13 @@ fn build_embedding_text_from_node(node: &MemoryNode) -> String {
         }
         NodeLabel::Scratchpad { .. } => {
             node.content.clone()
+        }
+        NodeLabel::Issue { title, .. } | NodeLabel::PullRequest { title, .. } => {
+            if node.content.is_empty() {
+                title.clone()
+            } else {
+                format!("{} {}", title, node.content)
+            }
         }
         NodeLabel::Entity { entity_type, .. } => {
             match entity_type.as_str() {
@@ -740,6 +753,8 @@ fn entity_type_string(label: &NodeLabel) -> String {
         NodeLabel::Entity { entity_type, .. } => entity_type.clone(),
         NodeLabel::Workspace { .. } => "Workspace".to_string(),
         NodeLabel::Scratchpad { .. } => "Scratchpad".to_string(),
+        NodeLabel::Issue { .. } => "Issue".to_string(),
+        NodeLabel::PullRequest { .. } => "PullRequest".to_string(),
     }
 }
 
@@ -1120,6 +1135,8 @@ fn handle_search(
                         NodeLabel::Entity { entity_type, .. } => entity_type.as_str(),
                         NodeLabel::Workspace { .. } => "Workspace",
                         NodeLabel::Scratchpad { .. } => "Scratchpad",
+                        NodeLabel::Issue { .. } => "Issue",
+                        NodeLabel::PullRequest { .. } => "PullRequest",
                     };
                     if !allowed_types.iter().any(|t| t == node_type) {
                         return false;
@@ -1185,6 +1202,8 @@ fn handle_search(
                     }
                     NodeLabel::Workspace { .. } => ("Workspace".to_string(), None),
                     NodeLabel::Scratchpad { .. } => ("Scratchpad".to_string(), None),
+                    NodeLabel::Issue { .. } => ("Issue".to_string(), None),
+                    NodeLabel::PullRequest { .. } => ("PullRequest".to_string(), None),
                 };
 
                 let category = file_path

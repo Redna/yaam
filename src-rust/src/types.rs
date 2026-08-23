@@ -89,6 +89,16 @@ pub enum NodeLabel {
     Scratchpad {
         created_at: u64,
     },
+    Issue {
+        title: String,
+        status: String,
+        created_at: u64,
+    },
+    PullRequest {
+        title: String,
+        status: String,
+        created_at: u64,
+    },
 }
 
 /// A node in the memory graph.

@@ -27,6 +27,15 @@ export class Reconciler {
 
   public scheduleIncremental(toolName: string, payload: any) {
     if (["write", "edit"].includes(toolName) && payload && payload.path) {
+      const walkPath = path;
+      const resolvedPath = walkPath.resolve(process.cwd(), payload.path);
+      const relPath = walkPath.relative(process.cwd(), resolvedPath);
+      
+      // Ignore files outside the project root or in hidden internal folders
+      if (relPath.startsWith('..') || relPath.startsWith('.yaam') || relPath.startsWith('.pi')) {
+        return;
+      }
+      
       this.syncQueue.add(payload.path);
       this.triggerSync();
     } else if (toolName === "bash") {
@@ -46,8 +55,8 @@ export class Reconciler {
     if (this.isPriming) return; // Full sync in progress — it handles everything
 
     const fs = await import('fs/promises');
-    const walkPath = require('path');
-    const { existsSync } = require('fs');
+    const walkPath = path;
+    const { existsSync } = await import('fs');
 
     const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
     const SKIP_DIRS = [
@@ -62,14 +71,15 @@ export class Reconciler {
       let files;
       try {
         files = await fs.readdir(dir);
-      } catch {
+      } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err);
         return filelist;
       }
       
       for (const file of files) {
         const filepath = walkPath.join(dir, file);
         try {
-          const stat = await fs.stat(filepath);
+          const stat = await fs.lstat(filepath);
           if (stat.isDirectory()) {
             if (!SKIP_DIRS.includes(file)) {
               await walkAsync(filepath, filelist);
@@ -77,7 +87,8 @@ export class Reconciler {
           } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {
             filelist.push(filepath);
           }
-        } catch { /* skip unreadable files */ }
+        } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err); /* skip unreadable files */ }
       }
       return filelist;
     };
@@ -94,12 +105,14 @@ export class Reconciler {
             this.syncQueue.add(relPath);
             found++;
           }
-        } catch { /* skip */ }
+        } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err); /* skip */ }
       }
       if (found > 0) {
         this.triggerSync();
       }
-    } catch {
+    } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err);
       // Scan failed — silently ignore
     }
   }
@@ -115,12 +128,74 @@ export class Reconciler {
    *
    * Stale files (in the graph but no longer on disk) are deleted.
    */
+  public async syncGithubContext() {
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT;
+    if (!token) {
+      console.log("[YAAM Reconciler] No GITHUB_TOKEN found, skipping GitHub context ingestion.");
+      return;
+    }
+
+    try {
+      console.log("[YAAM Reconciler] Fetching GitHub context...");
+      const res = await fetch("https://api.github.com/repos/Redna/evol-hive/issues?state=all&per_page=100", {
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Accept": "application/vnd.github.v3+json",
+          "User-Agent": "YAAM-Engine"
+        }
+      });
+
+      if (!res.ok) {
+        console.error(`[YAAM Reconciler] Failed to fetch GitHub context: ${res.statusText}`);
+        return;
+      }
+
+      const issues = await res.json();
+      let ingested = 0;
+
+      for (const item of issues) {
+        const isPr = !!item.pull_request;
+        const label = isPr ? "PullRequest" : "Issue";
+        const id = isPr ? `pr-${item.number}` : `issue-${item.number}`;
+        
+        await this.engine.upsertNode({
+          id,
+          label,
+          properties: {
+            title: item.title,
+            status: item.state,
+            created_at: Math.floor(new Date(item.created_at).getTime() / 1000),
+            name: `${label} #${item.number}`,
+            content: item.body || ""
+          }
+        });
+
+        if (isPr && item.body) {
+          const resolveMatch = item.body.match(/(?:closes|fixes|resolves) #(\d+)/i);
+          if (resolveMatch) {
+            const issueId = `issue-${resolveMatch[1]}`;
+            await this.engine.linkNodes({
+              from_id: id,
+              to_id: issueId,
+              relationship: "RESOLVES",
+              properties: {}
+            });
+          }
+        }
+        ingested++;
+      }
+      console.log(`[YAAM Reconciler] Successfully ingested ${ingested} GitHub issues/PRs.`);
+    } catch (err) {
+      console.error("[YAAM Reconciler] Error during GitHub context sync:", err);
+    }
+  }
+
   public async scheduleFull() {
     this.isPriming = true;
     try {
       const fs = await import('fs/promises');
-      const walkPath = require('path');
-      const { existsSync } = require('fs');
+      const walkPath = path;
+      const { existsSync } = await import('fs');
 
       const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
       const SKIP_DIRS = [
@@ -135,14 +210,15 @@ export class Reconciler {
         let files;
         try {
           files = await fs.readdir(dir);
-        } catch {
+        } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err);
           return filelist;
         }
         
         for (const file of files) {
           const filepath = walkPath.join(dir, file);
           try {
-            const stat = await fs.stat(filepath);
+            const stat = await fs.lstat(filepath);
             if (stat.isDirectory()) {
               if (!SKIP_DIRS.includes(file)) {
                 await walkAsync(filepath, filelist);
@@ -150,7 +226,8 @@ export class Reconciler {
             } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {
               filelist.push(filepath);
             }
-          } catch { /* skip unreadable files */ }
+          } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err); /* skip unreadable files */ }
         }
         return filelist;
       };
@@ -165,7 +242,8 @@ export class Reconciler {
           const lastMod = node.label?.last_modified ?? 0;
           graphFiles.set(node.id, lastMod);
         }
-      } catch {
+      } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err);
         // If query fails, graphFiles stays empty — all files will be queued
       }
 
@@ -202,7 +280,8 @@ export class Reconciler {
           }
           // Always update mtime baseline
           this.fileMtimes.set(relPath, stat.mtimeMs);
-        } catch { /* skip */ }
+        } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err); /* skip */ }
       }
 
       console.log(`[YAAM Reconciler] scheduleFull completed. Queued: ${queued}, Primed (Skipped): ${primed}`);
@@ -213,14 +292,18 @@ export class Reconciler {
           try {
             await this.engine.reconcile({ file_path: fileId, content: "" });
             this.contentHashes.delete(fileId);
-          } catch { /* ignore */ }
+          } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err); /* ignore */ }
         }
       }
+
+      await this.syncGithubContext();
 
       if (queued > 0 || this.syncQueue.size > 0) {
         this.triggerSync();
       }
-    } catch {
+    } catch (err) {
+      console.error("[YAAM Reconciler] Full sync error:", err);
       // Full sync error — trigger sync as fallback
       this.triggerSync();
     } finally {

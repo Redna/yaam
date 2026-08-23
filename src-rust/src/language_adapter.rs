@@ -138,9 +138,12 @@ impl LanguageAdapter for TypeScriptAdapter {
     fn query_source(&self) -> &'static str {
         r#"
         (class_declaration name: (type_identifier) @class.name)
+        (interface_declaration name: (type_identifier) @class.name)
+        (type_alias_declaration name: (type_identifier) @class.name)
         (function_declaration name: (identifier) @function.name)
         (method_definition name: (property_identifier) @method.name)
         (lexical_declaration (variable_declarator name: (identifier) @variable.name value: [(arrow_function) (function_expression)]))
+        (lexical_declaration (variable_declarator name: (identifier) @variable.name value: [(object) (as_expression)]))
         (call_expression function: (identifier) @call.name)
         (call_expression function: (member_expression property: (property_identifier) @call.name))
         (import_statement (import_clause (identifier) @import.name))

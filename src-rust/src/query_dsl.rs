@@ -258,11 +258,15 @@ fn apply_aggregation(
                     NodeLabel::Entity { entity_type, .. } => entity_type.clone(),
                     NodeLabel::Workspace { .. } => "Workspace".to_string(),
                     NodeLabel::Scratchpad { .. } => "Scratchpad".to_string(),
+                    NodeLabel::Issue { .. } => "Issue".to_string(),
+                    NodeLabel::PullRequest { .. } => "PullRequest".to_string(),
                 },
                 "label" => match &node.label {
                     NodeLabel::Entity { .. } => "Entity".to_string(),
                     NodeLabel::Workspace { .. } => "Workspace".to_string(),
                     NodeLabel::Scratchpad { .. } => "Scratchpad".to_string(),
+                    NodeLabel::Issue { .. } => "Issue".to_string(),
+                    NodeLabel::PullRequest { .. } => "PullRequest".to_string(),
                 },
                 "status" => match &node.label {
                     NodeLabel::Entity { status, .. } => status.clone(),
@@ -323,6 +327,18 @@ fn project_node(node: &MemoryNode, return_fields: Option<&[String]>, retrieval: 
             }),
             NodeLabel::Scratchpad { created_at } => serde_json::json!({
                 "label": "Scratchpad",
+                "created_at": created_at,
+            }),
+            NodeLabel::Issue { title, status, created_at } => serde_json::json!({
+                "label": "Issue",
+                "title": title,
+                "status": status,
+                "created_at": created_at,
+            }),
+            NodeLabel::PullRequest { title, status, created_at } => serde_json::json!({
+                "label": "PullRequest",
+                "title": title,
+                "status": status,
                 "created_at": created_at,
             }),
         },

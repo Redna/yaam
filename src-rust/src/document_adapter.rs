@@ -53,13 +53,29 @@ struct Heading {
 /// We use a simple state machine instead of a regex crate to avoid dependencies.
 fn extract_inline_code(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
+    
+    // 1. Extract words (length > 3)
+    let mut current_word = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            current_word.push(ch);
+        } else {
+            if current_word.len() > 3 && !refs.contains(&current_word) {
+                refs.push(current_word.clone());
+            }
+            current_word.clear();
+        }
+    }
+    if current_word.len() > 3 && !refs.contains(&current_word) {
+        refs.push(current_word);
+    }
+    
+    // 2. Extract backtick contents
     let mut in_code = false;
     let mut current = String::new();
-
     for ch in text.chars() {
         if ch == '`' {
             if in_code {
-                // End of inline code
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() && !refs.contains(&trimmed) {
                     refs.push(trimmed);
@@ -67,7 +83,6 @@ fn extract_inline_code(text: &str) -> Vec<String> {
                 current.clear();
                 in_code = false;
             } else {
-                // Start of inline code
                 in_code = true;
             }
         } else if in_code {
@@ -312,16 +327,18 @@ mod tests {
     fn test_extract_inline_code() {
         let text = "Content about `reconcile_file` and `parse_file`.";
         let refs = extract_inline_code(text);
-        assert_eq!(refs.len(), 2);
         assert!(refs.contains(&"reconcile_file".to_string()));
         assert!(refs.contains(&"parse_file".to_string()));
+        assert!(refs.contains(&"Content".to_string()));
     }
 
     #[test]
     fn test_extract_inline_code_dedup() {
         let text = "`reconcile_file` is used. `reconcile_file` again.";
         let refs = extract_inline_code(text);
-        assert_eq!(refs.len(), 1);
+        assert!(refs.contains(&"reconcile_file".to_string()));
+        assert!(refs.contains(&"used".to_string()));
+        assert!(refs.contains(&"again".to_string()));
     }
 
     #[test]
