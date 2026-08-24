@@ -49,3 +49,14 @@ With multiple agents potentially modifying the graph simultaneously:
 
 **Single vs. Multi-Workspace Daemon**
 One daemon per workspace (binding to a port derived from the workspace path hash) is recommended to ensure graphs from completely different codebases don't accidentally merge or leak context. This also resolves the limitation where `typescript-language-server` expects a single `rootUri`.
+
+---
+
+## 5. Distributed Agents (Cross-Machine Synchronization)
+
+When agents run on **separate machines** (e.g., CI runners), they cannot share a daemon. See [docs/DISTRIBUTED_AGENTS.md](docs/DISTRIBUTED_AGENTS.md) for the Git-based event sourcing pattern that synchronizes memory across ephemeral agent runs using:
+
+- A `memory` Git branch storing `events.jsonl` (base) and `events-<RUN_ID>.jsonl` (deltas)
+- `restore-memory.sh` / `save-memory.sh` scripts for per-run delta extraction
+- `run-compaction.sh` with a `yaam-compaction.lock` file for race-condition-free compaction
+- `YAAM_DISABLE_AUTO_COMPACT=true` to prevent the daemon from breaking delta calculation
