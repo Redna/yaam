@@ -264,10 +264,15 @@ EXAMPLES:
 
 3. Multi-hop impact analysis (outbound):
 {"match":{"id":"src/reconciler.ts::reconcile"}, "traverse":{"relationship":"CALLS","direction":"outbound","max_depth":3}}
+
+CRITICAL PERFORMANCE RULES:
+- Always use "limit" (e.g. "limit": 10) to prevent massive result sets from spooling to disk.
+- When traversing the graph for structural analysis, explicitly omit the "content" field to save LLM token context! (e.g. use "return_fields": ["id", "name", "entity_type"])
 `,
     promptSnippet: "Query YAAM memory graph with JSON DSL (read-only)",
     promptGuidelines: [
       "The YAAM graph is automatically reconciled. Use yaam_graph_explore with the JSON Query DSL to query files, functions, call graphs, imports, and workspace scratchpads.",
+      "CRITICAL: Always apply a 'limit' (e.g. 10) to queries, and use 'return_fields': ['id', 'name', 'entity_type'] to explicitly exclude the massive 'content' field when you only need structural/relationship data. This preserves your LLM context window.",
     ],
     parameters: Type.Object({
       query: Type.Any({ description: "The JSON Query DSL object (NOT Cypher!) specifying the match, where, and traverse parameters." }),
