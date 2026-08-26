@@ -28,6 +28,18 @@ export async function exploreGraph(
       return { text: "Query completed successfully. Zero rows returned." };
     }
 
+    const sanitizeRow = (r: any) => {
+      if (!r || typeof r !== 'object') return r;
+      const copy = { ...r };
+      if (typeof copy.content === 'string' && copy.content.length > 200) {
+        copy.content = copy.content.substring(0, 200) + '... [TRUNCATED]';
+      }
+      if (copy.embedding) {
+        delete copy.embedding;
+      }
+      return copy;
+    };
+
     if (rows.length > 20) {
       const tmpDir = path.join(baseDir, '.chunks', 'memory_dumps');
       if (!fs.existsSync(tmpDir)) {
@@ -35,7 +47,7 @@ export async function exploreGraph(
       }
       const outputFile = path.join(tmpDir, 'query_out.txt');
       const fileContent = `Source DSL: ${JSON.stringify(dsl)}\n${"=".repeat(40)}\n` +
-        rows.map((r: any) => JSON.stringify(r)).join("\n");
+        rows.map((r: any) => JSON.stringify(sanitizeRow(r))).join("\n");
       fs.writeFileSync(outputFile, fileContent, "utf-8");
       return {
         text: `SUCCESS: Query returned ${rows.length} rows. Results spooled to: '${outputFile}'.`,
@@ -44,7 +56,7 @@ export async function exploreGraph(
     }
 
     return {
-      text: `SUCCESS. Results:\n${rows.map((r: any) => JSON.stringify(r)).join("\n")}`,
+      text: `SUCCESS. Results:\n${rows.map((r: any) => JSON.stringify(sanitizeRow(r))).join("\n")}`,
     };
   } catch (err: any) {
     return { text: `Error executing query: ${err.message}` };
