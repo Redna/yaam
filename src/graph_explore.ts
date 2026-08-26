@@ -28,6 +28,8 @@ export async function exploreGraph(
       return { text: "Query completed successfully. Zero rows returned." };
     }
 
+    let filesOmitted = false;
+
     const sanitizeRow = (r: any) => {
       if (!r || typeof r !== 'object') return r;
       const copy = { ...r };
@@ -35,7 +37,8 @@ export async function exploreGraph(
       if (typeof copy.content === 'string') {
         const isFile = copy.entity_type === 'File' || copy.type === 'File';
         if (isFile) {
-          copy.content = "[File content omitted to prevent token bloat. Traverse inbound 'DECLARED_IN' edges to list entities, or use the 'read' tool to view the full source.]";
+          delete copy.content;
+          filesOmitted = true;
         } else {
           // For Functions, Classes, Types, Sections - 1000 chars preserves the signature + docstring + body
           if (copy.content.length > 1000) {
@@ -65,8 +68,10 @@ export async function exploreGraph(
       };
     }
 
+    const warning = filesOmitted ? "(Note: File contents omitted to prevent token bloat. Traverse inbound 'DECLARED_IN' edges to list entities, or use the 'read' tool to view full source.)\n" : "";
+
     return {
-      text: `SUCCESS. Results:\n${rows.map((r: any) => JSON.stringify(sanitizeRow(r))).join("\n")}`,
+      text: `SUCCESS. Results:\n${warning}${rows.map((r: any) => JSON.stringify(sanitizeRow(r))).join("\n")}`,
     };
   } catch (err: any) {
     return { text: `Error executing query: ${err.message}` };
