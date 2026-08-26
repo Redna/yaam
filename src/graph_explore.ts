@@ -31,9 +31,19 @@ export async function exploreGraph(
     const sanitizeRow = (r: any) => {
       if (!r || typeof r !== 'object') return r;
       const copy = { ...r };
-      if (typeof copy.content === 'string' && copy.content.length > 200) {
-        copy.content = copy.content.substring(0, 200) + '... [TRUNCATED]';
+      
+      if (typeof copy.content === 'string') {
+        const isFile = copy.entity_type === 'File' || copy.type === 'File';
+        if (isFile) {
+          copy.content = "[File content omitted to prevent token bloat. Traverse inbound 'DECLARED_IN' edges to list entities, or use the 'read' tool to view the full source.]";
+        } else {
+          // For Functions, Classes, Types, Sections - 1000 chars preserves the signature + docstring + body
+          if (copy.content.length > 1000) {
+            copy.content = copy.content.substring(0, 1000) + '\n... [BODY TRUNCATED]';
+          }
+        }
       }
+      
       if (copy.embedding) {
         delete copy.embedding;
       }
