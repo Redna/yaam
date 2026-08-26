@@ -22,6 +22,14 @@ export async function exploreGraph(
       }
     }
 
+    if (dsl && typeof dsl === 'object') {
+      if (dsl.limit === undefined || typeof dsl.limit !== 'number') {
+        dsl.limit = 25;
+      } else if (dsl.limit > 50) {
+        dsl.limit = 50;
+      }
+    }
+
     const rows = await client.query(dsl);
 
     if (rows.length === 0) {
