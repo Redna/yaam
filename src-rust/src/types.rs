@@ -237,6 +237,10 @@ pub struct DslQuery {
     /// Limit number of results.
     #[serde(default)]
     pub limit: Option<usize>,
+
+    /// Skip number of results (for pagination).
+    #[serde(default)]
+    pub skip: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

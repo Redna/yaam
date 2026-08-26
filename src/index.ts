@@ -252,6 +252,7 @@ JSON DSL STRUCTURE:
   },
   "aggregate": { "group_by": "type" | "label" | "status", "count": true },
   "limit": 20,
+  "skip": 0, // For pagination
   "return_fields": ["id", "name", "label", "content", "metadata"]
 }
 
