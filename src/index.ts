@@ -55,6 +55,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
       const bar = progressBar(pct);
       setStatus(lastCtx, "yaam", `Sync 🔄 ${p.detail} ${bar} ${p.current}/${p.total}`);
     }, 250);
+    statusTimer.unref();
   }
 
   // ─── Session lifecycle ───────────────────────────────────────────────────
@@ -181,6 +182,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
   // as one-time messages via pi.sendMessage instead.
 
   pi.on("session_shutdown", async () => {
+    // console.log("YAAM extension shutting down...");
     if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
     engine.stop();
   });

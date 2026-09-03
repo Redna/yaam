@@ -117,6 +117,7 @@ export class YaamEngineClient {
   private connectToDaemon(port: number): Promise<void> {
     return new Promise((resolve, reject) => {
       this.socket = new net.Socket();
+      this.socket.unref();
       let connected = false;
       
       this.socket.on('connect', () => {

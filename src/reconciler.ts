@@ -316,6 +316,7 @@ export class Reconciler {
     this.debounceTimer = setTimeout(() => {
       this.runSync().catch(e => {}); // Reconciler error suppressed
     }, 1000);
+    this.debounceTimer.unref();
   }
 
   private async runSync() {
