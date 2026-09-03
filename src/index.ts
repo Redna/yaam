@@ -122,7 +122,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
       // Auto-compact on startup to clear historical churn and archive old workspaces
       if (process.env.YAAM_DISABLE_AUTO_COMPACT !== "true") {
         try {
-          await (engine as any).request("compact", {});
+          await (engine as any).call("compact", {});
         } catch (e) {
           // Ignore compaction errors
         }
@@ -470,7 +470,7 @@ CRITICAL PERFORMANCE RULES:
       if (typeof args === 'string' && args.trim() === 'compact') {
         try {
           ctx.ui.notify("Compacting YAAM memory log...", "info");
-          const result = await (engine as any).request("compact", {});
+          const result = await (engine as any).call("compact", {});
           ctx.ui.notify(`Compaction successful. Archived ${result.archived_events_count || 0} old events, compacted graph to ${result.compacted_events_count || 0} events.`, "info");
         } catch (e: any) {
           ctx.ui.notify(`YAAM compaction error: ${e.message || String(e)}`, "error");

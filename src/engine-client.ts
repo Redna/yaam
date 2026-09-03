@@ -72,13 +72,17 @@ export class YaamEngineClient {
       spawn(binPath, [this.eventsPath], {
         detached: true,
         stdio: 'ignore',
-      }).unref();
+      })
+      .on('error', (err) => console.error("Failed to spawn YAAM daemon:", err))
+      .unref();
     } else {
       const cargoCmd = process.env.HOME ? path.join(process.env.HOME, '.cargo', 'bin', 'cargo') : 'cargo';
       spawn(cargoCmd, ['run', '--manifest-path', cargoTomlPath, '--release', '--', this.eventsPath], {
         detached: true,
         stdio: 'ignore',
-      }).unref();
+      })
+      .on('error', (err) => console.error("Failed to spawn cargo:", err))
+      .unref();
     }
 
     // Wait for the port file to be written
