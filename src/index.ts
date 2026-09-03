@@ -162,11 +162,15 @@ export default function yaamExtension(pi: ExtensionAPI) {
           // Send only the updated graph counts as a compact delta,
           // NOT a full [YAAM Memory Context] duplicate.
           const updateLine = memoryContext.split('\n')[0]; // e.g. "Graph: 181 Function, 39 Class, 18 File"
-          pi.sendMessage({
-            customType: "yaam_memory_context",
-            content: `[YAAM Context Update]\n${updateLine}\n(Reconciled graph reflects latest file changes.)`,
-            display: true,
-          }, { deliverAs: "nextTurn" });
+          try {
+            pi.sendMessage({
+              customType: "yaam_memory_context",
+              content: `[YAAM Context Update]\n${updateLine}\n(Reconciled graph reflects latest file changes.)`,
+              display: true,
+            }, { deliverAs: "nextTurn" });
+          } catch (e: any) {
+            // Ignore stale session errors if pi closed or switched contexts
+          }
         }
       })();
       } catch (e: any) {
