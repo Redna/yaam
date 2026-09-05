@@ -90,19 +90,7 @@ impl MemoryEngine {
         // sections may have multiple for chunked long text.
         let embedding = props
             .get("embedding")
-            .and_then(|v| v.as_array())
-            .map(|outer| {
-                outer
-                    .iter()
-                    .filter_map(|inner| {
-                        inner.as_array().map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect::<Vec<f32>>()
-                        })
-                    })
-                    .collect::<Vec<Vec<f32>>>()
-            });
+            .and_then(|v| crate::embedding::decode_embeddings_base64(v));
 
         let node = MemoryNode {
             id: payload.id.clone(),

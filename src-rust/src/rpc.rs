@@ -487,8 +487,9 @@ fn handle_upsert_node(
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 {
                         if let Ok(kb) = parts[1].parse::<u64>() {
-                            if kb / 1024 < 300 { // Less than 300MB available
+                            if kb / 1024 < 800 { // Less than 800MB available
                                 has_mem = false;
+                                eprintln!("WARNING: Host memory low ({} MB available) - skipping embeddings for node {}", kb / 1024, payload.id);
                             }
                         }
                     }
@@ -498,9 +499,20 @@ fn handle_upsert_node(
         }
     }
 
+    // Truncate massive tool outputs at the RPC boundary to prevent memory/disk inflation
+    let mut payload = payload;
+    if let Some(content_val) = payload.properties.get_mut("content") {
+        if let Some(content_str) = content_val.as_str() {
+            if content_str.len() > 32_000 {
+                let mut truncated = content_str[..32_000].to_string();
+                truncated.push_str("\n\n...[Content truncated by YAAM daemon to prevent memory inflation]...");
+                *content_val = serde_json::json!(truncated);
+            }
+        }
+    }
+
     // Compute embedding for all node types (Workspace, Scratchpad, Entity)
     // Uses embedding cache to skip ONNX inference when text hasn't changed (Spec #3).
-    let mut payload = payload;
     if has_mem {
         if let Some(ref embedder) = state.embedder {
             let text_to_embed = build_embedding_text_from_props(&payload.label, &payload.properties);
@@ -514,7 +526,7 @@ fn handle_upsert_node(
                         if let Some(ref existing_embedding) = node.embedding {
                             payload.properties.insert(
                                 "embedding".to_string(),
-                                serde_json::to_value(existing_embedding).unwrap_or(serde_json::json!(null)),
+                                crate::embedding::encode_embeddings_base64(existing_embedding),
                             );
                         }
                     }
@@ -523,7 +535,7 @@ fn handle_upsert_node(
                     // Text is new or changed — compute embedding
                     match embedder.embed_chunked(&text_to_embed, 400, 50) {
                         Ok(vectors) => {
-                            payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+                            payload.properties.insert("embedding".to_string(), crate::embedding::encode_embeddings_base64(&vectors));
                             cache.set_hash(&payload.id, hash);
                         }
                         Err(e) => {
@@ -1417,7 +1429,7 @@ fn handle_reconcile(
                                     // Long text — fall back to embed_chunked for this entity
                                     match embedder.embed_chunked(text, 400, 50) {
                                         Ok(vectors) => {
-                                            payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+                                            payload.properties.insert("embedding".to_string(), crate::embedding::encode_embeddings_base64(&vectors));
                                             cache.set_hash(&payload.id, *hash);
                                         }
                                         Err(e) => {
@@ -1446,7 +1458,7 @@ fn handle_reconcile(
                         if let EventPayload::UpsertNode(ref mut payload) = events[*event_idx].payload {
                             match embedder.embed_chunked(text, 400, 50) {
                                 Ok(vectors) => {
-                                    payload.properties.insert("embedding".to_string(), serde_json::json!(vectors));
+                                    payload.properties.insert("embedding".to_string(), crate::embedding::encode_embeddings_base64(&vectors));
                                     cache.set_hash(&payload.id, *hash);
                                 }
                                 Err(e2) => {

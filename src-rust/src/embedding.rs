@@ -334,6 +334,11 @@ impl EmbeddingModel {
             chunks.push(current_chunk);
         }
 
+        // Cap chunk count to prevent unbounded memory growth on massive session-dump files.
+        // A single 500KB text could previously produce ~1,400 chunks. Capping to 16 limits 
+        // the explosion while retaining the start of the text for semantic search.
+        chunks.truncate(16);
+
         // Embed all chunks in a single batched ONNX forward pass
         let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
         let embeddings = self.embed_batch(&chunk_refs)?;
@@ -456,4 +461,42 @@ pub async fn download_model_files() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+pub fn encode_embeddings_base64(vectors: &[Vec<f32>]) -> serde_json::Value {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let b64_strings: Vec<String> = vectors.iter().map(|vec| {
+        let bytes: Vec<u8> = vec.iter().flat_map(|&f| f.to_le_bytes()).collect();
+        STANDARD.encode(&bytes)
+    }).collect();
+    serde_json::json!(b64_strings)
+}
+
+pub fn decode_embeddings_base64(val: &serde_json::Value) -> Option<Vec<Vec<f32>>> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    
+    // Support both old JSON float format and new base64 string format
+    let outer = val.as_array()?;
+    let mut result = Vec::new();
+    
+    for inner in outer {
+        if let Some(s) = inner.as_str() {
+            if let Ok(bytes) = STANDARD.decode(s) {
+                let mut vec = Vec::with_capacity(bytes.len() / 4);
+                for chunk in bytes.chunks_exact(4) {
+                    vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+                result.push(vec);
+            }
+        } else if let Some(arr) = inner.as_array() {
+            let vec: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            result.push(vec);
+        }
+    }
+    
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
