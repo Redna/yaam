@@ -101,7 +101,7 @@ async fn main() {
     // the client will connect to that one.
     let _ = std::fs::create_dir_all(".yaam");
     let mut claimed = false;
-    for _attempt in 0..2 {
+    for _attempt in 0..4 {
         match OpenOptions::new().write(true).create_new(true).open(".yaam/daemon.port") {
             Ok(mut file) => {
                 write!(file, "{}", port).expect("Failed to write port lockfile");
@@ -113,7 +113,12 @@ async fn main() {
                     .ok()
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                if !existing_port.is_empty() && port_is_alive(&existing_port) {
+                if existing_port.is_empty() {
+                    // Another daemon may be mid-write; give it a moment before deciding.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    continue;
+                }
+                if port_is_alive_retry(&existing_port, 3, 400) {
                     eprintln!(
                         "Another YAAM daemon is already running on port {}. Exiting.",
                         existing_port
@@ -121,8 +126,8 @@ async fn main() {
                     std::process::exit(0);
                 }
                 eprintln!(
-                    "Stale YAAM port file (port {}) — no daemon listening; taking over.",
-                    if existing_port.is_empty() { "?" } else { existing_port.as_str() }
+                    "Stale YAAM port file (port {}) — no daemon answered after retries; taking over.",
+                    existing_port
                 );
                 let _ = std::fs::remove_file(".yaam/daemon.port");
             }
@@ -148,6 +153,18 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            // Self-heal the port file: a takeover race or manual cleanup can
+            // remove it while this daemon keeps serving, which makes the
+            // workspace unreachable (the client then spawns duplicate daemons).
+            match std::fs::read_to_string(".yaam/daemon.port") {
+                Ok(v) if v.trim() == port.to_string() => {}
+                Ok(_) => { /* a different daemon owns the file — leave it alone */ }
+                Err(_) => {
+                    if std::fs::write(".yaam/daemon.port", port.to_string()).is_ok() {
+                        eprintln!("[yaam] port file was missing — rewrote {}", port);
+                    }
+                }
+            }
             if active_cloned.load(Ordering::SeqCst) == 0 {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 let last = last_activity_cloned.load(Ordering::SeqCst);
@@ -227,6 +244,22 @@ async fn main() {
     }
 }
 
+
+/// Probe a recorded port, retrying a few times before concluding it is dead.
+///
+/// A single failed probe is not proof: a daemon busy with a large reconcile can
+/// be slow to accept, and stealing its port file would orphan a live daemon.
+fn port_is_alive_retry(port: &str, attempts: u32, delay_ms: u64) -> bool {
+    for attempt in 0..attempts {
+        if port_is_alive(port) {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
+    false
+}
 
 /// True when something is listening on `127.0.0.1:<port>` (short timeout).
 ///

@@ -661,6 +661,31 @@ Capture names are categorized by prefix in `parse_file()`:
    python3 -c "import json; [print(f'{t[\"type\"]}: fields={[f for f in t.get(\"fields\",{})]}') for t in json.load(open('PATH')) if 'function' in t.get('type','').lower() or 'class' in t.get('type','').lower()]"
    ```
 
+### Running under a shared host (PI WEB and other session daemons)
+
+PI WEB loads Pi extensions **once per session daemon**, which starts in the home
+directory and hosts every workspace. Two rules follow:
+
+- **Scope state to the workspace, never to `process.cwd()`.** The engine client
+  derives the workspace root from the events path, so the port file and the
+  spawned daemon live in `<workspace>/.yaam/` — otherwise every workspace in the
+  host shares one daemon and one graph.
+- **Disable auto-compaction when the log is shared or synced**
+  (`YAAM_DISABLE_AUTO_COMPACT=true`), exactly as the Git-based pipeline already
+  requires. Auto-compaction rewrites `events.jsonl` on session start, which both
+  breaks delta calculation and drops graph state while the session runs.
+
+For the PI WEB session daemon (systemd user service), add a drop-in:
+
+```ini
+# ~/.config/systemd/user/pi-web-sessiond.service.d/yaam.conf
+[Service]
+Environment=YAAM_DISABLE_AUTO_COMPACT=true
+```
+
+then `systemctl --user daemon-reload` (the variable applies on the next daemon
+restart).
+
 ### Troubleshooting
 
 | Problem | Cause | Fix |

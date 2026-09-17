@@ -32,13 +32,27 @@ export class YaamEngineClient {
 
   constructor(private eventsPath: string) {}
 
+  /**
+   * Workspace root this client is bound to — derived from the events path, NOT
+   * from `process.cwd()`.
+   *
+   * The extension can run inside a shared host process (PI WEB's session daemon
+   * starts in $HOME and hosts every workspace), so `process.cwd()` is not the
+   * workspace. Using it put the port file in `$HOME/.yaam/daemon.port` and
+   * spawned the daemon with cwd=$HOME, which made unrelated workspaces share one
+   * daemon (wrong graph) and left the workspace's own port file unused.
+   */
+  private get workspaceRoot(): string {
+    return path.dirname(path.resolve(this.eventsPath));
+  }
+
   public async start(): Promise<void> {
     const port = await this.ensureDaemonRunning();
     await this.connectToDaemon(port);
   }
 
   private async ensureDaemonRunning(): Promise<number> {
-    const portFilePath = path.resolve(process.cwd(), '.yaam', 'daemon.port');
+    const portFilePath = path.resolve(this.workspaceRoot, '.yaam', 'daemon.port');
 
     // Check if daemon is already running
     if (fs.existsSync(portFilePath)) {
@@ -50,7 +64,20 @@ export class YaamEngineClient {
           await this.testConnection(port);
           return port; // Successfully connected to existing daemon
         } catch (e) {
-          console.log("Stale daemon port file detected, starting new daemon...");
+          // One failed probe is not proof of death: a daemon busy with a large
+          // reconcile can be slow to accept. Retry before stealing its file.
+          let alive = false;
+          for (let i = 0; i < 3 && !alive; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            try {
+              await this.testConnection(port);
+              alive = true;
+            } catch {
+              // keep retrying
+            }
+          }
+          if (alive) return port;
+          console.log("Stale daemon port file detected (no answer after retries), starting new daemon...");
           fs.unlinkSync(portFilePath);
         }
       }
@@ -70,6 +97,7 @@ export class YaamEngineClient {
 
     if (fs.existsSync(binPath)) {
       spawn(binPath, [this.eventsPath], {
+        cwd: this.workspaceRoot,
         detached: true,
         stdio: 'ignore',
       })
@@ -78,6 +106,7 @@ export class YaamEngineClient {
     } else {
       const cargoCmd = process.env.HOME ? path.join(process.env.HOME, '.cargo', 'bin', 'cargo') : 'cargo';
       spawn(cargoCmd, ['run', '--manifest-path', cargoTomlPath, '--release', '--', this.eventsPath], {
+        cwd: this.workspaceRoot,
         detached: true,
         stdio: 'ignore',
       })
