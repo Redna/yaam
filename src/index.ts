@@ -21,6 +21,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
   interface WorkspaceState {
     root: string;
     engine: YaamEngineClient;
+    reconcilerEngine: YaamEngineClient;
     reconciler: Reconciler;
     memoryContext: string;
   }
@@ -47,7 +48,18 @@ export default function yaamExtension(pi: ExtensionAPI) {
     let state = workspaces.get(root);
     if (!state) {
       const engine = new YaamEngineClient(path.resolve(root, 'events.jsonl'));
-      state = { root, engine, reconciler: new Reconciler(engine), memoryContext: '' };
+      // The reconciler gets its OWN connection. A full sync issues hundreds of
+      // reconcile RPCs, and the daemon serves one connection serially, so
+      // sharing a socket made interactive tool calls queue behind the backlog
+      // and fail at their 30 s timeout (observed 2026-09-17).
+      const reconcilerEngine = new YaamEngineClient(path.resolve(root, 'events.jsonl'));
+      state = {
+        root,
+        engine,
+        reconcilerEngine,
+        reconciler: new Reconciler(reconcilerEngine),
+        memoryContext: '',
+      };
       workspaces.set(root, state);
     }
     return state;
@@ -201,7 +213,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
     if (!state) return;
     (async () => {
       try {
-        await state.engine.start();
+        await Promise.all([state.engine.start(), state.reconcilerEngine.start()]);
         setStatus(ctx, "yaam", "Ready ✅");
       
       // Auto-compact on startup to clear historical churn and archive old workspaces
@@ -286,7 +298,10 @@ export default function yaamExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     // console.log("YAAM extension shutting down...");
     if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-    for (const state of workspaces.values()) state.engine.stop();
+    for (const state of workspaces.values()) {
+      state.engine.stop();
+      state.reconcilerEngine.stop();
+    }
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -433,14 +448,11 @@ CRITICAL PERFORMANCE RULES:
         };
       }
       try {
-        // Optimistic background save — no full reconcile needed.
-        // The graph is already kept current by incremental syncs from
-        // tool_result hooks and the session_start full sync.
-        initializeWorkspace(params.name, params.description, state.engine)
-          .catch(e => {}); // Workspace init error suppressed
-        
+        // Await the write so the answer reflects reality: on 2026-09-17 a leg's
+        // note never landed while this tool still reported "background save".
+        await initializeWorkspace(params.name, params.description, state.engine);
         return {
-          content: [{ type: "text" as const, text: `Workspace '${params.name}' initialized successfully (background save).` }],
+          content: [{ type: "text" as const, text: `Workspace '${params.name}' initialized.` }],
           details: undefined,
         };
       } catch (e: any) {
@@ -476,12 +488,10 @@ CRITICAL PERFORMANCE RULES:
         };
       }
       try {
-        // Optimistic background save
-        appendNote(params.workspace, params.content, state.engine)
-          .catch(e => {}); // Workspace append note error suppressed
-
+        // Await the write and report the real outcome (see the initialize tool).
+        const noteId = await appendNote(params.workspace, params.content, state.engine);
         return {
-          content: [{ type: "text" as const, text: `Note added to workspace '${params.workspace}' (background save).` }],
+          content: [{ type: "text" as const, text: `Note ${noteId} added to workspace '${params.workspace}'.` }],
           details: undefined,
         };
       } catch (e: any) {
