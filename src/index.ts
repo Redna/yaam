@@ -27,12 +27,31 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
   /** Workspace root for a session context, or null for $HOME (OOM guard). */
   function resolveRoot(ctx: any): string | null {
-    const cwd = ctx && typeof ctx.cwd === 'string' && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
-    const root = path.resolve(cwd);
+    // `ctx.cwd` throws once the context is stale (session replaced/reloaded).
+    // Deferred work must pass a resolved root instead of a ctx, but stay
+    // defensive here so a stale ctx degrades to the process cwd.
+    let cwd: string | undefined;
+    try {
+      cwd = ctx && typeof ctx.cwd === 'string' && ctx.cwd.length > 0 ? ctx.cwd : undefined;
+    } catch {
+      cwd = undefined;
+    }
+    const root = path.resolve(cwd ?? process.cwd());
     return root === HOME ? null : root;
   }
 
   /** Lazily create (once per workspace) the engine + reconciler pair. */
+  function stateForRoot(root: string): WorkspaceState {
+    let state = workspaces.get(root);
+    if (!state) {
+      const engine = new YaamEngineClient(path.resolve(root, 'events.jsonl'));
+      state = { engine, reconciler: new Reconciler(engine), memoryContext: '' };
+      workspaces.set(root, state);
+    }
+    return state;
+  }
+
+  /** Resolve state from a live session/command ctx (never from deferred code). */
   function stateFor(ctx: any): WorkspaceState | null {
     const root = resolveRoot(ctx);
     if (!root) {
@@ -44,13 +63,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
       }
       return null;
     }
-    let state = workspaces.get(root);
-    if (!state) {
-      const engine = new YaamEngineClient(path.resolve(root, 'events.jsonl'));
-      state = { engine, reconciler: new Reconciler(engine), memoryContext: '' };
-      workspaces.set(root, state);
-    }
-    return state;
+    return stateForRoot(root);
   }
 
   // ─── Cached memory context (refreshed at session start) ──────────────────
@@ -68,10 +81,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
   }
 
   /** Poll reconciler progress and update the status bar every 250ms. */
-  function startStatusPolling(ctx: any) {
-    lastCtx = ctx;
-    const state = stateFor(ctx);
-    if (!state) return;
+  function startStatusPolling(state: WorkspaceState) {
     if (statusTimer) clearInterval(statusTimer);
     statusTimer = setInterval(() => {
       if (!state.reconciler.isRunning) {
@@ -93,9 +103,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
   // ─── Session lifecycle ───────────────────────────────────────────────────
 
-  async function refreshMemoryContext(ctx: any) {
-    const state = stateFor(ctx);
-    if (!state) return;
+  async function refreshMemoryContext(state: WorkspaceState) {
     try {
       const [typeRows, wsRows] = await Promise.all([
         state.engine.query({
@@ -172,13 +180,17 @@ export default function yaamExtension(pi: ExtensionAPI) {
       // so the graph is fully populated before any reconciliation happens.
       // No delay needed — this avoids the race condition where the old
       // 3-second setTimeout captured a partial graph mid-reconcile.
-      await refreshMemoryContext(ctx);
+      await refreshMemoryContext(state);
       if (state.memoryContext) {
-        pi.sendMessage({
-          customType: "yaam_memory_context",
-          content: `[YAAM Memory Context]\n${state.memoryContext}`,
-          display: true,
-        }, { deliverAs: "nextTurn" });
+        try {
+          pi.sendMessage({
+            customType: "yaam_memory_context",
+            content: `[YAAM Memory Context]\n${state.memoryContext}`,
+            display: true,
+          }, { deliverAs: "nextTurn" });
+        } catch (e: any) {
+          // Ignore stale session errors if pi closed or switched contexts
+        }
       }
 
       // Phase 2: After reconciliation finishes, send a COMPACT DELTA
@@ -194,7 +206,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
           await new Promise(r => setTimeout(r, 250));
         }
         const before = state.memoryContext;
-        await refreshMemoryContext(ctx);
+        await refreshMemoryContext(state);
         if (state.memoryContext && state.memoryContext !== before) {
           // Send only the updated graph counts as a compact delta,
           // NOT a full [YAAM Memory Context] duplicate.
@@ -211,8 +223,10 @@ export default function yaamExtension(pi: ExtensionAPI) {
         }
       })();
       } catch (e: any) {
-        setStatus(ctx, "yaam", `Error ❌`);
-        ctx.ui.notify(`Failed to start YAAM Engine: ${e.message}`, "error");
+        // This runs after awaits (engine start can take seconds), so the ctx may
+        // already be stale — never touch ctx.ui here.
+        setStatus(lastCtx, "yaam", `Error ❌`);
+        console.error(`[YAAM] Failed to start engine for ${state.engine ? "workspace" : "?"}: ${e?.message}`);
       }
     })();
   });
@@ -232,7 +246,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     const state = stateFor(ctx);
     if (state?.reconciler.isRunning) {
-      startStatusPolling(ctx);
+      startStatusPolling(state);
     } else {
       setStatus(ctx, "yaam", "Idle 💤");
     }
@@ -247,7 +261,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
     if (!state) return;
 
     if (["write", "edit", "bash", "read"].includes(toolName)) {
-      startStatusPolling(ctx);
+      startStatusPolling(state);
       // Fire workspace mapping in the background — does NOT block the agent.
       // trackAccessedFile queries existing graph entities instead of
       // performing a full reconcile, so it's lightweight. It waits for any
@@ -264,7 +278,8 @@ export default function yaamExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    startStatusPolling(ctx);
+    const state = stateFor(ctx);
+    if (state) startStatusPolling(state);
     // reconciler.scheduleFull(connMgr); (Disabled for now as Rust reconciler handles file-by-file)
   });
 
