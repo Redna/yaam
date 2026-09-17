@@ -94,22 +94,48 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("Failed to bind to random port");
     let port = listener.local_addr().unwrap().port();
     
-    // Atomically create the port file. If another daemon beat us to it,
-    // read its port and exit — the client will connect to the existing daemon.
+    // Claim the port file. A file left behind by a daemon that died without a
+    // graceful shutdown (SIGTERM, killed session, reboot) must not block every
+    // future start in this workspace: probe the recorded port first, and take
+    // the file over when nothing is listening. If a live daemon owns it, exit —
+    // the client will connect to that one.
     let _ = std::fs::create_dir_all(".yaam");
-    match OpenOptions::new().write(true).create_new(true).open(".yaam/daemon.port") {
-        Ok(mut file) => {
-            write!(file, "{}", port).expect("Failed to write port lockfile");
-        }
-        Err(_) => {
-            // Another daemon already created the port file. Read its port and exit.
-            if let Ok(existing_port_str) = std::fs::read_to_string(".yaam/daemon.port") {
-                let existing_port = existing_port_str.trim();
-                eprintln!("Another YAAM daemon is already starting on port {}. Exiting.", existing_port);
+    let mut claimed = false;
+    for _attempt in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(".yaam/daemon.port") {
+            Ok(mut file) => {
+                write!(file, "{}", port).expect("Failed to write port lockfile");
+                claimed = true;
+                break;
             }
-            std::process::exit(0);
+            Err(_) => {
+                let existing_port = std::fs::read_to_string(".yaam/daemon.port")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if !existing_port.is_empty() && port_is_alive(&existing_port) {
+                    eprintln!(
+                        "Another YAAM daemon is already running on port {}. Exiting.",
+                        existing_port
+                    );
+                    std::process::exit(0);
+                }
+                eprintln!(
+                    "Stale YAAM port file (port {}) — no daemon listening; taking over.",
+                    if existing_port.is_empty() { "?" } else { existing_port.as_str() }
+                );
+                let _ = std::fs::remove_file(".yaam/daemon.port");
+            }
         }
     }
+    if !claimed {
+        eprintln!("Could not claim .yaam/daemon.port (another daemon is racing us). Exiting.");
+        std::process::exit(1);
+    }
+
+    // Remove the port file on SIGTERM/SIGINT so a killed session does not leave
+    // a stale file behind for the next start.
+    spawn_shutdown_cleanup();
     
     let active_connections = Arc::new(AtomicUsize::new(0));
     let last_activity = Arc::new(AtomicU64::new(
@@ -201,3 +227,50 @@ async fn main() {
     }
 }
 
+
+/// True when something is listening on `127.0.0.1:<port>` (short timeout).
+///
+/// Used to distinguish a live daemon from a stale `.yaam/daemon.port` file left
+/// behind by a daemon that died without a graceful shutdown.
+fn port_is_alive(port: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr = match format!("127.0.0.1:{}", port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => addr,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Remove `.yaam/daemon.port` when this process receives SIGTERM or SIGINT, so a
+/// killed session does not leave a stale lockfile that blocks the next start.
+fn spawn_shutdown_cleanup() {
+    tokio::spawn(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut intr = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = intr.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = std::fs::remove_file(".yaam/daemon.port");
+        std::process::exit(0);
+    });
+}
