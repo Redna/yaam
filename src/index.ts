@@ -9,20 +9,51 @@ import * as path from "path";
 
 export default function yaamExtension(pi: ExtensionAPI) {
   const os = require('os');
-  // Prevent YAAM from running in the home directory (e.g., when loaded globally by pi-web-sessiond)
-  // because scanning the entire home directory will cause massive OOM crashes.
-  if (process.cwd() === os.homedir()) {
-    console.warn("[YAAM] Refusing to start in home directory to prevent OOM.");
-    return;
+  const HOME = path.resolve(os.homedir());
+
+  // One extension instance serves many workspaces (PI WEB's session daemon loads
+  // extensions once for every session it hosts), so engine state is resolved from
+  // the session context instead of process.cwd(). The home-directory OOM guard
+  // stays, but per workspace — it must never unregister the tools, which is what
+  // it used to do when the daemon's own cwd happened to be $HOME (every PI WEB
+  // session ended up tool-less while the pi CLI, started from a project, worked).
+  interface WorkspaceState {
+    engine: YaamEngineClient;
+    reconciler: Reconciler;
+    memoryContext: string;
+  }
+  const workspaces = new Map<string, WorkspaceState>();
+  let homeWarned = false;
+
+  /** Workspace root for a session context, or null for $HOME (OOM guard). */
+  function resolveRoot(ctx: any): string | null {
+    const cwd = ctx && typeof ctx.cwd === 'string' && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+    const root = path.resolve(cwd);
+    return root === HOME ? null : root;
   }
 
-  const eventsPath = path.resolve(process.cwd(), "events.jsonl");
-  const engine = new YaamEngineClient(eventsPath);
-  const reconciler = new Reconciler(engine);
+  /** Lazily create (once per workspace) the engine + reconciler pair. */
+  function stateFor(ctx: any): WorkspaceState | null {
+    const root = resolveRoot(ctx);
+    if (!root) {
+      if (!homeWarned) {
+        console.warn(
+          '[YAAM] Home directory workspace skipped (OOM guard); tools remain available for project workspaces.',
+        );
+        homeWarned = true;
+      }
+      return null;
+    }
+    let state = workspaces.get(root);
+    if (!state) {
+      const engine = new YaamEngineClient(path.resolve(root, 'events.jsonl'));
+      state = { engine, reconciler: new Reconciler(engine), memoryContext: '' };
+      workspaces.set(root, state);
+    }
+    return state;
+  }
 
   // ─── Cached memory context (refreshed at session start) ──────────────────
-  let memoryContext = "";
-
   // ─── UI helpers (safe in all modes) ─────────────────────────────────────
   let lastCtx: any = null;
   let statusTimer: ReturnType<typeof setInterval> | null = null;
@@ -39,14 +70,16 @@ export default function yaamExtension(pi: ExtensionAPI) {
   /** Poll reconciler progress and update the status bar every 250ms. */
   function startStatusPolling(ctx: any) {
     lastCtx = ctx;
+    const state = stateFor(ctx);
+    if (!state) return;
     if (statusTimer) clearInterval(statusTimer);
     statusTimer = setInterval(() => {
-      if (!reconciler.isRunning) {
+      if (!state.reconciler.isRunning) {
         setStatus(lastCtx, "yaam", "Ready ✅");
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         return;
       }
-      const p = reconciler.progress;
+      const p = state.reconciler.progress;
       if (!p) {
         setStatus(lastCtx, "yaam", "Sync 🔄 working…");
         return;
@@ -60,14 +93,16 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
   // ─── Session lifecycle ───────────────────────────────────────────────────
 
-  async function refreshMemoryContext() {
+  async function refreshMemoryContext(ctx: any) {
+    const state = stateFor(ctx);
+    if (!state) return;
     try {
       const [typeRows, wsRows] = await Promise.all([
-        engine.query({
+        state.engine.query({
           match: { label: "Entity" },
           aggregate: { group_by: "type", count: true }
         }),
-        engine.query({
+        state.engine.query({
           match: { label: "Workspace", status: "active" } }),
       ]);
 
@@ -89,7 +124,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
         // Fetch recent scratchpad notes
         try {
-          const notes = await engine.query({
+          const notes = await state.engine.query({
             match: { label: "Workspace", id: ws.id },
             traverse: { relationship: "HAS_SCRATCHPAD", direction: "outbound", max_depth: 1 },
             limit: 3,
@@ -106,40 +141,42 @@ export default function yaamExtension(pi: ExtensionAPI) {
         parts.push("No active workspace.");
       }
 
-      memoryContext = parts.join("\n");
+      state.memoryContext = parts.join("\n");
     } catch {
-      memoryContext = "";
+      state.memoryContext = "";
     }
   }
 
   pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
+    const state = stateFor(ctx);
+    if (!state) return;
     (async () => {
       try {
-        await engine.start();
+        await state.engine.start();
         setStatus(ctx, "yaam", "Ready ✅");
       
       // Auto-compact on startup to clear historical churn and archive old workspaces
       if (process.env.YAAM_DISABLE_AUTO_COMPACT !== "true") {
         try {
-          await (engine as any).call("compact", {});
+          await (state.engine as any).call("compact", {});
         } catch (e) {
           // Ignore compaction errors
         }
       }
 
-      reconciler.scheduleFull().catch(() => {});
+      state.reconciler.scheduleFull().catch(() => {});
 
       // Phase 1: Send context IMMEDIATELY from the persisted graph.
       // The daemon already loaded everything from events.jsonl on startup,
       // so the graph is fully populated before any reconciliation happens.
       // No delay needed — this avoids the race condition where the old
       // 3-second setTimeout captured a partial graph mid-reconcile.
-      await refreshMemoryContext();
-      if (memoryContext) {
+      await refreshMemoryContext(ctx);
+      if (state.memoryContext) {
         pi.sendMessage({
           customType: "yaam_memory_context",
-          content: `[YAAM Memory Context]\n${memoryContext}`,
+          content: `[YAAM Memory Context]\n${state.memoryContext}`,
           display: true,
         }, { deliverAs: "nextTurn" });
       }
@@ -153,15 +190,15 @@ export default function yaamExtension(pi: ExtensionAPI) {
         // scheduleFull() debounces 1s before processing starts.
         // Give it a moment to kick off, then poll until done.
         await new Promise(r => setTimeout(r, 1500));
-        while (reconciler.isRunning) {
+        while (state.reconciler.isRunning) {
           await new Promise(r => setTimeout(r, 250));
         }
-        const before = memoryContext;
-        await refreshMemoryContext();
-        if (memoryContext && memoryContext !== before) {
+        const before = state.memoryContext;
+        await refreshMemoryContext(ctx);
+        if (state.memoryContext && state.memoryContext !== before) {
           // Send only the updated graph counts as a compact delta,
           // NOT a full [YAAM Memory Context] duplicate.
-          const updateLine = memoryContext.split('\n')[0]; // e.g. "Graph: 181 Function, 39 Class, 18 File"
+          const updateLine = state.memoryContext.split('\n')[0]; // e.g. "Graph: 181 Function, 39 Class, 18 File"
           try {
             pi.sendMessage({
               customType: "yaam_memory_context",
@@ -188,12 +225,13 @@ export default function yaamExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     // console.log("YAAM extension shutting down...");
     if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-    engine.stop();
+    for (const state of workspaces.values()) state.engine.stop();
   });
 
   pi.on("turn_start", async (_event, ctx) => {
     lastCtx = ctx;
-    if (reconciler.isRunning) {
+    const state = stateFor(ctx);
+    if (state?.reconciler.isRunning) {
       startStatusPolling(ctx);
     } else {
       setStatus(ctx, "yaam", "Idle 💤");
@@ -205,6 +243,8 @@ export default function yaamExtension(pi: ExtensionAPI) {
   pi.on("tool_result", async (event, ctx) => {
     const toolName = (event as any).toolName;
     const toolInput = (event as any).input;
+    const state = stateFor(ctx);
+    if (!state) return;
 
     if (["write", "edit", "bash", "read"].includes(toolName)) {
       startStatusPolling(ctx);
@@ -212,14 +252,14 @@ export default function yaamExtension(pi: ExtensionAPI) {
       // trackAccessedFile queries existing graph entities instead of
       // performing a full reconcile, so it's lightweight. It waits for any
       // ongoing reconciliation to finish before linking entities.
-      trackAccessedFile(toolName, toolInput, engine, process.cwd(), reconciler)
+      trackAccessedFile(toolName, toolInput, state.engine, resolveRoot(ctx) ?? process.cwd(), state.reconciler)
         .catch(() => {});
       // Queue the touched file for incremental reconciliation.
       // - write/edit: queues the specific file via payload.path
       // - bash: scans for mtime changes (can't know which files were touched)
       // - read: scheduleIncremental ignores it (read-only, no changes)
       // The hash check in runSync() ensures unchanged files are skipped.
-      reconciler.scheduleIncremental(toolName, toolInput);
+      state.reconciler.scheduleIncremental(toolName, toolInput);
     }
   });
 
@@ -284,9 +324,16 @@ CRITICAL PERFORMANCE RULES:
     parameters: Type.Object({
       query: Type.Any({ description: "The JSON Query DSL object (NOT Cypher!) specifying the match, where, and traverse parameters." }),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = stateFor(ctx);
+      if (!state) {
+        return {
+          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+          details: undefined,
+        };
+      }
       try {
-        const result = await exploreGraph(params.query, engine, process.cwd());
+        const result = await exploreGraph(params.query, state.engine, resolveRoot(ctx) ?? process.cwd());
         return {
           content: [{ type: "text" as const, text: result.text }],
           details: { spooledTo: result.spooledTo },
@@ -315,12 +362,19 @@ CRITICAL PERFORMANCE RULES:
       name: Type.String({ description: "The unique name of the workspace (e.g. 'auth-fix', 'ui-refactor')." }),
       description: Type.String({ description: "Detailed description of the task." }),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = stateFor(ctx);
+      if (!state) {
+        return {
+          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+          details: undefined,
+        };
+      }
       try {
         // Optimistic background save — no full reconcile needed.
         // The graph is already kept current by incremental syncs from
         // tool_result hooks and the session_start full sync.
-        initializeWorkspace(params.name, params.description, engine)
+        initializeWorkspace(params.name, params.description, state.engine)
           .catch(e => {}); // Workspace init error suppressed
         
         return {
@@ -351,10 +405,17 @@ CRITICAL PERFORMANCE RULES:
       workspace: Type.String({ description: "The name of the active workspace." }),
       content: Type.String({ description: "The insight content to record." }),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = stateFor(ctx);
+      if (!state) {
+        return {
+          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+          details: undefined,
+        };
+      }
       try {
         // Optimistic background save
-        appendNote(params.workspace, params.content, engine)
+        appendNote(params.workspace, params.content, state.engine)
           .catch(e => {}); // Workspace append note error suppressed
 
         return {
@@ -396,9 +457,16 @@ CRITICAL PERFORMANCE RULES:
       snippet: Type.Optional(Type.String({ description: "Optional: set to 'auto' to extract the best-matching passage from each result's content as a 'snippet' field." })),
       diversity_lambda: Type.Optional(Type.Number({ description: "Optional: MMR diversity lambda (0.0 = max diversity, 1.0 = max relevance). Default: 1.0 (pure relevance)." })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = stateFor(ctx);
+      if (!state) {
+        return {
+          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+          details: undefined,
+        };
+      }
       try {
-        const response = await engine.search({
+        const response = await state.engine.search({
           text: params.text,
           top_k: params.top_k,
           workspace: params.workspace,
@@ -454,11 +522,16 @@ CRITICAL PERFORMANCE RULES:
   pi.registerCommand("yaam", {
     description: "Show YAAM memory status. Use '/yaam viz' for a visual workspace graph view.",
     async handler(args, ctx) {
+      const state = stateFor(ctx);
+      if (!state) {
+        ctx.ui.notify("YAAM is disabled for the home directory workspace (OOM guard).", "info");
+        return;
+      }
       // ─── Subcommand: viz ──────────────────────────────────────────────
       if (typeof args === 'string' && args.trim() === 'viz') {
         try {
           ctx.ui.notify("Launching YAAM Visualizer... 🚀", "info");
-          const url = await startServerIfNeeded(engine, 3456);
+          const url = await startServerIfNeeded(state.engine, 3456);
           ctx.ui.notify(`YAAM Graph Visualizer is running at: ${url}`, "info");
         } catch (e: any) {
           ctx.ui.notify(`YAAM visualization error: ${e.message || String(e)}`, "error");
@@ -470,7 +543,7 @@ CRITICAL PERFORMANCE RULES:
       if (typeof args === 'string' && args.trim() === 'compact') {
         try {
           ctx.ui.notify("Compacting YAAM memory log...", "info");
-          const result = await (engine as any).call("compact", {});
+          const result = await (state.engine as any).call("compact", {});
           ctx.ui.notify(`Compaction successful. Archived ${result.archived_events_count || 0} old events, compacted graph to ${result.compacted_events_count || 0} events.`, "info");
         } catch (e: any) {
           ctx.ui.notify(`YAAM compaction error: ${e.message || String(e)}`, "error");
@@ -480,12 +553,12 @@ CRITICAL PERFORMANCE RULES:
 
       // ─── Default: status display ──────────────────────────────────────
       try {
-        const typeRows = await engine.query({
+        const typeRows = await state.engine.query({
           match: { label: "Entity" },
           aggregate: { group_by: "type", count: true }
         });
 
-        const wsRows = await engine.query({
+        const wsRows = await state.engine.query({
           match: { label: "Workspace", status: "active" }
         });
 
@@ -493,7 +566,7 @@ CRITICAL PERFORMANCE RULES:
         let notesRows = [];
 
         if (activeWs) {
-          notesRows = await engine.query({
+          notesRows = await state.engine.query({
             match: { label: "Workspace", id: activeWs },
             traverse: { relationship: "HAS_SCRATCHPAD", direction: "outbound", max_depth: 1 },
             limit: 5
@@ -531,7 +604,7 @@ CRITICAL PERFORMANCE RULES:
           }
         }
 
-        output += `\n🔄 Reconciler: ${reconciler.isRunning ? "running" : "idle"}`;
+        output += `\n🔄 Reconciler: ${state.reconciler.isRunning ? "running" : "idle"}`;
 
         ctx.ui.notify(output, "info");
       } catch (e: any) {
