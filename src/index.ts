@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as fs from "fs";
 import { Type } from "typebox";
 import { YaamEngineClient } from "./engine-client.js";
 import { Reconciler } from "./reconciler.js";
@@ -18,6 +19,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
   // it used to do when the daemon's own cwd happened to be $HOME (every PI WEB
   // session ended up tool-less while the pi CLI, started from a project, worked).
   interface WorkspaceState {
+    root: string;
     engine: YaamEngineClient;
     reconciler: Reconciler;
     memoryContext: string;
@@ -45,10 +47,48 @@ export default function yaamExtension(pi: ExtensionAPI) {
     let state = workspaces.get(root);
     if (!state) {
       const engine = new YaamEngineClient(path.resolve(root, 'events.jsonl'));
-      state = { engine, reconciler: new Reconciler(engine), memoryContext: '' };
+      state = { root, engine, reconciler: new Reconciler(engine), memoryContext: '' };
       workspaces.set(root, state);
     }
     return state;
+  }
+
+  /**
+   * Whether a full workspace reconcile is warranted.
+   *
+   * Every session used to call `reconciler.scheduleFull()`. Under a shared host
+   * (PI WEB) that means every session — including every subsession — re-parses
+   * the whole workspace, which saturates the daemon (agent queries then time out)
+   * and re-emits the graph as new events on each run.
+   *
+   * Rules: `YAAM_SKIP_FULL_RECONCILE=true` never reconciles;
+   * `YAAM_FORCE_FULL_RECONCILE=true` always does; otherwise reconcile when the
+   * graph has no files yet or the last full sync is older than the TTL
+   * (`YAAM_FULL_RECONCILE_TTL_MS`, default 6h). Incremental syncs from
+   * `tool_result` keep touched files fresh in between.
+   */
+  function needsFullReconcile(state: WorkspaceState): { needed: boolean; reason: string } {
+    if (process.env.YAAM_SKIP_FULL_RECONCILE === 'true') return { needed: false, reason: 'YAAM_SKIP_FULL_RECONCILE' };
+    if (process.env.YAAM_FORCE_FULL_RECONCILE === 'true') return { needed: true, reason: 'YAAM_FORCE_FULL_RECONCILE' };
+    const ttlMs = Number(process.env.YAAM_FULL_RECONCILE_TTL_MS ?? 6 * 60 * 60 * 1000);
+    const marker = path.resolve(state.root, '.yaam', 'last-full-reconcile');
+    let last = 0;
+    try {
+      last = Number(fs.readFileSync(marker, 'utf8').trim()) || 0;
+    } catch {
+      last = 0;
+    }
+    if (Date.now() - last < (Number.isFinite(ttlMs) ? ttlMs : 0)) return { needed: false, reason: `last full sync ${Math.round((Date.now() - last) / 60000)}m ago` };
+    return { needed: true, reason: last === 0 ? 'no recorded full sync' : 'full sync older than TTL' };
+  }
+
+  function markFullReconcile(state: WorkspaceState): void {
+    try {
+      fs.mkdirSync(path.resolve(state.root, '.yaam'), { recursive: true });
+      fs.writeFileSync(path.resolve(state.root, '.yaam', 'last-full-reconcile'), String(Date.now()));
+    } catch {
+      // diagnostics only — never break a session over the marker
+    }
   }
 
   /** Resolve state from a live session/command ctx (never from deferred code). */
@@ -173,7 +213,14 @@ export default function yaamExtension(pi: ExtensionAPI) {
         }
       }
 
-      state.reconciler.scheduleFull().catch(() => {});
+      const reconcileDecision = needsFullReconcile(state);
+      if (reconcileDecision.needed) {
+        markFullReconcile(state);
+        console.warn(`[yaam] full reconcile scheduled (${reconcileDecision.reason})`);
+        state.reconciler.scheduleFull().catch(() => {});
+      } else {
+        console.warn(`[yaam] full reconcile skipped (${reconcileDecision.reason}) — incremental syncs keep touched files fresh`);
+      }
 
       // Phase 1: Send context IMMEDIATELY from the persisted graph.
       // The daemon already loaded everything from events.jsonl on startup,
