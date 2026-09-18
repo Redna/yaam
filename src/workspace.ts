@@ -43,6 +43,22 @@ export async function appendNote(
   const noteId = `note_${Date.now()}`;
   const ts = Math.floor(Date.now() / 1000);
 
+  // Make sure the workspace node exists: a note appended before any
+  // `yaam_workspace_initialize` used to create a dangling HAS_SCRATCHPAD edge,
+  // so the workspace never showed up as active in the injected memory context.
+  try {
+    const existing = await client.query({ match: { label: "Workspace", id: workspace }, limit: 1 });
+    if (!Array.isArray(existing) || existing.length === 0) {
+      await client.upsertNode({
+        id: workspace,
+        label: "Workspace",
+        properties: { description: workspace, status: "active", closed_at: null }
+      });
+    }
+  } catch {
+    // Never block a note on workspace bookkeeping.
+  }
+
   await client.upsertNode({
     id: noteId,
     label: "Scratchpad",

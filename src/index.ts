@@ -98,9 +98,24 @@ export default function yaamExtension(pi: ExtensionAPI) {
    * (`YAAM_FULL_RECONCILE_TTL_MS`, default 6h). Incremental syncs from
    * `tool_result` keep touched files fresh in between.
    */
-  function needsFullReconcile(state: WorkspaceState): { needed: boolean; reason: string } {
+  async function needsFullReconcile(state: WorkspaceState): Promise<{ needed: boolean; reason: string }> {
     if (process.env.YAAM_SKIP_FULL_RECONCILE === 'true') return { needed: false, reason: 'YAAM_SKIP_FULL_RECONCILE' };
     if (process.env.YAAM_FORCE_FULL_RECONCILE === 'true') return { needed: true, reason: 'YAAM_FORCE_FULL_RECONCILE' };
+
+    // Layer 0 (code topology) is deliberately not persisted, so a restarted
+    // daemon starts with an empty graph. The marker alone would then skip the
+    // rebuild and leave the memory looking empty (observed: "28 Function,
+    // 10 File" right after a restart). An empty graph always needs a reconcile.
+    try {
+      const rows = await state.engine.query({
+        match: { label: 'Entity' },
+        aggregate: { group_by: 'type', count: true },
+      });
+      const entities = Array.isArray(rows) ? rows.reduce((n: number, r: any) => n + (r?.count ?? 0), 0) : -1;
+      if (entities === 0) return { needed: true, reason: 'graph empty (Layer 0 is rebuilt per session)' };
+    } catch {
+      // Query failed — fall through to the marker rule rather than guessing.
+    }
     const ttlMs = Number(process.env.YAAM_FULL_RECONCILE_TTL_MS ?? 6 * 60 * 60 * 1000);
     const marker = path.resolve(state.root, '.yaam', 'last-full-reconcile');
     let last = 0;
@@ -248,7 +263,7 @@ export default function yaamExtension(pi: ExtensionAPI) {
         }
       }
 
-      const reconcileDecision = needsFullReconcile(state);
+      const reconcileDecision = await needsFullReconcile(state);
       if (reconcileDecision.needed) {
         markFullReconcile(state);
         console.warn(`[yaam] full reconcile scheduled (${reconcileDecision.reason})`);
