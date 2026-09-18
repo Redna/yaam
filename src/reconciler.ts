@@ -63,7 +63,8 @@ export class Reconciler {
       'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
       '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
       '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out',
-      '.pi', '.pi-web'
+      '.pi', '.pi-web', '.claude', '.vscode', '.idea', 'coverage', '.turbo',
+      '.next', '.parcel-cache', 'screenshots'
     ];
 
     const walkAsync = async (dir: string, filelist: string[] = []): Promise<string[]> => {
@@ -81,7 +82,7 @@ export class Reconciler {
         try {
           const stat = await fs.lstat(filepath);
           if (stat.isDirectory()) {
-            if (!SKIP_DIRS.includes(file)) {
+            if (!SKIP_DIRS.includes(file) && !file.startsWith('session-logs')) {
               await walkAsync(filepath, filelist);
             }
           } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {
@@ -202,7 +203,8 @@ export class Reconciler {
         'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
         '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
         '.nvm', '.pyenv', 'venv', '.venv', '__pycache__', 'build', 'out',
-        '.pi', '.pi-web'
+        '.pi', '.pi-web', '.claude', '.vscode', '.idea', 'coverage', '.turbo',
+      '.next', '.parcel-cache', 'screenshots'
       ];
 
       const walkAsync = async (dir: string, filelist: string[] = []): Promise<string[]> => {
@@ -220,7 +222,7 @@ export class Reconciler {
           try {
             const stat = await fs.lstat(filepath);
             if (stat.isDirectory()) {
-              if (!SKIP_DIRS.includes(file)) {
+              if (!SKIP_DIRS.includes(file) && !file.startsWith('session-logs')) {
                 await walkAsync(filepath, filelist);
               }
             } else if (SUPPORTED_EXTENSIONS.some(ext => file.endsWith(ext))) {

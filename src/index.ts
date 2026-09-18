@@ -12,6 +12,24 @@ export default function yaamExtension(pi: ExtensionAPI) {
   const os = require('os');
   const HOME = path.resolve(os.homedir());
 
+  /**
+   * Hard kill-switch (`YAAM_DISABLED=true`).
+   *
+   * The daemon holds the ONNX model, embedding cache, BM25 index and the whole
+   * graph in RAM (~290 MB idle, 600 MB+ while starting, >1 GB after a full
+   * reconcile of a large workspace). On a small machine several of those are a
+   * real OOM risk, so a host must be able to turn the memory layer off without
+   * uninstalling the package. Tools stay registered and answer with a clear
+   * message instead of silently doing nothing.
+   */
+  const DISABLED = process.env.YAAM_DISABLED === 'true';
+  const DISABLED_MESSAGE =
+    'YAAM is disabled on this host (YAAM_DISABLED=true) — no daemon will be started. Unset the variable to re-enable memory.';
+  const disabledResult = () => ({
+    content: [{ type: 'text' as const, text: DISABLED_MESSAGE }],
+    details: undefined,
+  });
+
   // One extension instance serves many workspaces (PI WEB's session daemon loads
   // extensions once for every session it hosts), so engine state is resolved from
   // the session context instead of process.cwd(). The home-directory OOM guard
@@ -44,7 +62,8 @@ export default function yaamExtension(pi: ExtensionAPI) {
   }
 
   /** Lazily create (once per workspace) the engine + reconciler pair. */
-  function stateForRoot(root: string): WorkspaceState {
+  function stateForRoot(root: string): WorkspaceState | null {
+    if (DISABLED) return null;
     let state = workspaces.get(root);
     if (!state) {
       const engine = new YaamEngineClient(path.resolve(root, 'events.jsonl'));
@@ -209,6 +228,10 @@ export default function yaamExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
+    if (DISABLED) {
+      console.warn(`[yaam] ${DISABLED_MESSAGE}`);
+      return;
+    }
     const state = stateFor(ctx);
     if (!state) return;
     (async () => {
@@ -404,10 +427,12 @@ CRITICAL PERFORMANCE RULES:
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = stateFor(ctx);
       if (!state) {
-        return {
-          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
-          details: undefined,
-        };
+        return DISABLED
+          ? disabledResult()
+          : {
+              content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+              details: undefined,
+            };
       }
       try {
         const result = await exploreGraph(params.query, state.engine, resolveRoot(ctx) ?? process.cwd());
@@ -442,10 +467,12 @@ CRITICAL PERFORMANCE RULES:
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = stateFor(ctx);
       if (!state) {
-        return {
-          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
-          details: undefined,
-        };
+        return DISABLED
+          ? disabledResult()
+          : {
+              content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+              details: undefined,
+            };
       }
       try {
         // Await the write so the answer reflects reality: on 2026-09-17 a leg's
@@ -482,10 +509,12 @@ CRITICAL PERFORMANCE RULES:
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = stateFor(ctx);
       if (!state) {
-        return {
-          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
-          details: undefined,
-        };
+        return DISABLED
+          ? disabledResult()
+          : {
+              content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+              details: undefined,
+            };
       }
       try {
         // Await the write and report the real outcome (see the initialize tool).
@@ -532,10 +561,12 @@ CRITICAL PERFORMANCE RULES:
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = stateFor(ctx);
       if (!state) {
-        return {
-          content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
-          details: undefined,
-        };
+        return DISABLED
+          ? disabledResult()
+          : {
+              content: [{ type: "text" as const, text: "YAAM is disabled for the home directory workspace (OOM guard)." }],
+              details: undefined,
+            };
       }
       try {
         const response = await state.engine.search({

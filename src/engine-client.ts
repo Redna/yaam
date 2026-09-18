@@ -78,7 +78,9 @@ export class YaamEngineClient {
           }
           if (alive) return port;
           console.log("Stale daemon port file detected (no answer after retries), starting new daemon...");
-          fs.unlinkSync(portFilePath);
+          // force: the file can vanish between the probe and the unlink (another
+          // session's client doing the same thing) — ENOENT must not abort start.
+          fs.rmSync(portFilePath, { force: true });
         }
       }
     }
