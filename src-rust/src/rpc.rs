@@ -1335,6 +1335,33 @@ fn handle_reconcile(
 
     let path = std::path::Path::new(&request.file_path);
 
+    // Memory safety valve: stop accepting new graph work at the ceiling instead
+    // of growing until the host swaps or dies (see docs/MEMORY_FOOTPRINT.md).
+    if let Some((rss, ceiling)) = crate::over_rss_ceiling() {
+        eprintln!(
+            "[yaam] rss {} MB >= ceiling {} MB — refusing reconcile of {}",
+            rss, ceiling, request.file_path
+        );
+        return Ok(serde_json::json!({
+            "status": "refused",
+            "reason": "rss_ceiling",
+            "rss_mb": rss,
+            "max_rss_mb": ceiling,
+            "upserted_nodes": [],
+            "edges_pending": 0,
+        }));
+    }
+
+    // Documents are opt-in (they dominate a doc-heavy graph).
+    if !crate::index_docs() && request.file_path.ends_with(".md") {
+        return Ok(serde_json::json!({
+            "status": "skipped",
+            "reason": "docs_disabled",
+            "upserted_nodes": [],
+            "edges_pending": 0,
+        }));
+    }
+
     // Phase 1 (Spec #2): Parse with tree-sitter, upsert entities, collect references.
     // LSP is NOT passed here — references are collected for background resolution.
     let (mut events, pending_refs) = {

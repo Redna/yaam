@@ -58,7 +58,11 @@ export class Reconciler {
     const walkPath = path;
     const { existsSync } = await import('fs');
 
-    const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
+    // Documents are opt-in: indexing every .md in a repo dominates the graph
+    // (a doc-heavy workspace reached 1,809 Section nodes) and with it the RSS.
+    const SUPPORTED_EXTENSIONS = process.env.YAAM_INDEX_DOCS === 'true'
+      ? ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md']
+      : ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs'];
     const SKIP_DIRS = [
       'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
       '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',
@@ -198,7 +202,11 @@ export class Reconciler {
       const walkPath = path;
       const { existsSync } = await import('fs');
 
-      const SUPPORTED_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md'];
+      // Documents are opt-in: indexing every .md in a repo dominates the graph
+    // (a doc-heavy workspace reached 1,809 Section nodes) and with it the RSS.
+    const SUPPORTED_EXTENSIONS = process.env.YAAM_INDEX_DOCS === 'true'
+      ? ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.md']
+      : ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs'];
       const SKIP_DIRS = [
         'node_modules', 'dist', '.git', 'target', '.chunks', '.yaam',
         '.local', '.cache', '.npm', '.cargo', '.docker', '.rustup',

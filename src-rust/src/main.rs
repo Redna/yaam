@@ -40,12 +40,67 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub static PERSIST_RECONCILE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Soft memory ceiling in MB (`YAAM_MAX_RSS_MB`, default 800; 0 disables).
+///
+/// A full reconcile of a large workspace builds the whole graph in RAM and
+/// carries each node's embedding, so RSS grows with workspace size (measured:
+/// >2 GB for a ~1,000-file workspace with docs). Once the ceiling is reached the
+/// daemon stops accepting reconcile work instead of growing further, and says so
+/// in the reply and in a diagnostic line.
+pub static MAX_RSS_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(800);
+
+pub fn max_rss_mb() -> u64 {
+    MAX_RSS_MB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resident set size of this process in MB (Linux; 0 when unavailable).
+pub fn current_rss_mb() -> u64 {
+    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+        if let Some(pages) = statm.split_whitespace().nth(1) {
+            if let Ok(pages) = pages.parse::<u64>() {
+                let page = 4096u64;
+                return pages.saturating_mul(page) / (1024 * 1024);
+            }
+        }
+    }
+    0
+}
+
+/// `Some((rss, ceiling))` when this process is at or over the configured ceiling.
+pub fn over_rss_ceiling() -> Option<(u64, u64)> {
+    let ceiling = max_rss_mb();
+    if ceiling == 0 {
+        return None;
+    }
+    let rss = current_rss_mb();
+    if rss >= ceiling {
+        Some((rss, ceiling))
+    } else {
+        None
+    }
+}
+
+/// Documents (`.md` -> Section entities) are opt-in: they are the bulk of a
+/// doc-heavy workspace's graph. `YAAM_INDEX_DOCS=true` enables them.
+pub fn index_docs() -> bool {
+    std::env::var("YAAM_INDEX_DOCS").map(|v| v == "true").unwrap_or(false)
+}
+
 pub fn persist_reconcile() -> bool {
     PERSIST_RECONCILE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[tokio::main]
 async fn main() {
+    if let Ok(v) = std::env::var("YAAM_MAX_RSS_MB") {
+        if let Ok(v) = v.parse::<u64>() {
+            MAX_RSS_MB.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if !index_docs() {
+        eprintln!("[yaam] document indexing off (set YAAM_INDEX_DOCS=true to index .md files)");
+    }
+
     if std::env::var("YAAM_PERSIST_RECONCILE").map(|v| v == "true").unwrap_or(false) {
         PERSIST_RECONCILE.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[yaam] persisting reconcile-derived events (YAAM_PERSIST_RECONCILE=true)");

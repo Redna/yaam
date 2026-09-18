@@ -60,13 +60,25 @@ eviction still dominate.
 2. **Index code on demand, and never index junk.** Layer 0 (code topology) is
    regenerable from the checkout and does not need to be resident or durable;
    Layer 1 (workspaces + scratchpad notes) is tiny and is the part that must
-   survive across sessions. Keep `SKIP_DIRS` honest (`.claude`, `.pi-web`,
-   `session-logs*`, `screenshots`, caches — done in `cbb771e`) and consider
-   excluding docs from eager indexing entirely.
+   survive across sessions. `SKIP_DIRS` is honest (`.claude`, `.pi-web`,
+   `session-logs*`, `screenshots`, caches — `cbb771e`) and **documents are now
+   opt-in** (`YAAM_INDEX_DOCS=true`; default off, enforced in both the TS walk and
+   the Rust handler, verified: `{"status":"skipped","reason":"docs_disabled"}`).
+   That removes the 1,809 Section nodes from the default graph. Still to do: index
+   code lazily rather than eagerly at reconcile time.
 3. **Lazy embeddings.** Embed notes and query results, not every reconciled node.
    The ANN index can be built on demand for the subset that is actually searchable.
-4. **Idle eviction and a hard ceiling.** Drop ANN vectors when idle (they rebuild),
-   and refuse to grow past a configurable RSS limit instead of being OOM-killed.
+4. **~~Idle eviction and a hard ceiling~~ — partially done (2026-09-18).** The
+   daemon now refuses reconcile work once RSS reaches `YAAM_MAX_RSS_MB` (default
+   800; 0 disables) and logs `[yaam] rss <n> MB >= ceiling <m> MB — refusing
+   reconcile of <file>`. Measured on this workspace: without a ceiling a reconcile
+   climbed 1.0 → **2.09 GB** in 90 s; with `YAAM_MAX_RSS_MB=900` the same workload
+   stopped at **1.08 GB** and returned `{"status":"refused","reason":"rss_ceiling"}`
+   for the rest. Caveats: the **floor is ~600 MB** (ONNX model + runtime + caches)
+   before any user data, so ceilings below that refuse everything; and the check
+   runs per request, so a single large file can overshoot by a few hundred MB.
+   Still to do: evict rebuildable structures (ANN index, embedding cache) and
+   check the ceiling *inside* chunked embedding.
 5. **Bound the local log.** ~~Cap or compact `events.jsonl`~~ — **done
    (2026-09-18): reconcile-derived events are no longer persisted by default**
    (`YAAM_PERSIST_RECONCILE=false`). Layer 0 (code topology) still fills the
@@ -82,7 +94,9 @@ eviction still dominate.
 ## Acceptance criteria before re-enabling
 
 - **AC-1** A daemon's idle RSS is ≤ 300 MB and its post-reconcile RSS is ≤ 600 MB
-  on this workspace, measured and recorded.
+  on this workspace, measured and recorded. **Not met**: the floor is ~600 MB
+  (model + caches) and a full reconcile of this workspace reaches ~1.08 GB even
+  with the ceiling and docs off. Requires item 3 (lazy embeddings).
 - **AC-2** Exactly **one** daemon serves a workspace regardless of how many
   sessions, subsessions or reloads are active; `pgrep -x yaam-engine | wc -l` is 1.
 - **AC-3** The local `events.jsonl` stays bounded (a documented cap or compaction)
