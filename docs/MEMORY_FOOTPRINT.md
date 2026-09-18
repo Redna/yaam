@@ -67,9 +67,15 @@ eviction still dominate.
    The ANN index can be built on demand for the subset that is actually searchable.
 4. **Idle eviction and a hard ceiling.** Drop ANN vectors when idle (they rebuild),
    and refuse to grow past a configurable RSS limit instead of being OOM-killed.
-5. **Bound the local log.** Cap or compact `events.jsonl` (replay is the spike),
-   and do not persist baseline reconcile re-emissions as new events — the
-   reconcile-bloat issue (`~/yaam-issue-delta-bloat.md`).
+5. **Bound the local log.** ~~Cap or compact `events.jsonl`~~ — **done
+   (2026-09-18): reconcile-derived events are no longer persisted by default**
+   (`YAAM_PERSIST_RECONCILE=false`). Layer 0 (code topology) still fills the
+   in-memory graph and stays searchable; only Layer 1 (notes, workspaces) and
+   explicit mutations are written. Measured: a two-file reconcile produces the
+   same graph and search hits with **0** log lines, versus **5** with
+   `YAAM_PERSIST_RECONCILE=true`. Set the variable to `true` to restore the old
+   behaviour. Still to do here: a cap/compaction policy for long-lived Layer 1
+   logs. See also the reconcile-bloat issue (`~/yaam-issue-delta-bloat.md`).
 6. **Swap on the host.** Not a YAAM fix, but it converts a lock-up into a slow
    patch. 4 GB is enough for this stack.
 

@@ -1507,10 +1507,13 @@ fn handle_reconcile(
         let mut engine = state.engine.write().unwrap();
         
         for event in events {
-            // Append to JSONL
-            if let Err(e) = store.append(&event) {
-                eprintln!("Failed to append reconciled event: {}", e);
-                continue;
+            // Append to JSONL (skipped by default: Layer 0 is regenerable — see
+            // PERSIST_RECONCILE; the in-memory graph is updated either way).
+            if crate::persist_reconcile() {
+                if let Err(e) = store.append(&event) {
+                    eprintln!("Failed to append reconciled event: {}", e);
+                    continue;
+                }
             }
 
             // Apply to memory
@@ -1620,9 +1623,11 @@ fn handle_reconcile(
             let store = state.store.write().unwrap();
             let mut engine = state.engine.write().unwrap();
             for event in &relink_events {
-                if let Err(e) = store.append(event) {
-                    eprintln!("Failed to append relink event: {}", e);
-                    continue;
+                if crate::persist_reconcile() {
+                    if let Err(e) = store.append(event) {
+                        eprintln!("Failed to append relink event: {}", e);
+                        continue;
+                    }
                 }
                 engine.apply_event(event);
             }
@@ -1710,8 +1715,8 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
             }),
         };
 
-        // 6. Persist + apply
-        {
+        // 6. Persist (optional) + apply
+        if crate::persist_reconcile() {
             let store = state.store.write().unwrap();
             if let Err(e) = store.append(&event) {
                 eprintln!("Failed to append background LSP event: {}", e);

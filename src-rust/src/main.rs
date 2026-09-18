@@ -30,8 +30,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Persist reconcile-derived events (Layer 0: code topology) to `events.jsonl`.
+///
+/// Default **off**: the code graph is regenerable from the checkout, and
+/// re-emitting it on every reconcile is what ballooned the log (194k events /
+/// 229 MB observed) and the replay cost. Layer 1 (workspaces, scratchpad notes)
+/// and explicit mutations are always persisted. Set `YAAM_PERSIST_RECONCILE=true`
+/// to restore the old behaviour.
+pub static PERSIST_RECONCILE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn persist_reconcile() -> bool {
+    PERSIST_RECONCILE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[tokio::main]
 async fn main() {
+    if std::env::var("YAAM_PERSIST_RECONCILE").map(|v| v == "true").unwrap_or(false) {
+        PERSIST_RECONCILE.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[yaam] persisting reconcile-derived events (YAAM_PERSIST_RECONCILE=true)");
+    }
+
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
     
