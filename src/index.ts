@@ -518,9 +518,12 @@ CRITICAL PERFORMANCE RULES:
       }
       try {
         // Await the write and report the real outcome (see the initialize tool).
-        const noteId = await appendNote(params.workspace, params.content, state.engine);
+        // `appendNote` resolves with a message that names the note it created —
+        // report it verbatim (it used to be discarded, so a failed write still
+        // looked like success: the pilot leg's first note never landed).
+        const savedMessage = await appendNote(params.workspace, params.content, state.engine);
         return {
-          content: [{ type: "text" as const, text: `Note ${noteId} added to workspace '${params.workspace}'.` }],
+          content: [{ type: "text" as const, text: savedMessage }],
           details: undefined,
         };
       } catch (e: any) {

@@ -98,10 +98,11 @@ export async function appendNote(
     console.error("[YAAM] Semantic linking failed:", e);
   }
 
-  return `Note added to workspace '${workspace}'.`;
+  return `Note ${noteId} added to workspace '${workspace}'.`;
 }
 
 /** Minimal interface for checking reconciler status (avoids circular import). */
+
 export interface ReconcilerStatus {
   isRunning: boolean;
 }
