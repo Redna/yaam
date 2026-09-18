@@ -80,6 +80,18 @@ pub fn over_rss_ceiling() -> Option<(u64, u64)> {
     }
 }
 
+/// Whether reconcile computes embeddings for code entities.
+///
+/// Default **off**. Every embedded text costs one or more 512-token ONNX passes
+/// and the pass footprint dominates RSS (measured: >1 GB for a single large file
+/// before `with_memory_pattern(false)` and the chunk cap). Code search still works
+/// through BM25 + the graph; notes are always embedded because they are short and
+/// are the part semantic search is most useful for. `YAAM_EMBED_ON_RECONCILE=true`
+/// enables full semantic code search.
+pub fn embed_on_reconcile() -> bool {
+    std::env::var("YAAM_EMBED_ON_RECONCILE").map(|v| v == "true").unwrap_or(false)
+}
+
 /// Documents (`.md` -> Section entities) are opt-in: they are the bulk of a
 /// doc-heavy workspace's graph. `YAAM_INDEX_DOCS=true` enables them.
 pub fn index_docs() -> bool {

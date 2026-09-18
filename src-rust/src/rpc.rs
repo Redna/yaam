@@ -1372,6 +1372,9 @@ fn handle_reconcile(
     // Compute embeddings for Entity UpsertNode events before persistence.
     // Uses embedding cache to skip ONNX inference for unchanged entities (Spec #3).
     // Batch-embeds all cache misses in a single ONNX forward pass for efficiency.
+    // Reconcile-time embeddings are opt-in: each embedded text costs 512-token
+    // ONNX passes whose footprint dominates RSS (see docs/MEMORY_FOOTPRINT.md).
+    if crate::embed_on_reconcile() {
     if let Some(ref embedder) = state.embedder {
         // Phase A: Check cache for all entities, collect texts that need embedding
         // (cache misses). Reuse existing embeddings for cache hits.
@@ -1497,6 +1500,7 @@ fn handle_reconcile(
                 }
             }
         }
+    }
     }
 
     let mut generated_ids = Vec::new();

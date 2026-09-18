@@ -15,7 +15,16 @@ impl EmbeddingModel {
         let model_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
 
-        let session = Session::builder()?.with_intra_threads(2)?.with_inter_threads(1)?.commit_from_file(model_path)?;
+        // `with_memory_pattern(false)` matters more than it looks: the default
+        // pattern allocator keeps per-shape buffers alive for the life of the
+        // session, and this daemon runs many short 512-token passes (one per text
+        // chunk). Measured before the change: ~28 MB retained per pass, i.e.
+        // ~450 MB for a single 20 KB note and >1 GB for one large source file.
+        let mut builder = Session::builder()?
+            .with_intra_threads(2)?
+            .with_inter_threads(1)?
+            .with_memory_pattern(false)?;
+        let session = builder.commit_from_file(model_path)?;
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
@@ -334,10 +343,18 @@ impl EmbeddingModel {
             chunks.push(current_chunk);
         }
 
-        // Cap chunk count to prevent unbounded memory growth on massive session-dump files.
-        // A single 500KB text could previously produce ~1,400 chunks. Capping to 16 limits 
-        // the explosion while retaining the start of the text for semantic search.
-        chunks.truncate(16);
+        // Cap chunk count. 16 was still far too many: every chunk is a 512-token
+        // ONNX pass and the pass footprint dominates the daemon's RSS. The first
+        // chunks carry the start of the text, which is what semantic search needs.
+        // `YAAM_MAX_EMBED_CHUNKS` overrides (default 2, 0 = no embeddings).
+        let max_chunks = std::env::var("YAAM_MAX_EMBED_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        if max_chunks == 0 {
+            return Ok(Vec::new());
+        }
+        chunks.truncate(max_chunks);
 
         // Embed all chunks in a single batched ONNX forward pass
         let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();

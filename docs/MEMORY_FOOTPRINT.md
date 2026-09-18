@@ -17,6 +17,32 @@ The host (7.7 GB RAM, **no swap**) became unresponsive with two to three
 | 4 s after start with an **empty** `events.jsonl` | **612 MB** |
 | after replaying this workspace's 229 MB / 194k-event local log | **830 MB in seconds**, earlier 2.2 GB |
 
+## Root cause of the spike (measured 2026-09-18)
+
+The dominant consumer was **reconcile-time embeddings**, not the graph, the log or
+concurrency:
+
+| step | before | after |
+| --- | --- | --- |
+| floor (empty graph, model loaded) | 178 MB | 180 MB |
+| embed one **20 KB** text | **633 MB** (+455) | ~0 (2 chunks, cached) |
+| reconcile a 500-line file | **691 MB** (+504) | **189 MB** (+9) |
+| reconcile a 600-line file | **1108 MB** (+417) | **193 MB** (+4) |
+| one scratchpad note | 1108 MB | 194 MB |
+
+Each embedded text was chunked and **up to 16 chunks** were embedded, one 512-token
+ONNX forward pass each; the runtime retained roughly **28 MB per pass** (the default
+memory-pattern arena keeps per-shape buffers for the session's life), so a single
+20 KB note or one large source file cost ~450 MB that was never returned.
+
+Fixes: `Session::builder()?.with_memory_pattern(false)`; chunks capped by
+`YAAM_MAX_EMBED_CHUNKS` (default **2**, 0 disables embeddings); and reconcile-time
+embeddings are **off by default** (`YAAM_EMBED_ON_RECONCILE=true` enables them —
+code search then uses BM25 + the graph, while notes are still embedded because they
+are short and are what semantic search is most useful for). With those defaults a
+full code graph (23 functions / 5 classes / 3 files in the probe; ~1,000 files in
+the workspace) holds at **~190–200 MB**.
+
 ## Root causes
 
 **The floor is the model and the caches, not the data.** A daemon holds the ONNX
@@ -94,9 +120,10 @@ eviction still dominate.
 ## Acceptance criteria before re-enabling
 
 - **AC-1** A daemon's idle RSS is ≤ 300 MB and its post-reconcile RSS is ≤ 600 MB
-  on this workspace, measured and recorded. **Not met**: the floor is ~600 MB
-  (model + caches) and a full reconcile of this workspace reaches ~1.08 GB even
-  with the ceiling and docs off. Requires item 3 (lazy embeddings).
+  on this workspace, measured and recorded. **Met for the default configuration**
+  (reconcile embeddings off, docs off): ~190 MB after reconciling three real source
+  files. With `YAAM_EMBED_ON_RECONCILE=true` the first large batch still spikes
+  ~440 MB (one-time), so keep the ceiling (`YAAM_MAX_RSS_MB`) as the safety net.
 - **AC-2** Exactly **one** daemon serves a workspace regardless of how many
   sessions, subsessions or reloads are active; `pgrep -x yaam-engine | wc -l` is 1.
 - **AC-3** The local `events.jsonl` stays bounded (a documented cap or compaction)
