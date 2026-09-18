@@ -97,9 +97,19 @@ export class YaamEngineClient {
     const cargoTomlPath = path.resolve(yaamRoot, 'src-rust', 'Cargo.toml');
     const binPath = path.resolve(yaamRoot, 'src-rust', 'target', 'release', 'yaam-engine');
 
+    // Spawn with sane safety defaults: the host env may not carry them (PI WEB's
+    // session daemon is started once, long before these limits existed), and an
+    // unconstrained daemon grows with the graph. Explicit env always wins.
+    const daemonEnv = {
+      ...process.env,
+      YAAM_MAX_RSS_MB: process.env.YAAM_MAX_RSS_MB ?? '600',
+      YAAM_MAX_EMBED_CHUNKS: process.env.YAAM_MAX_EMBED_CHUNKS ?? '2',
+    };
+
     if (fs.existsSync(binPath)) {
       spawn(binPath, [this.eventsPath], {
         cwd: this.workspaceRoot,
+        env: daemonEnv,
         detached: true,
         stdio: 'ignore',
       })
@@ -109,6 +119,7 @@ export class YaamEngineClient {
       const cargoCmd = process.env.HOME ? path.join(process.env.HOME, '.cargo', 'bin', 'cargo') : 'cargo';
       spawn(cargoCmd, ['run', '--manifest-path', cargoTomlPath, '--release', '--', this.eventsPath], {
         cwd: this.workspaceRoot,
+        env: daemonEnv,
         detached: true,
         stdio: 'ignore',
       })
