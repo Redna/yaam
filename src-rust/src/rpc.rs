@@ -11,7 +11,7 @@ use crate::ann_index::AnnIndex;
 use crate::storage::EventStore;
 use crate::types::*;
 use crate::lsp_adapter::{LspAdapter, StdioLspClient};
-use crate::language_adapter::get_adapter;
+use crate::language_adapter::{get_adapter, lsp_resolver_enabled};
 use std::panic;
 use std::sync::{Arc, RwLock, Mutex};
 use std::collections::HashMap;
@@ -1273,6 +1273,13 @@ fn get_or_create_lsp(
     file_path: &std::path::Path,
 ) -> Option<Arc<Mutex<StdioLspClient>>> {
     let adapter = get_adapter(file_path)?;
+    // Gate the only spawn path for the LSP server (see `lsp_resolver_enabled`):
+    // default off, because the TypeScript LSP costs ~1.2 GB RSS in child
+    // processes that `YAAM_MAX_RSS_MB` does not cover. Cross-file resolution is
+    // enrichment — the graph resolves references without it.
+    if !lsp_resolver_enabled() {
+        return None;
+    }
     let lsp_cmd = adapter.lsp_command()?;
     let lang_id = adapter.language_id().to_string();
 

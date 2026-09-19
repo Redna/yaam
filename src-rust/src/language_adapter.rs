@@ -87,29 +87,47 @@ pub struct LanguageInfo {
     pub lsp_command: Option<LspCommand>,
 }
 
+/// Whether the optional LSP-based cross-file resolver is enabled.
+///
+/// **Default OFF.** The LSP server is enrichment only — `document_adapter.rs`
+/// resolves references from the graph itself — but it is expensive: for
+/// TypeScript it spawns `typescript-language-server` plus its two `tsserver`
+/// children, measured at **~1.2 GB RSS**, and that is **not** covered by
+/// `YAAM_MAX_RSS_MB` (which bounds only this process, not its children). Making
+/// it opt-in keeps the default footprint small; set `YAAM_LSP_RESOLVER=true` to
+/// turn cross-file LSP resolution back on.
+pub fn lsp_resolver_enabled() -> bool {
+    std::env::var("YAAM_LSP_RESOLVER")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
 /// Returns metadata for every registered language.
 ///
 /// This is the single source of truth for the language registry.
 /// When you add a new adapter, also add an entry here.
 pub fn list_languages() -> Vec<LanguageInfo> {
+    // The advertised LSP command follows the gate, so the registry reports what
+    // would actually be started (`lsp_running` can never be true while off).
+    let lsp = lsp_resolver_enabled();
     vec![
         LanguageInfo {
             name: "TypeScript".to_string(),
             extensions: vec!["ts".to_string(), "tsx".to_string(), "js".to_string(), "jsx".to_string()],
             language_id: "typescript".to_string(),
-            lsp_command: TypeScriptAdapter.lsp_command(),
+            lsp_command: if lsp { TypeScriptAdapter.lsp_command() } else { None },
         },
         LanguageInfo {
             name: "Python".to_string(),
             extensions: vec!["py".to_string()],
             language_id: "python".to_string(),
-            lsp_command: PythonAdapter.lsp_command(),
+            lsp_command: if lsp { PythonAdapter.lsp_command() } else { None },
         },
         LanguageInfo {
             name: "Rust".to_string(),
             extensions: vec!["rs".to_string()],
             language_id: "rust".to_string(),
-            lsp_command: RustAdapter.lsp_command(),
+            lsp_command: if lsp { RustAdapter.lsp_command() } else { None },
         },
     ]
 }
