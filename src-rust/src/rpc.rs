@@ -1744,8 +1744,24 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
     // 4. Resolve definition
     let locations = match lsp.get_definition(&pref.source_file_uri, pref.line, pref.col) {
         Ok(locs) => locs,
-        Err(_) => return,  // LSP failed — skip this reference
+        Err(e) => {
+            // Previously silent — an LSP that answers nothing looked identical to
+            // one that was never asked, which is why "imports in the graph" could
+            // not be verified from the outside.
+            eprintln!(
+                "[yaam] lsp: definition request failed for {} at {}:{} — {}",
+                pref.source_file, pref.line, pref.col, e
+            );
+            return;
+        }
     };
+    if locations.is_empty() {
+        eprintln!(
+            "[yaam] lsp: no definition for '{}' at {}:{}:{} (resolved 0 edges)",
+            pref.ref_name, pref.source_file, pref.line, pref.col
+        );
+        return;
+    }
     drop(lsp);  // Release LSP lock as early as possible
 
     // 5. Create LinkNodes event(s)
@@ -1760,6 +1776,10 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or(absolute_path);
         let target_id = format!("{}:{}", target_file_path, pref.ref_name);
+        eprintln!(
+            "[yaam] lsp: resolved {} --{}--> {}",
+            pref.source_id, pref.ref_type, target_id
+        );
 
         let event = Event {
             version: EVENT_VERSION,
