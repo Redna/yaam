@@ -25,8 +25,10 @@ use crate::types::{
     DeleteNodePayload, Event, EventPayload, EventType, LinkNodesPayload, EVENT_VERSION,
 };
 
-/// On-disk format version. Bump for any incompatible change.
-pub const CACHE_VERSION: u32 = 1;
+/// On-disk format version. Bump for any incompatible change. v2 adds the
+/// `signatures` / `diagnostics` / `implements` facts: a v1 entry would HIT and
+/// silently replay without them.
+pub const CACHE_VERSION: u32 = 2;
 /// File name written under the cache directory.
 pub const CACHE_FILE: &str = "reconcile-cache.json";
 
@@ -40,6 +42,31 @@ pub struct CachedRef {
     pub to_id: String,
     pub line: u32,
     pub col: u32,
+}
+
+/// Compiler diagnostics for one file (Leg 2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Diagnostics {
+    pub errors: u32,
+    pub warnings: u32,
+}
+
+/// An `IMPLEMENTS` edge found by `textDocument/implementation` (Leg 2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CachedImpl {
+    /// The implementor (class) — the resolved target of the implementation query.
+    pub from_id: String,
+    /// The declaration the query was made at (interface/superclass).
+    pub to_id: String,
+}
+
+/// The three richer facts, cached on the same content hash as `decls`/`refs`.
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    /// entity id -> trimmed first line of its hover text.
+    pub signatures: HashMap<String, String>,
+    pub diagnostics: Option<Diagnostics>,
+    pub implements: Vec<CachedImpl>,
 }
 
 /// One source file's cached state.
@@ -61,6 +88,15 @@ pub struct CacheEntry {
     /// this reaches zero — otherwise its resolved edges are incomplete.
     #[serde(default)]
     pub refs_pending: u32,
+    /// Leg 2: hover signatures per entity id.
+    #[serde(default)]
+    pub signatures: HashMap<String, String>,
+    /// Leg 2: compiler diagnostic counts for this file.
+    #[serde(default)]
+    pub diagnostics: Option<Diagnostics>,
+    /// Leg 2: `IMPLEMENTS` edges.
+    #[serde(default)]
+    pub implements: Vec<CachedImpl>,
 }
 
 /// Top-level cache document.
@@ -90,6 +126,105 @@ pub fn parser_tag() -> String {
         env!("CARGO_PKG_VERSION"),
         crate::language_adapter::lsp_resolver_enabled()
     )
+}
+
+/// Whether the extra LSP fact requests (hover/diagnostic/implementation) run.
+/// Default on; `YAAM_LSP_FACTS=off` disables all three request kinds.
+pub fn facts_enabled() -> bool {
+    std::env::var("YAAM_LSP_FACTS")
+        .map(|v| !v.eq_ignore_ascii_case("off"))
+        .unwrap_or(true)
+}
+
+/// Merge `entries` into a metadata JSON string, preserving existing keys.
+/// An empty or invalid metadata string is treated as an empty object.
+pub fn merge_metadata(metadata: &str, entries: &[(&str, serde_json::Value)]) -> String {
+    let mut obj = serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    for (key, value) in entries {
+        obj.insert((*key).to_string(), value.clone());
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// Extract the identifier starting at `(line0, col0)` (both 0-indexed).
+/// Used to turn an LSP `targetSelectionRange` into a target node name without
+/// needing the target file to already be in the graph.
+pub fn identifier_at_position(content: &str, line0: usize, col0: usize) -> Option<String> {
+    let line = content.lines().nth(line0)?;
+    let rest = line.get(col0..)?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Merge the three facts into the events about to be applied (miss path) or
+/// replayed (hit path): signatures/diagnostics go into the entity/file node's
+/// `metadata` string, implementations become `IMPLEMENTS` edges.
+pub fn apply_facts(events: &mut Vec<Event>, facts: &Facts) {
+    if facts.signatures.is_empty() && facts.diagnostics.is_none() && facts.implements.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    for event in events.iter_mut() {
+        let EventPayload::UpsertNode(ref mut payload) = event.payload else {
+            continue;
+        };
+        let entity_type = payload
+            .properties
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut updates: Vec<(&str, serde_json::Value)> = Vec::new();
+        if entity_type == "File" {
+            if let Some(d) = &facts.diagnostics {
+                updates.push((
+                    "diagnostics",
+                    serde_json::json!({"errors": d.errors, "warnings": d.warnings}),
+                ));
+            }
+        } else if let Some(sig) = facts.signatures.get(&payload.id) {
+            updates.push(("signature", serde_json::json!(sig)));
+        }
+        if updates.is_empty() {
+            continue;
+        }
+        let existing = payload
+            .properties
+            .get("metadata")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        payload.properties.insert(
+            "metadata".to_string(),
+            serde_json::Value::String(merge_metadata(existing, &updates)),
+        );
+    }
+
+    for imp in &facts.implements {
+        events.push(Event {
+            version: EVENT_VERSION,
+            timestamp: now,
+            event_type: EventType::LinkNodes,
+            payload: EventPayload::LinkNodes(LinkNodesPayload {
+                from_id: imp.from_id.clone(),
+                to_id: imp.to_id.clone(),
+                relationship: "IMPLEMENTS".to_string(),
+                properties: HashMap::new(),
+            }),
+        });
+    }
 }
 
 /// Stable content hash. `sha2` is already a dependency; `DefaultHasher` is
@@ -310,8 +445,22 @@ impl CacheHandle {
                 decls,
                 refs: Vec::new(),
                 refs_pending,
+                signatures: HashMap::new(),
+                diagnostics: None,
+                implements: Vec::new(),
             },
         );
+        self.dirty = true;
+    }
+
+    /// Attach the Leg 2 facts to an existing entry (after `put_decls`).
+    pub fn put_facts(&mut self, rel: &str, facts: &Facts) {
+        let Some(entry) = self.cache.files.get_mut(rel) else {
+            return;
+        };
+        entry.signatures = facts.signatures.clone();
+        entry.diagnostics = facts.diagnostics.clone();
+        entry.implements = facts.implements.clone();
         self.dirty = true;
     }
 
@@ -330,7 +479,14 @@ impl CacheHandle {
             entry.refs_pending -= 1;
         }
         if let Some(edge) = edge {
-            entry.refs.push(edge);
+            // Dedupe: reconciling the same file twice before its refs resolve
+            // can deliver the same edge twice (Leg 1 race).
+            let dup = entry.refs.iter().any(|r| {
+                r.from_id == edge.from_id && r.to_id == edge.to_id && r.ref_type == edge.ref_type
+            });
+            if !dup {
+                entry.refs.push(edge);
+            }
         }
         if let Some((path, hash)) = dep {
             entry.deps.insert(path, hash);
@@ -447,6 +603,9 @@ mod tests {
             decls: vec![event("a.ts:helper")],
             refs: Vec::new(),
             refs_pending: pending,
+            signatures: HashMap::new(),
+            diagnostics: None,
+            implements: Vec::new(),
         }
     }
 
@@ -551,5 +710,132 @@ mod tests {
         assert_ne!(h1, content_hash("hello "));
         assert!(h1.starts_with("sha256:"));
         assert_eq!(h1.len(), 7 + 64);
+    }
+
+    fn upsert(id: &str, entity_type: &str, metadata: &str) -> Event {
+        let mut props: HashMap<String, serde_json::Value> = HashMap::new();
+        props.insert("entity_type".to_string(), serde_json::json!(entity_type));
+        if !metadata.is_empty() {
+            props.insert("metadata".to_string(), serde_json::json!(metadata));
+        }
+        Event {
+            version: EVENT_VERSION,
+            timestamp: 1,
+            event_type: EventType::UpsertNode,
+            payload: EventPayload::UpsertNode(crate::types::UpsertNodePayload {
+                id: id.to_string(),
+                label: "Entity".to_string(),
+                properties: props,
+            }),
+        }
+    }
+
+    fn metadata_of(events: &[Event], id: &str) -> String {
+        for e in events {
+            if let EventPayload::UpsertNode(ref p) = e.payload {
+                if p.id == id {
+                    return p
+                        .properties
+                        .get("metadata")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+        }
+        panic!("no node {}", id);
+    }
+
+    #[test]
+    fn merge_metadata_preserves_existing_keys() {
+        let out = merge_metadata(
+            "{\"line\":7}",
+            &[("signature", serde_json::json!("(x: string) => void"))],
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["line"], serde_json::json!(7));
+        assert_eq!(v["signature"], serde_json::json!("(x: string) => void"));
+        // Empty metadata still produces an object.
+        let v: serde_json::Value =
+            serde_json::from_str(&merge_metadata("", &[("a", serde_json::json!(1))])).unwrap();
+        assert_eq!(v["a"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn apply_facts_merges_signature_and_diagnostics() {
+        let mut events = vec![
+            upsert("a.ts:helper", "Function", "{\"line\":1}"),
+            upsert("a.ts", "File", ""),
+        ];
+        let mut facts = Facts::default();
+        facts
+            .signatures
+            .insert("a.ts:helper".to_string(), "function helper(): void".to_string());
+        facts.diagnostics = Some(Diagnostics { errors: 2, warnings: 1 });
+        facts.implements.push(CachedImpl {
+            from_id: "b.ts:Impl".to_string(),
+            to_id: "a.ts:IFace".to_string(),
+        });
+        apply_facts(&mut events, &facts);
+
+        let sig_meta: serde_json::Value =
+            serde_json::from_str(&metadata_of(&events, "a.ts:helper")).unwrap();
+        assert_eq!(sig_meta["line"], serde_json::json!(1));
+        assert_eq!(sig_meta["signature"], serde_json::json!("function helper(): void"));
+        let file_meta: serde_json::Value =
+            serde_json::from_str(&metadata_of(&events, "a.ts")).unwrap();
+        assert_eq!(file_meta["diagnostics"]["errors"], serde_json::json!(2));
+        assert_eq!(file_meta["diagnostics"]["warnings"], serde_json::json!(1));
+
+        let impls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::LinkNodes(p) if p.relationship == "IMPLEMENTS" => {
+                    Some((p.from_id.clone(), p.to_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(impls, vec![("b.ts:Impl".to_string(), "a.ts:IFace".to_string())]);
+    }
+
+    #[test]
+    fn identifier_at_position_reads_selection_range() {
+        let src = "export interface IFoo {\n  bar(): void;\n}\n";
+        assert_eq!(
+            identifier_at_position(src, 0, 17),
+            Some("IFoo".to_string())
+        );
+        assert_eq!(identifier_at_position(src, 5, 0), None);
+    }
+
+    #[test]
+    fn record_resolution_dedupes_edges() {
+        let mut handle = CacheHandle {
+            path: PathBuf::from("/nonexistent/reconcile-cache.json"),
+            root: PathBuf::from("/tmp"),
+            parser: parser_tag(),
+            read_enabled: true,
+            cache: ReconcileCache {
+                version: CACHE_VERSION,
+                parser: parser_tag(),
+                files: HashMap::new(),
+            },
+            dirty: false,
+        };
+        handle.put_decls("a.ts", "x", vec![], 2);
+        let edge = CachedRef {
+            ref_name: "helper".to_string(),
+            ref_type: "CALLS".to_string(),
+            from_id: "a.ts:main".to_string(),
+            to_id: "b.ts:helper".to_string(),
+            line: 1,
+            col: 2,
+        };
+        handle.record_resolution("a.ts", Some(edge.clone()), None);
+        handle.record_resolution("a.ts", Some(edge), None);
+        let entry = handle.cache.files.get("a.ts").unwrap();
+        assert_eq!(entry.refs.len(), 1);
+        assert_eq!(entry.refs_pending, 0);
     }
 }

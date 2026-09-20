@@ -14,6 +14,8 @@ pub struct ParsedDeclaration {
     pub entity_type: String,
     pub name: String,
     pub line: usize,
+    /// 0-indexed column of the declaration's name (LSP hover position).
+    pub col: usize,
     pub source_text: String,
 }
 
@@ -129,6 +131,7 @@ pub fn parse_file(
                     entity_type: entity_type.to_string(),
                     name,
                     line: node.start_position().row + 1,
+                    col: node.start_position().column,
                     source_text,
                 });
             }
@@ -264,6 +267,10 @@ pub fn reconcile_file(
         entity_props.insert(
             "line".to_string(),
             serde_json::Value::Number(serde_json::Number::from(decl.line)),
+        );
+        entity_props.insert(
+            "col".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(decl.col)),
         );
         entity_props.insert(
             "status".to_string(),

@@ -177,6 +177,65 @@ impl StdioLspClient {
     }
 }
 
+impl StdioLspClient {
+    /// Send a request and read until its response arrives, returning `result`.
+    ///
+    /// Server-initiated notifications (e.g. `publishDiagnostics`) are skipped.
+    fn request_result(&mut self, method: &str, params: Value) -> Result<Value, Box<dyn Error>> {
+        let req_id = self.send_request(method, params)?;
+        loop {
+            let msg = self.read_message_with_timeout(LSP_REQUEST_TIMEOUT)?;
+            if msg.get("id").and_then(|i| i.as_u64()) == Some(req_id as u64) {
+                if let Some(error) = msg.get("error") {
+                    return Err(format!("LSP Error: {}", error).into());
+                }
+                return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+
+    /// `textDocument/hover` at a declaration, returning the trimmed first
+    /// non-fence line of the hover text (the signature).
+    pub fn get_hover(
+        &mut self,
+        file_uri: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Option<String>, Box<dyn Error>> {
+        let params = json!({
+            "textDocument": { "uri": file_uri },
+            "position": { "line": line, "character": col }
+        });
+        let result = self.request_result("textDocument/hover", params)?;
+        Ok(parse_hover_text(&result))
+    }
+
+    /// `textDocument/diagnostic` for a file -> (errors, warnings).
+    pub fn get_diagnostics(&mut self, file_uri: &str) -> Result<(u32, u32), Box<dyn Error>> {
+        let params = json!({
+            "textDocument": { "uri": file_uri }
+        });
+        let result = self.request_result("textDocument/diagnostic", params)?;
+        Ok(count_diagnostics(&result))
+    }
+
+    /// `textDocument/implementation` — implementors of the declaration at
+    /// `(line, col)`. Accepts both `Location` and `LocationLink` results.
+    pub fn get_implementation(
+        &mut self,
+        file_uri: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<Location>, Box<dyn Error>> {
+        let params = json!({
+            "textDocument": { "uri": file_uri },
+            "position": { "line": line, "character": col }
+        });
+        let result = self.request_result("textDocument/implementation", params)?;
+        Ok(parse_locations(&result))
+    }
+}
+
 impl LspAdapter for StdioLspClient {
     fn start(&mut self, project_root: &Path) -> Result<(), Box<dyn Error>> {
         let process = Command::new(&self.command)
@@ -192,7 +251,19 @@ impl LspAdapter for StdioLspClient {
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
-            "capabilities": {}
+            // Advertised capabilities gate which requests the server answers.
+            // Without these, `textDocument/diagnostic` and
+            // `textDocument/implementation` are silently unsupported, and
+            // `definition` is limited to plain `Location` results.
+            "capabilities": {
+                "textDocument": {
+                    "diagnostic": {},
+                    "implementation": {},
+                    "hover": {},
+                    "definition": { "linkSupport": true },
+                    "publishDiagnostics": {}
+                }
+            }
         });
 
         self.send_request("initialize", params)?;
@@ -232,45 +303,8 @@ impl LspAdapter for StdioLspClient {
                 "character": col,
             }
         });
-
-        let req_id = self.send_request("textDocument/definition", params)?;
-
-        loop {
-            let msg = self.read_message_with_timeout(LSP_REQUEST_TIMEOUT)?;
-            if msg.get("id").and_then(|i| i.as_u64()) == Some(req_id as u64) {
-                if let Some(error) = msg.get("error") {
-                    return Err(format!("LSP Error: {}", error).into());
-                }
-
-                let mut locations = Vec::new();
-                if let Some(result) = msg.get("result") {
-                    if result.is_array() {
-                        for item in result.as_array().unwrap() {
-                            if let (Some(uri), Some(range)) = (item.get("uri"), item.get("range")) {
-                                if let Some(start) = range.get("start") {
-                                    locations.push(Location {
-                                        uri: uri.as_str().unwrap_or("").to_string(),
-                                        line: start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                                        col: start.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
-                                    });
-                                }
-                            }
-                        }
-                    } else if result.is_object() {
-                        if let (Some(uri), Some(range)) = (result.get("uri"), result.get("range")) {
-                            if let Some(start) = range.get("start") {
-                                locations.push(Location {
-                                    uri: uri.as_str().unwrap_or("").to_string(),
-                                    line: start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
-                                    col: start.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
-                                });
-                            }
-                        }
-                    }
-                }
-                return Ok(locations);
-            }
-        }
+        let result = self.request_result("textDocument/definition", params)?;
+        Ok(parse_locations(&result))
     }
 
     fn stop(&mut self) -> Result<(), Box<dyn Error>> {
@@ -285,5 +319,177 @@ impl LspAdapter for StdioLspClient {
             }
         }
         Ok(())
+    }
+}
+
+/// Parse an LSP definition/implementation result into `Location`s.
+///
+/// Accepts all three shapes the spec allows:
+/// - `Location`          (`uri` + `range.start`)
+/// - `LocationLink`      (`targetUri` + `targetSelectionRange.start`)
+/// - an array of either.
+///
+/// `targetSelectionRange` is the target's *own* name/position (not the range
+/// the caller asked about), which is what a node id must be built from.
+pub fn parse_locations(result: &Value) -> Vec<Location> {
+    let mut out = Vec::new();
+    let items: Vec<&Value> = match result {
+        Value::Array(a) => a.iter().collect(),
+        Value::Object(_) => vec![result],
+        _ => return out,
+    };
+    for item in items {
+        // Location shape.
+        if let (Some(uri), Some(range)) = (item.get("uri"), item.get("range")) {
+            if let Some(start) = range.get("start") {
+                if let Some(uri) = uri.as_str() {
+                    out.push(Location {
+                        uri: uri.to_string(),
+                        line: start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
+                        col: start
+                            .get("character")
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0) as u32,
+                    });
+                    continue;
+                }
+            }
+        }
+        // LocationLink shape.
+        if let (Some(uri), Some(range)) = (
+            item.get("targetUri"),
+            item.get("targetSelectionRange").or_else(|| item.get("targetRange")),
+        ) {
+            if let Some(start) = range.get("start") {
+                if let Some(uri) = uri.as_str() {
+                    out.push(Location {
+                        uri: uri.to_string(),
+                        line: start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32,
+                        col: start
+                            .get("character")
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0) as u32,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract the first meaningful line of a hover response.
+///
+/// Handles `MarkupContent` (`contents.value`), plain strings, and arrays of
+/// `MarkedString`. Hover text is usually a fenced code block
+/// (```` ```typescript ````), so skips the fence line and blank lines and
+/// returns the first content line, trimmed.
+pub fn parse_hover_text(result: &Value) -> Option<String> {
+    let raw = if result.is_null() {
+        return None;
+    } else if let Some(contents) = result.get("contents") {
+        match contents {
+            Value::String(s) => s.clone(),
+            Value::Object(o) => o.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            Value::Array(a) => a
+                .iter()
+                .map(|item| match item {
+                    Value::String(s) => s.clone(),
+                    Value::Object(o) => o
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("```"))
+        .map(|line| line.to_string())
+}
+
+/// Count errors/warnings in a `textDocument/diagnostic` result.
+///
+/// Errors = severity 1 (or absent, per spec default), warnings = severity 2.
+/// `{kind: "unchanged"}` (no items) counts as zero.
+pub fn count_diagnostics(result: &Value) -> (u32, u32) {
+    let items = result
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let mut errors = 0u32;
+    let mut warnings = 0u32;
+    for item in items {
+        match item.get("severity").and_then(|s| s.as_u64()) {
+            Some(2) => warnings += 1,
+            Some(1) | None => errors += 1,
+            // 3 = Information, 4 = Hint: not an error or a warning.
+            _ => {}
+        }
+    }
+    (errors, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_plain_location() {
+        let v = json!([{ "uri": "file:///a.ts", "range": { "start": { "line": 4, "character": 9 } } }]);
+        let locs = parse_locations(&v);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].uri, "file:///a.ts");
+        assert_eq!((locs[0].line, locs[0].col), (4, 9));
+    }
+
+    #[test]
+    fn parses_location_link_via_selection_range() {
+        // `range` here is the caller's reference; `targetSelectionRange` is the
+        // target's own name — the value that must win.
+        let v = json!([{
+            "targetUri": "file:///b.ts",
+            "targetRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 3, "character": 1 } },
+            "targetSelectionRange": { "start": { "line": 0, "character": 16 }, "end": { "line": 0, "character": 22 } }
+        }]);
+        let locs = parse_locations(&v);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].uri, "file:///b.ts");
+        assert_eq!((locs[0].line, locs[0].col), (0, 16));
+    }
+
+    #[test]
+    fn parses_single_object_and_empty() {
+        let v = json!({ "targetUri": "file:///c.ts", "targetSelectionRange": { "start": { "line": 1, "character": 2 } } });
+        assert_eq!(parse_locations(&v).len(), 1);
+        assert!(parse_locations(&json!(null)).is_empty());
+        assert!(parse_locations(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn hover_skips_code_fence() {
+        let v = json!({ "contents": { "kind": "markdown", "value": "```typescript\nfunction helper(a: string): void\n```" } });
+        assert_eq!(parse_hover_text(&v).as_deref(), Some("function helper(a: string): void"));
+        let s = json!({ "contents": "  const x: number  " });
+        assert_eq!(parse_hover_text(&s).as_deref(), Some("const x: number"));
+        assert_eq!(parse_hover_text(&json!(null)), None);
+    }
+
+    #[test]
+    fn counts_diagnostics_by_severity() {
+        let v = json!({ "kind": "full", "items": [
+            { "severity": 1 }, { "severity": 2 }, { "severity": 2 }, { "severity": 3 }, {}
+        ]});
+        assert_eq!(count_diagnostics(&v), (2, 2));
+        assert_eq!(count_diagnostics(&json!({ "kind": "unchanged" })), (0, 0));
     }
 }

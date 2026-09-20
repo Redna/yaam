@@ -1374,6 +1374,138 @@ fn get_or_create_lsp(
     Some(arc)
 }
 
+/// Collect the Leg 2 facts for one reconciled file: one `textDocument/hover`
+/// per declared entity, one `textDocument/diagnostic` for the file, and one
+/// `textDocument/implementation` per interface declaration. Best-effort — any
+/// failed request is logged and skipped; it can never fail the reconcile.
+fn collect_facts(
+    state: &AppState,
+    path: &std::path::Path,
+    content: &str,
+    rel: &str,
+    events: &[Event],
+) -> crate::reconcile_cache::Facts {
+    use crate::lsp_adapter::LspAdapter;
+    use crate::reconcile_cache::{CachedImpl, Diagnostics, Facts};
+
+    let mut facts = Facts::default();
+    let Some(lsp_arc) = get_or_create_lsp(state, path) else {
+        return facts;
+    };
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let file_uri = format!("file://{}", abs.display());
+    let language_id = get_adapter(path)
+        .map(|a| a.language_id().to_string())
+        .unwrap_or_else(|| "typescript".to_string());
+
+    let mut lsp = lsp_arc.lock().unwrap();
+    if let Err(e) = lsp.notify_open(&file_uri, content, &language_id) {
+        eprintln!("[yaam] lsp-facts: notify_open failed for {} — {}", rel, e);
+        return facts;
+    }
+
+    // One hover per declared entity. The signature is the highest-value
+    // per-byte context an agent can get, and it also tells us which `Class`
+    // declarations are interfaces (needed to point IMPLEMENTS the right way).
+    let mut interfaces: Vec<String> = Vec::new();
+    for event in events {
+        let EventPayload::UpsertNode(ref payload) = event.payload else {
+            continue;
+        };
+        let et = payload
+            .properties
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if et != "Function" && et != "Class" {
+            continue;
+        }
+        let line = payload.properties.get("line").and_then(|v| v.as_u64()).unwrap_or(1);
+        let col = payload.properties.get("col").and_then(|v| v.as_u64()).unwrap_or(0);
+        match lsp.get_hover(&file_uri, line.saturating_sub(1) as u32, col as u32) {
+            Ok(Some(sig)) => {
+                if et == "Class" && sig.starts_with("interface ") {
+                    interfaces.push(payload.id.clone());
+                }
+                facts.signatures.insert(payload.id.clone(), sig);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[yaam] lsp-facts: hover failed for {} — {}", payload.id, e),
+        }
+    }
+
+    // One diagnostic request per reconciled file.
+    match lsp.get_diagnostics(&file_uri) {
+        Ok((errors, warnings)) => {
+            eprintln!(
+                "[yaam] lsp-facts: {} diagnostics — {} error(s), {} warning(s)",
+                rel, errors, warnings
+            );
+            facts.diagnostics = Some(Diagnostics { errors, warnings });
+        }
+        Err(e) => eprintln!("[yaam] lsp-facts: diagnostics failed for {} — {}", rel, e),
+    }
+
+    // One implementation request per interface declaration. The result is the
+    // implementor (class), so the edge points implementor -> interface.
+    for interface_id in &interfaces {
+        let Some(event) = events.iter().find(|e| {
+            matches!(&e.payload, EventPayload::UpsertNode(p) if p.id == *interface_id)
+        }) else {
+            continue;
+        };
+        let EventPayload::UpsertNode(ref payload) = event.payload else {
+            continue;
+        };
+        let line = payload.properties.get("line").and_then(|v| v.as_u64()).unwrap_or(1);
+        let col = payload.properties.get("col").and_then(|v| v.as_u64()).unwrap_or(0);
+        let locations = match lsp.get_implementation(&file_uri, line.saturating_sub(1) as u32, col as u32) {
+            Ok(locs) => locs,
+            Err(e) => {
+                eprintln!("[yaam] lsp-facts: implementation failed for {} — {}", interface_id, e);
+                continue;
+            }
+        };
+        for loc in locations {
+            let target_abs = loc.uri.strip_prefix("file://").unwrap_or(&loc.uri).to_string();
+            let target_rel = std::path::Path::new(&target_abs)
+                .strip_prefix(std::env::current_dir().unwrap_or_default())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| target_abs.clone());
+            let Some(name) = std::fs::read_to_string(&target_abs).ok().and_then(|c| {
+                crate::reconcile_cache::identifier_at_position(
+                    &c,
+                    loc.line as usize,
+                    loc.col as usize,
+                )
+            }) else {
+                continue;
+            };
+            let from_id = format!("{}:{}", target_rel, name);
+            if from_id == *interface_id {
+                continue;
+            }
+            if !facts
+                .implements
+                .iter()
+                .any(|i| i.from_id == from_id && i.to_id == *interface_id)
+            {
+                eprintln!("[yaam] lsp-facts: IMPLEMENTS {} -> {}", from_id, interface_id);
+                facts.implements.push(CachedImpl {
+                    from_id,
+                    to_id: interface_id.clone(),
+                });
+            }
+        }
+    }
+
+    facts
+}
+
 fn handle_reconcile(
     state: &AppState,
     params: &serde_json::Value,
@@ -1425,6 +1557,8 @@ fn handle_reconcile(
     let mut miss_persist = false;
     let mut edges_pending = 0usize;
     let mut cached_refs: Vec<crate::reconcile_cache::CachedRef> = Vec::new();
+    let mut cached_facts = crate::reconcile_cache::Facts::default();
+    let mut new_facts = crate::reconcile_cache::Facts::default();
 
     // Phase 1 (Spec #2): Parse with tree-sitter, upsert entities, collect references.
     // LSP is NOT passed here — references are collected for background resolution.
@@ -1434,11 +1568,19 @@ fn handle_reconcile(
             Some(entry) => {
                 cache_hit = true;
                 cached_refs = entry.refs.clone();
+                cached_facts = crate::reconcile_cache::Facts {
+                    signatures: entry.signatures.clone(),
+                    diagnostics: entry.diagnostics.clone(),
+                    implements: entry.implements.clone(),
+                };
                 eprintln!(
-                    "[yaam] reconcile-cache HIT for {} ({} decl event(s), {} ref edge(s)) — no parse, no LSP",
+                    "[yaam] reconcile-cache HIT for {} ({} decl event(s), {} ref edge(s), {} signature(s), diagnostics={:?}, {} IMPLEMENTS) — no parse, no LSP",
                     rel,
                     entry.decls.len(),
-                    entry.refs.len()
+                    entry.refs.len(),
+                    entry.signatures.len(),
+                    entry.diagnostics,
+                    entry.implements.len(),
                 );
                 let engine = state.engine.read().unwrap();
                 let evs = crate::reconcile_cache::replay_events(
@@ -1451,22 +1593,31 @@ fn handle_reconcile(
             }
             None => {
                 miss_persist = true;
-                let (evs, refs) = {
+                let (mut evs, refs) = {
                     let engine = state.engine.read().unwrap();
                     crate::reconciler::reconcile_file(path, Some(content), None, &engine)
                 };
                 edges_pending = refs.len();
+                // Leg 2 facts: one hover per entity, one diagnostic per file,
+                // one implementation request per interface — best-effort, in
+                // this same pass (never per reference).
+                if crate::reconcile_cache::facts_enabled() {
+                    new_facts = collect_facts(state, path, content, &rel, &evs);
+                    crate::reconcile_cache::apply_facts(&mut evs, &new_facts);
+                }
                 if state.reconcile_cache.lock().unwrap().read_enabled() {
                     eprintln!(
-                        "[yaam] reconcile-cache MISS for {} — parsed, {} ref(s) queued",
+                        "[yaam] reconcile-cache MISS for {} — parsed, {} ref(s) queued, {} signature(s), diagnostics={:?}",
                         rel,
-                        refs.len()
+                        refs.len(),
+                        new_facts.signatures.len(),
+                        new_facts.diagnostics,
                     );
                 } else {
                     eprintln!(
                         "[yaam] reconcile-cache OFF (YAAM_RECONCILE_CACHE=off) for {} — parsed, {} ref(s) queued",
                         rel,
-                        refs.len()
+                        refs.len(),
                     );
                 }
                 (evs, refs)
@@ -1480,6 +1631,12 @@ fn handle_reconcile(
         edges_pending = refs.len();
         (evs, refs)
     };
+
+    // Leg 2: a cache hit replays the facts recorded on the same content hash,
+    // so no LSP request is needed for an unchanged file.
+    if cache_hit {
+        crate::reconcile_cache::apply_facts(&mut events, &cached_facts);
+    }
 
     // Compute embeddings for Entity UpsertNode events before persistence.
     // Uses embedding cache to skip ONNX inference for unchanged entities (Spec #3).
@@ -1620,11 +1777,23 @@ fn handle_reconcile(
     if miss_persist {
         let decls: Vec<Event> = events
             .iter()
-            .filter(|e| !matches!(e.event_type, EventType::DeleteNode))
+            .filter(|e| {
+                if matches!(e.event_type, EventType::DeleteNode) {
+                    return false;
+                }
+                // IMPLEMENTS edges live in `entry.implements` and are re-added
+                // by `apply_facts` on a HIT — storing them twice would emit
+                // duplicate edges on replay.
+                if let EventPayload::LinkNodes(ref p) = e.payload {
+                    return p.relationship != "IMPLEMENTS";
+                }
+                true
+            })
             .cloned()
             .collect();
         if let Ok(mut cache) = state.reconcile_cache.lock() {
             cache.put_decls(&rel, content_opt.unwrap_or(""), decls, edges_pending as u32);
+            cache.put_facts(&rel, &new_facts);
             cache.flush();
         }
     }
