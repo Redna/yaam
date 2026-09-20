@@ -166,14 +166,34 @@ async fn main() {
         state_mut.ref_queue = Some(ref_tx);
     }
 
-    // Spawn the background worker task
+    // Spawn the background worker task.
+    //
+    // The LSP servers are only useful while references are being resolved, and
+    // they are expensive (a TypeScript pair holds several hundred MB in child
+    // processes that YAAM_MAX_RSS_MB does not cover). When the queue has been
+    // quiet for YAAM_LSP_IDLE_STOP_SECS (default 30) the worker stops every LSP
+    // client and releases the memory; the next reference respawns one lazily.
     let worker_state = state.clone();
+    let lsp_idle = std::time::Duration::from_secs(
+        std::env::var("YAAM_LSP_IDLE_STOP_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30),
+    );
     tokio::spawn(async move {
-        while let Some(pref) = ref_rx.recv().await {
-            let s = worker_state.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::rpc::resolve_reference_sync(s.as_ref(), pref);
-            }).await.ok();
+        loop {
+            match tokio::time::timeout(lsp_idle, ref_rx.recv()).await {
+                Ok(Some(pref)) => {
+                    let s = worker_state.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::rpc::resolve_reference_sync(s.as_ref(), pref);
+                    })
+                    .await
+                    .ok();
+                }
+                Ok(None) => break, // channel closed
+                Err(_) => crate::rpc::stop_all_lsp(worker_state.as_ref()),
+            }
         }
     });
 

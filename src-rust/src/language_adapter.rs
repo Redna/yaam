@@ -87,19 +87,24 @@ pub struct LanguageInfo {
     pub lsp_command: Option<LspCommand>,
 }
 
-/// Whether the optional LSP-based cross-file resolver is enabled.
+/// Whether the LSP-based cross-file resolver is enabled.
 ///
-/// **Default OFF.** The LSP server is enrichment only — `document_adapter.rs`
-/// resolves references from the graph itself — but it is expensive: for
-/// TypeScript it spawns `typescript-language-server` plus its two `tsserver`
-/// children, measured at **~1.2 GB RSS**, and that is **not** covered by
-/// `YAAM_MAX_RSS_MB` (which bounds only this process, not its children). Making
-/// it opt-in keeps the default footprint small; set `YAAM_LSP_RESOLVER=true` to
-/// turn cross-file LSP resolution back on.
+/// **Default ON** — cross-file `CALLS`/`IMPORTS` edges are load-bearing for the
+/// code graph. The resolver is not free, though: for TypeScript it spawns
+/// `typescript-language-server` plus its two `tsserver` children, measured at
+/// **~1.2 GB RSS**, and `YAAM_MAX_RSS_MB` does not cover it (that bounds only
+/// this process). So the footprint is controlled instead by two things:
+///
+/// - a tight per-process heap cap on the spawned servers (see [`TypeScriptAdapter::lsp_command`]), and
+/// - the background worker **stopping every LSP client once the reference queue
+///   has been idle** (`YAAM_LSP_IDLE_STOP_SECS`, default 30) — the servers are
+///   only resident during a resolution burst, not between reconciles.
+///
+/// `YAAM_LSP_RESOLVER=false` disables it entirely (trades imports for ~0 MB).
 pub fn lsp_resolver_enabled() -> bool {
     std::env::var("YAAM_LSP_RESOLVER")
-        .map(|v| v == "true")
-        .unwrap_or(false)
+        .map(|v| v != "false")
+        .unwrap_or(true)
 }
 
 /// Returns metadata for every registered language.
@@ -212,7 +217,10 @@ impl LanguageAdapter for TypeScriptAdapter {
         Some(LspCommand {
             command: "env".to_string(),
             args: vec![
-                "NODE_OPTIONS=--max-old-space-size=1024".to_string(),
+                // Tight cap: the resolver only answers `textDocument/definition`
+                // for reference resolution, so the servers do not need the 1 GB
+                // default. This bounds *each* spawned node process.
+                "NODE_OPTIONS=--max-old-space-size=384".to_string(),
                 "npx".to_string(),
                 "typescript-language-server".to_string(),
                 "--stdio".to_string(),

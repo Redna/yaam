@@ -1262,6 +1262,30 @@ fn handle_search(
 
 // ─── Reconciliation Handlers ────────────────────────────────────────────────
 
+/// Stop and drop every running LSP server.
+///
+/// The cross-file resolver keeps one server per language alive for reuse, which
+/// is right during a resolution burst and wrong once the reference queue is
+/// idle: the TypeScript pair (`typescript-language-server` + two `tsserver`
+/// children) holds several hundred MB, and `YAAM_MAX_RSS_MB` does not cover
+/// child processes. The background worker calls this when the queue has been
+/// quiet for `YAAM_LSP_IDLE_STOP_SECS`, so the next reference respawns lazily.
+pub fn stop_all_lsp(state: &AppState) {
+    let mut clients = match state.lsp_clients.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let count = clients.len();
+    for (_, arc) in clients.drain() {
+        if let Ok(mut c) = arc.lock() {
+            let _ = c.stop();
+        }
+    }
+    if count > 0 {
+        eprintln!("[yaam] LSP idle — stopped {} server(s), memory released", count);
+    }
+}
+
 /// Lazily obtain an LSP client for the language of the given file path.
 ///
 /// If a client for the file's language is already running, returns the existing
@@ -1272,14 +1296,13 @@ fn get_or_create_lsp(
     state: &AppState,
     file_path: &std::path::Path,
 ) -> Option<Arc<Mutex<StdioLspClient>>> {
-    let adapter = get_adapter(file_path)?;
     // Gate the only spawn path for the LSP server (see `lsp_resolver_enabled`):
-    // default off, because the TypeScript LSP costs ~1.2 GB RSS in child
-    // processes that `YAAM_MAX_RSS_MB` does not cover. Cross-file resolution is
-    // enrichment — the graph resolves references without it.
+    // default on (imports are load-bearing), tunable heap cap, and released when
+    // idle by `stop_all_lsp`. `YAAM_LSP_RESOLVER=false` turns it off entirely.
     if !lsp_resolver_enabled() {
         return None;
     }
+    let adapter = get_adapter(file_path)?;
     let lsp_cmd = adapter.lsp_command()?;
     let lang_id = adapter.language_id().to_string();
 
