@@ -1438,16 +1438,22 @@ fn collect_facts(
         }
     }
 
-    // One diagnostic request per reconciled file.
-    match lsp.get_diagnostics(&file_uri) {
-        Ok((errors, warnings)) => {
+    // Diagnostics are PUSH-only on this server (the pull request is answered with
+    // -32601), so read them from the notifications captured while the hover and
+    // implementation responses were being read. A file with no declarations had
+    // no request to read yet, so make one cheap request to drain what is pending.
+    if facts.signatures.is_empty() {
+        let _ = lsp.get_hover(&file_uri, 0, 0);
+    }
+    match lsp.diagnostics_for(&file_uri) {
+        Some((errors, warnings)) => {
             eprintln!(
                 "[yaam] lsp-facts: {} diagnostics — {} error(s), {} warning(s)",
                 rel, errors, warnings
             );
             facts.diagnostics = Some(Diagnostics { errors, warnings });
         }
-        Err(e) => eprintln!("[yaam] lsp-facts: diagnostics failed for {} — {}", rel, e),
+        None => eprintln!("[yaam] lsp-facts: {} diagnostics — none pushed", rel),
     }
 
     // One implementation request per interface declaration. The result is the

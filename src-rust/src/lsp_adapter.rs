@@ -36,6 +36,14 @@ pub struct StdioLspClient {
     args: Vec<String>,
     process: Option<Child>,
     request_id: u32,
+    /// Latest `textDocument/publishDiagnostics` counts per file URI.
+    ///
+    /// Diagnostics are **push-only** on this server: `textDocument/diagnostic`
+    /// is answered with `-32601 Unhandled method`, and the counts arrive as a
+    /// notification after `didOpen` instead. They are captured while reading
+    /// other responses — waiting for them is not an option, because a read
+    /// timeout kills the server (the reader thread owns stdout).
+    push_diagnostics: std::collections::HashMap<String, (u32, u32)>,
 }
 
 impl StdioLspClient {
@@ -45,6 +53,7 @@ impl StdioLspClient {
             args: args.iter().map(|s| s.to_string()).collect(),
             process: None,
             request_id: 1,
+            push_diagnostics: std::collections::HashMap::new(),
         }
     }
 
@@ -191,7 +200,42 @@ impl StdioLspClient {
                 }
                 return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
             }
+            // A server-initiated notification (in practice
+            // `textDocument/publishDiagnostics`) — capture it and keep reading.
+            // This is the only chance to see diagnostics: the pull request is
+            // unsupported, and a dedicated wait would kill the server on timeout.
+            self.capture_push_diagnostics(&msg);
         }
+    }
+
+    /// Record a `textDocument/publishDiagnostics` notification, if that is what
+    /// this message is. Called from every read loop, so the counts are current
+    /// by the time a caller asks for them.
+    fn capture_push_diagnostics(&mut self, msg: &Value) {
+        if msg.get("method").and_then(|m| m.as_str())
+            != Some("textDocument/publishDiagnostics")
+        {
+            return;
+        }
+        let Some(params) = msg.get("params") else {
+            return;
+        };
+        let Some(uri) = params.get("uri").and_then(|u| u.as_str()) else {
+            return;
+        };
+        let items = params
+            .get("diagnostics")
+            .and_then(|d| d.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        self.push_diagnostics
+            .insert(uri.to_string(), count_severities(items));
+    }
+
+    /// The last diagnostics the server pushed for `file_uri`, if any. Pure —
+    /// no request and no I/O, so it can never block or fail a reconcile.
+    pub fn diagnostics_for(&self, file_uri: &str) -> Option<(u32, u32)> {
+        self.push_diagnostics.get(file_uri).copied()
     }
 
     /// `textDocument/hover` at a declaration, returning the trimmed first
@@ -210,14 +254,10 @@ impl StdioLspClient {
         Ok(parse_hover_text(&result))
     }
 
-    /// `textDocument/diagnostic` for a file -> (errors, warnings).
-    pub fn get_diagnostics(&mut self, file_uri: &str) -> Result<(u32, u32), Box<dyn Error>> {
-        let params = json!({
-            "textDocument": { "uri": file_uri }
-        });
-        let result = self.request_result("textDocument/diagnostic", params)?;
-        Ok(count_diagnostics(&result))
-    }
+    /// Diagnostics are push-only (see `push_diagnostics`), so this no longer
+    /// sends the unsupported `textDocument/diagnostic` pull request. Use
+    /// [`Self::diagnostics_for`] instead, after some other request has had a
+    /// chance to read the pushed notification.
 
     /// `textDocument/implementation` — implementors of the declaration at
     /// `(line, col)`. Accepts both `Location` and `LocationLink` results.
@@ -420,23 +460,31 @@ pub fn parse_hover_text(result: &Value) -> Option<String> {
 ///
 /// Errors = severity 1 (or absent, per spec default), warnings = severity 2.
 /// `{kind: "unchanged"}` (no items) counts as zero.
-pub fn count_diagnostics(result: &Value) -> (u32, u32) {
-    let items = result
-        .get("items")
-        .and_then(|v| v.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
+/// Count errors/warnings over a list of LSP diagnostic items.
+///
+/// Errors = severity 1 (or absent, per spec default), warnings = severity 2;
+/// 3 (Information) and 4 (Hint) are neither.
+pub fn count_severities(items: &[Value]) -> (u32, u32) {
     let mut errors = 0u32;
     let mut warnings = 0u32;
     for item in items {
         match item.get("severity").and_then(|s| s.as_u64()) {
             Some(2) => warnings += 1,
             Some(1) | None => errors += 1,
-            // 3 = Information, 4 = Hint: not an error or a warning.
             _ => {}
         }
     }
     (errors, warnings)
+}
+
+/// Count errors/warnings in a `textDocument/diagnostic` result (the pull shape).
+pub fn count_diagnostics(result: &Value) -> (u32, u32) {
+    let items = result
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    count_severities(items)
 }
 
 #[cfg(test)]
@@ -491,5 +539,26 @@ mod tests {
         ]});
         assert_eq!(count_diagnostics(&v), (2, 2));
         assert_eq!(count_diagnostics(&json!({ "kind": "unchanged" })), (0, 0));
+    }
+
+    /// The push shape (`publishDiagnostics` params) must count identically to
+    /// the pull shape, because that is the only source this server offers.
+    #[test]
+    fn counts_pushed_diagnostics() {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///x.ts",
+                "diagnostics": [ { "severity": 1 }, { "severity": 2 }, { "severity": 4 } ]
+            }
+        });
+        let mut client = StdioLspClient::new("true", &[]);
+        client.capture_push_diagnostics(&msg);
+        assert_eq!(client.diagnostics_for("file:///x.ts"), Some((1, 1)));
+        assert_eq!(client.diagnostics_for("file:///other.ts"), None);
+        // A non-diagnostic notification is ignored.
+        client.capture_push_diagnostics(&json!({ "method": "window/logMessage" }));
+        assert_eq!(client.diagnostics_for("file:///x.ts"), Some((1, 1)));
     }
 }
