@@ -111,7 +111,7 @@ export class YaamEngineClient {
         cwd: this.workspaceRoot,
         env: daemonEnv,
         detached: true,
-        stdio: 'ignore',
+        stdio: engineStdio(this.workspaceRoot),
       })
       .on('error', (err) => console.error("Failed to spawn YAAM daemon:", err))
       .unref();
@@ -121,7 +121,7 @@ export class YaamEngineClient {
         cwd: this.workspaceRoot,
         env: daemonEnv,
         detached: true,
-        stdio: 'ignore',
+        stdio: engineStdio(this.workspaceRoot),
       })
       .on('error', (err) => console.error("Failed to spawn cargo:", err))
       .unref();
@@ -331,5 +331,32 @@ export class YaamEngineClient {
 
   public async reconcile(payload: { file_path: string; content: string }): Promise<{ upserted_nodes: string[] }> {
     return this.call('reconcile', payload);
+  }
+}
+
+/**
+ * Engine stdio: append the daemon's stdout/stderr to
+ * `<workspace>/.yaam/engine.log`.
+ *
+ * The daemon is spawned detached, and used to be spawned with `stdio: 'ignore'`
+ * — which discarded every engine diagnostic (LSP lifecycle, reconcile decisions,
+ * RSS refusals, panics) and made the engine effectively unobservable from the
+ * outside. Falls back to `'ignore'` when the log cannot be opened, and truncates
+ * the file once it passes 5 MB so it cannot grow without bound.
+ */
+function engineStdio(workspaceRoot: string): 'ignore' | ['ignore', number, number] {
+  try {
+    const dir = path.join(workspaceRoot, '.yaam');
+    fs.mkdirSync(dir, { recursive: true });
+    const logPath = path.join(dir, 'engine.log');
+    try {
+      if (fs.statSync(logPath).size > 5 * 1024 * 1024) fs.truncateSync(logPath, 0);
+    } catch {
+      // No existing log, or unreadable — the append below is the source of truth.
+    }
+    const fd = fs.openSync(logPath, 'a');
+    return ['ignore', fd, fd];
+  } catch {
+    return 'ignore';
   }
 }
