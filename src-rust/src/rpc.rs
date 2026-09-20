@@ -1325,6 +1325,20 @@ fn get_or_create_lsp(
                 lsp_cmd.command,
                 lsp_cmd.args.join(" ")
             );
+            // Settle before the first request: tsserver answers definition
+            // queries for a program it has not loaded yet with the LOCAL ALIAS
+            // (observed: `./a` resolving to the import specifier in the source
+            // file itself), which the caller would otherwise turn into a wrong
+            // cross-file edge. Measured: immediately after start the answer is
+            // self-referential; a moment later it is correct. This runs once per
+            // server start, on the background worker — never on the game loop.
+            let settle_ms = std::env::var("YAAM_LSP_SETTLE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(750);
+            if settle_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+            }
         }
         Err(e) => {
             eprintln!(
@@ -1741,31 +1755,83 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
     // 3. Notify open (idempotent — LSP servers handle duplicate notifications)
     let _ = lsp.notify_open(&pref.source_file_uri, &pref.content, &pref.language_id);
 
-    // 4. Resolve definition
-    let locations = match lsp.get_definition(&pref.source_file_uri, pref.line, pref.col) {
-        Ok(locs) => locs,
-        Err(e) => {
-            // Previously silent — an LSP that answers nothing looked identical to
-            // one that was never asked, which is why "imports in the graph" could
-            // not be verified from the outside.
-            eprintln!(
-                "[yaam] lsp: definition request failed for {} at {}:{} — {}",
-                pref.source_file, pref.line, pref.col, e
-            );
-            return;
+    // 4. Resolve definition.
+    //
+    // tsserver answers with the LOCAL ALIAS — a location in the source file
+    // itself — until it has finished loading the program. Measured: the first
+    // request after `start` returns `b.ts:0:9` for a reference in `b.ts:2:9`,
+    // while the identical request seconds later returns `a.ts:0:16`. So retry
+    // while that signature holds, and if it never clears, report the module as
+    // unresolved instead of fabricating `<source-file>:<name>` as a cross-file
+    // edge (which is exactly what made this invisible for so long).
+    let max_attempts: u32 = std::env::var("YAAM_LSP_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let retry_ms: u64 = std::env::var("YAAM_LSP_RETRY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(700);
+    let mut answer: Option<crate::lsp_adapter::Location> = None;
+    for attempt in 1..=max_attempts {
+        let locations = match lsp.get_definition(&pref.source_file_uri, pref.line, pref.col) {
+            Ok(locs) => locs,
+            Err(e) => {
+                // Previously silent — an LSP that answers nothing looked identical
+                // to one that was never asked.
+                eprintln!(
+                    "[yaam] lsp: definition request failed for {} at {}:{} — {}",
+                    pref.source_file, pref.line, pref.col, e
+                );
+                return;
+            }
+        };
+        match locations.into_iter().next() {
+            None => {
+                eprintln!(
+                    "[yaam] lsp: no definition for '{}' at {}:{}:{} (attempt {})",
+                    pref.ref_name, pref.source_file, pref.line, pref.col, attempt
+                );
+                if attempt == max_attempts {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(retry_ms));
+            }
+            Some(loc) => {
+                let self_referential = loc.uri == pref.source_file_uri;
+                answer = Some(loc);
+                if !self_referential || attempt == max_attempts {
+                    break;
+                }
+                eprintln!(
+                    "[yaam] lsp: self-referential answer for '{}' at {}:{} (attempt {}/{}) — program not loaded yet",
+                    pref.ref_name, pref.source_file, pref.line, attempt, max_attempts
+                );
+                std::thread::sleep(std::time::Duration::from_millis(retry_ms));
+            }
         }
-    };
-    if locations.is_empty() {
-        eprintln!(
-            "[yaam] lsp: no definition for '{}' at {}:{}:{} (resolved 0 edges)",
-            pref.ref_name, pref.source_file, pref.line, pref.col
-        );
-        return;
     }
+    let loc = match answer {
+        Some(l) => l,
+        None => return,
+    };
     drop(lsp);  // Release LSP lock as early as possible
 
     // 5. Create LinkNodes event(s)
-    if let Some(loc) = locations.first() {
+    {
+        eprintln!(
+            "[yaam] lsp: raw definition for '{}' at {}:{}:{} -> {}:{}:{}",
+            pref.ref_name, pref.source_file, pref.line, pref.col, loc.uri, loc.line, loc.col
+        );
+        // Never emit an edge whose target is the query file itself: that is the
+        // server's unresolved-module fallback, not a definition.
+        if loc.uri == pref.source_file_uri {
+            eprintln!(
+                "[yaam] lsp: UNRESOLVED module for '{}' at {}:{} — self-referential after {} attempt(s), no edge emitted",
+                pref.ref_name, pref.source_file, pref.line, max_attempts
+            );
+            return;
+        }
         let absolute_path = if let Some(stripped) = loc.uri.strip_prefix("file://") {
             stripped.to_string()
         } else {
