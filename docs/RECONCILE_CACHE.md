@@ -73,3 +73,45 @@ hash — not an append-only stream. An unchanged file costs one hash, not one re
   regenerable and may be deleted at any time without losing a note or a decision.
 - Each capability is batched **per file per reconcile**, never per reference, so adding
   features multiplies round-trips only for changed files.
+
+## As built (measured, 2026-09-20)
+
+Shipped: `6a18b66` cache · `da31cba` coverage-aware full sync · `9c8126d` signatures +
+`IMPLEMENTS` · `2186c68` push-only diagnostics. **Reads are ON by default**
+(`YAAM_RECONCILE_CACHE=off` bypasses); the cache lives in
+`<workspace>/.yaam/reconcile-cache.json` and is regenerable, gitignored state.
+
+The goal was that a new session does not pay to re-reconcile the repo. Measured on a
+10-file workspace with one shared import target:
+
+| session | wall time | per file | cache | LSP servers |
+| --- | --- | --- | --- | --- |
+| cold (no cache) | 3,146 ms | 315 ms | 0/10 hits | 1 start |
+| **fresh process, files unchanged** | **16 ms** | **2 ms** | **10/10 hits** | **0 starts** |
+
+A restart with unchanged content performs **zero parsing and zero LSP work** while still
+re-materialising the graph, so the graph a new session sees is the same one: an inbound
+`CALLS` traversal on `a.ts:helper` returns both callers, with their `signature` metadata,
+in a process that never started a language server. (Reconcile events are not persisted by
+default, so the graph itself is rebuilt from the cache on each start — that is the design,
+since persisting reconcile events is the bloat path this replaces.)
+
+Correctness is tied to content, not to trust: an entry is valid only when the file hash,
+every dependency hash, the version/parser tags, and `refs_pending == 0` all agree. A
+cross-file edge is never invented — if the LSP's answer is self-referential (its
+unresolved fallback before the program has loaded) the reference stays pending and is
+re-queued, which is what makes "who calls X" truthful after a mid-queue restart.
+
+### Known limitations (all deliberate, all visible)
+
+1. **Diagnostics lag one reconcile on a cold client.** The server only pushes
+   `publishDiagnostics`; on a cold client the notification arrives after the last read of
+   the first reconcile, so that pass records `None` and the next reconcile of the same file
+   records the real counts. `None` ("not captured yet") and `Some(0, 0)` ("clean") are
+   distinct, so this is visible rather than wrong.
+2. **A fresh session still issues one `reconcile` RPC per file** (each ~2 ms, no parse, no
+   LSP) because the graph is in-memory. Eliminating even that means persisting the graph
+   (`YAAM_PERSIST_RECONCILE=true`), which is the event-blob path we deliberately retired —
+   the cache is the cheaper replacement.
+3. **The extension cannot validate the engine's parser/version tag** (it does not know the
+   running build), so after a parser bump a stale-but-complete entry could be skipped once.
