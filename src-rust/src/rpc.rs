@@ -37,6 +37,10 @@ pub struct AppState {
     /// spawned in main.rs, so reconcile can return immediately without
     /// blocking on LSP round-trips.
     pub ref_queue: Option<tokio::sync::mpsc::UnboundedSender<crate::reconciler::PendingReference>>,
+    /// Content-addressed reconcile cache (Leg 1): declaration events + resolved
+    /// reference edges per source file, so an unchanged file replays without a
+    /// tree-sitter parse or an LSP round-trip.
+    pub reconcile_cache: Arc<Mutex<crate::reconcile_cache::CacheHandle>>,
 }
 
 impl AppState {
@@ -97,6 +101,12 @@ impl AppState {
         // LSP clients are lazily started on first reconcile of each language.
         // No LSP servers are spawned at daemon startup.
 
+        // Reconcile cache lives beside the daemon state (`.yaam/`), keyed by
+        // content so an unchanged file costs one hash on the next start.
+        let reconcile_cache = Arc::new(Mutex::new(
+            crate::reconcile_cache::CacheHandle::open(dir.to_path_buf()),
+        ));
+
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
             store: Arc::new(RwLock::new(store)),
@@ -107,6 +117,7 @@ impl AppState {
             lsp_clients: Arc::new(RwLock::new(HashMap::new())),
             project_root: dir.to_path_buf(),
             ref_queue: None,
+            reconcile_cache,
         })
     }
 }
@@ -1406,11 +1417,68 @@ fn handle_reconcile(
         }));
     }
 
+    // ── Reconcile cache (Leg 1): try a valid cached entry before touching
+    // tree-sitter or the LSP. A hit replays declarations + resolved edges.
+    let rel = crate::reconcile_cache::rel_key(&request.file_path, &state.project_root);
+    let content_opt = request.content.as_deref().filter(|c| !c.is_empty());
+    let mut cache_hit = false;
+    let mut miss_persist = false;
+    let mut edges_pending = 0usize;
+    let mut cached_refs: Vec<crate::reconcile_cache::CachedRef> = Vec::new();
+
     // Phase 1 (Spec #2): Parse with tree-sitter, upsert entities, collect references.
     // LSP is NOT passed here — references are collected for background resolution.
-    let (mut events, pending_refs) = {
-        let engine = state.engine.read().unwrap();
-        crate::reconciler::reconcile_file(path, request.content.as_deref(), None, &engine)
+    let (mut events, pending_refs) = if let Some(content) = content_opt {
+        let hit = state.reconcile_cache.lock().unwrap().lookup(&rel, content);
+        match hit {
+            Some(entry) => {
+                cache_hit = true;
+                cached_refs = entry.refs.clone();
+                eprintln!(
+                    "[yaam] reconcile-cache HIT for {} ({} decl event(s), {} ref edge(s)) — no parse, no LSP",
+                    rel,
+                    entry.decls.len(),
+                    entry.refs.len()
+                );
+                let engine = state.engine.read().unwrap();
+                let evs = crate::reconcile_cache::replay_events(
+                    path,
+                    &entry.decls,
+                    &entry.refs,
+                    &engine,
+                );
+                (evs, Vec::new())
+            }
+            None => {
+                miss_persist = true;
+                let (evs, refs) = {
+                    let engine = state.engine.read().unwrap();
+                    crate::reconciler::reconcile_file(path, Some(content), None, &engine)
+                };
+                edges_pending = refs.len();
+                if state.reconcile_cache.lock().unwrap().read_enabled() {
+                    eprintln!(
+                        "[yaam] reconcile-cache MISS for {} — parsed, {} ref(s) queued",
+                        rel,
+                        refs.len()
+                    );
+                } else {
+                    eprintln!(
+                        "[yaam] reconcile-cache OFF (YAAM_RECONCILE_CACHE=off) for {} — parsed, {} ref(s) queued",
+                        rel,
+                        refs.len()
+                    );
+                }
+                (evs, refs)
+            }
+        }
+    } else {
+        let (evs, refs) = {
+            let engine = state.engine.read().unwrap();
+            crate::reconciler::reconcile_file(path, content_opt, None, &engine)
+        };
+        edges_pending = refs.len();
+        (evs, refs)
     };
 
     // Compute embeddings for Entity UpsertNode events before persistence.
@@ -1418,7 +1486,7 @@ fn handle_reconcile(
     // Batch-embeds all cache misses in a single ONNX forward pass for efficiency.
     // Reconcile-time embeddings are opt-in: each embedded text costs 512-token
     // ONNX passes whose footprint dominates RSS (see docs/MEMORY_FOOTPRINT.md).
-    if crate::embed_on_reconcile() {
+    if crate::embed_on_reconcile() && !cache_hit {
     if let Some(ref embedder) = state.embedder {
         // Phase A: Check cache for all entities, collect texts that need embedding
         // (cache misses). Reuse existing embeddings for cache hits.
@@ -1545,6 +1613,20 @@ fn handle_reconcile(
             }
         }
     }
+    }
+
+    // Persist declarations immediately on a miss; resolved edges are added by
+    // the background worker as they arrive. Best-effort: never fails reconcile.
+    if miss_persist {
+        let decls: Vec<Event> = events
+            .iter()
+            .filter(|e| !matches!(e.event_type, EventType::DeleteNode))
+            .cloned()
+            .collect();
+        if let Ok(mut cache) = state.reconcile_cache.lock() {
+            cache.put_decls(&rel, content_opt.unwrap_or(""), decls, edges_pending as u32);
+            cache.flush();
+        }
     }
 
     let mut generated_ids = Vec::new();
@@ -1713,8 +1795,7 @@ fn handle_reconcile(
     // References are sent to a background worker via tokio channel.
     // The worker resolves them via LSP and applies LinkNodes events asynchronously.
     // This ensures reconcile returns immediately without blocking on LSP round-trips.
-    let edges_pending = pending_refs.len();
-    if edges_pending > 0 {
+    if !pending_refs.is_empty() {
         if let Some(ref tx) = state.ref_queue {
             for pref in pending_refs {
                 let _ = tx.send(pref);  // Non-blocking — never blocks the caller
@@ -1722,11 +1803,28 @@ fn handle_reconcile(
         }
     }
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "status": "ok",
         "upserted_nodes": generated_ids,
-        "edges_pending": edges_pending
-    }))
+        "edges_pending": edges_pending,
+        "cached": cache_hit,
+    });
+    if cache_hit {
+        // Make the replayed edges explicit so a caller can see them without a
+        // graph query.
+        response["edges"] = serde_json::json!(cached_refs
+            .iter()
+            .map(|r| serde_json::json!({
+                "ref_name": r.ref_name,
+                "ref_type": r.ref_type,
+                "from_id": r.from_id,
+                "to_id": r.to_id,
+                "line": r.line,
+                "col": r.col,
+            }))
+            .collect::<Vec<_>>());
+    }
+    Ok(response)
 }
 
 // ─── Background LSP Resolution (Spec #2) ────────────────────────────────────
@@ -1738,7 +1836,48 @@ fn handle_reconcile(
 /// calls `get_definition`, and applies the resulting `LinkNodes` event
 /// to storage and the memory graph.
 pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::PendingReference) {
-    use crate::reconciler::PendingReference;
+    use crate::reconcile_cache::{content_hash, rel_key, CachedRef, Resolution};
+
+    let resolution = resolve_reference_inner(state, &pref);
+
+    // Cache bookkeeping. `LspUnavailable` leaves the entry pending so a later
+    // run with the resolver enabled re-resolves rather than caching a hole.
+    let (edge, dep) = match &resolution {
+        Resolution::LspUnavailable => return,
+        Resolution::Unresolved => (None, None),
+        Resolution::Resolved { to_id, dep_path } => {
+            let edge = CachedRef {
+                ref_name: pref.ref_name.clone(),
+                ref_type: pref.ref_type.clone(),
+                from_id: pref.source_id.clone(),
+                to_id: to_id.clone(),
+                line: pref.line,
+                col: pref.col,
+            };
+            // Any cross-file target is a dependency: a rename/removal there
+            // changes this file's resolved answer.
+            let dep = dep_path.as_ref().and_then(|p| {
+                std::fs::read_to_string(p)
+                    .ok()
+                    .map(|c| (rel_key(p, &state.project_root), content_hash(&c)))
+            });
+            (Some(edge), dep)
+        }
+    };
+    if let Ok(mut cache) = state.reconcile_cache.lock() {
+        cache.record_resolution(&rel_key(&pref.source_file, &state.project_root), edge, dep);
+    }
+}
+
+/// Resolve one pending reference via LSP and apply the resulting edge.
+///
+/// The `Resolution` return tells the cache whether the reference counts as
+/// resolved (so the entry can become usable) and what dependency it added.
+fn resolve_reference_inner(
+    state: &AppState,
+    pref: &crate::reconciler::PendingReference,
+) -> crate::reconcile_cache::Resolution {
+    use crate::reconcile_cache::Resolution;
     use crate::lsp_adapter::LspAdapter;
 
     let path = std::path::Path::new(&pref.source_file);
@@ -1746,7 +1885,7 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
     // 1. Get or create LSP client for the file's language
     let lsp_arc = match get_or_create_lsp(state, path) {
         Some(c) => c,
-        None => return,  // LSP not available for this language
+        None => return Resolution::LspUnavailable,  // LSP not available for this language
     };
 
     // 2. Lock the LSP client
@@ -1783,7 +1922,7 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
                     "[yaam] lsp: definition request failed for {} at {}:{} — {}",
                     pref.source_file, pref.line, pref.col, e
                 );
-                return;
+                return Resolution::Unresolved;
             }
         };
         match locations.into_iter().next() {
@@ -1793,7 +1932,7 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
                     pref.ref_name, pref.source_file, pref.line, pref.col, attempt
                 );
                 if attempt == max_attempts {
-                    return;
+                    return Resolution::Unresolved;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(retry_ms));
             }
@@ -1813,7 +1952,7 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
     }
     let loc = match answer {
         Some(l) => l,
-        None => return,
+        None => return Resolution::Unresolved,
     };
     drop(lsp);  // Release LSP lock as early as possible
 
@@ -1830,7 +1969,7 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
                 "[yaam] lsp: UNRESOLVED module for '{}' at {}:{} — self-referential after {} attempt(s), no edge emitted",
                 pref.ref_name, pref.source_file, pref.line, max_attempts
             );
-            return;
+            return Resolution::Unresolved;
         }
         let absolute_path = if let Some(stripped) = loc.uri.strip_prefix("file://") {
             stripped.to_string()
@@ -1842,6 +1981,11 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or(absolute_path);
         let target_id = format!("{}:{}", target_file_path, pref.ref_name);
+        let dep_path = if target_file_path != pref.source_file {
+            Some(target_file_path.clone())
+        } else {
+            None
+        };
         eprintln!(
             "[yaam] lsp: resolved {} --{}--> {}",
             pref.source_id, pref.ref_type, target_id
@@ -1855,9 +1999,9 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
                 .as_millis() as u64,
             event_type: EventType::LinkNodes,
             payload: EventPayload::LinkNodes(LinkNodesPayload {
-                from_id: pref.source_id,
-                to_id: target_id,
-                relationship: pref.ref_type,
+                from_id: pref.source_id.clone(),
+                to_id: target_id.clone(),
+                relationship: pref.ref_type.clone(),
                 properties: HashMap::new(),
             }),
         };
@@ -1867,11 +2011,12 @@ pub fn resolve_reference_sync(state: &AppState, pref: crate::reconciler::Pending
             let store = state.store.write().unwrap();
             if let Err(e) = store.append(&event) {
                 eprintln!("Failed to append background LSP event: {}", e);
-                return;
+                return Resolution::Resolved { to_id: target_id, dep_path };
             }
         }
         let mut engine = state.engine.write().unwrap();
         engine.apply_event(&event);
+        Resolution::Resolved { to_id: target_id, dep_path }
     }
 }
 
@@ -1887,6 +2032,10 @@ fn handle_initialize(
 }
 
 fn handle_shutdown(state: &AppState) -> Result<serde_json::Value, RpcResponse> {
+    // Persist the reconcile cache before the process exits.
+    if let Ok(mut cache) = state.reconcile_cache.lock() {
+        cache.flush();
+    }
     // Stop all running LSP servers.
     let clients = state.lsp_clients.read().unwrap();
     for (lang_id, client) in clients.iter() {

@@ -14,6 +14,7 @@ mod language_adapter;
 mod lsp_adapter;
 mod mcp;
 mod query_dsl;
+mod reconcile_cache;
 mod reconciler;
 mod rpc;
 mod search;
@@ -29,6 +30,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Best-effort flush of the reconcile cache; IO failures are logged and ignored.
+fn flush_reconcile_cache(state: &Arc<AppState>) {
+    if let Ok(mut cache) = state.reconcile_cache.lock() {
+        cache.flush();
+    }
+}
 
 /// Persist reconcile-derived events (Layer 0: code topology) to `events.jsonl`.
 ///
@@ -151,6 +159,14 @@ async fn main() {
         }
     };
 
+    if let Ok(cache) = state.reconcile_cache.lock() {
+        eprintln!(
+            "[yaam] reconcile-cache: {} entries, read_enabled={}",
+            cache.len(),
+            cache.read_enabled()
+        );
+    }
+
     // ── Background LSP reference resolution worker (Spec #2) ──
     //
     // Pending references from reconcile are sent through an unbounded channel
@@ -190,9 +206,20 @@ async fn main() {
                     })
                     .await
                     .ok();
+                    // Flush once the queue drains: one write per resolved batch
+                    // instead of one write per reference.
+                    if ref_rx.len() == 0 {
+                        flush_reconcile_cache(&worker_state);
+                    }
                 }
-                Ok(None) => break, // channel closed
-                Err(_) => crate::rpc::stop_all_lsp(worker_state.as_ref()),
+                Ok(None) => {
+                    flush_reconcile_cache(&worker_state);
+                    break; // channel closed
+                }
+                Err(_) => {
+                    crate::rpc::stop_all_lsp(worker_state.as_ref());
+                    flush_reconcile_cache(&worker_state);
+                }
             }
         }
     });
