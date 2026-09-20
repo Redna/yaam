@@ -2,6 +2,24 @@ import { YaamEngineClient } from './engine-client.js';
 import * as path from 'path';
 import * as crypto from 'crypto';
 
+/**
+ * Coverage facts read from the engine's reconcile cache
+ * (`<workspace>/.yaam/reconcile-cache.json`, owned by the Rust daemon).
+ *
+ * `known` is false only when the cache is switched off
+ * (`YAAM_RECONCILE_CACHE=off`): the engine is bypassing the cache, so file
+ * completeness cannot be judged from it and the full sync falls back to the
+ * mtime-only fast-path. When the cache is enabled but absent/unreadable the
+ * result is an empty coverage set — nothing is provably complete.
+ */
+interface CacheCoverage {
+  known: boolean;
+  /** Relative paths that have a cache entry (complete or not). */
+  present: Set<string>;
+  /** Relative path → references still awaiting resolution in the engine queue. */
+  pending: Map<string, number>;
+}
+
 export class Reconciler {
   public isRunning = false;
   public progress: { current: number; total: number; detail: string } | null = null;
@@ -17,6 +35,11 @@ export class Reconciler {
   /** Maps relative file path → mtime (ms) of the last reconciled version.
    *  Used to detect files modified externally (e.g., by bash commands). */
   private fileMtimes: Map<string, number> = new Map();
+  /** Files whose content hash is known but whose graph coverage is incomplete
+   *  (no cache entry, or references still pending). These must bypass the
+   *  content-hash fast-path in runSync() so the engine re-parses and re-queues
+   *  their references instead of silently skipping them. */
+  private forceReconcile: Set<string> = new Set();
 
   constructor(private engine: YaamEngineClient) {}
 
@@ -195,6 +218,42 @@ export class Reconciler {
     }
   }
 
+  /**
+   * Read the engine's reconcile cache for coverage facts. Best-effort: an
+   * absent or malformed cache yields an *empty* coverage set (nothing is
+   * provably complete, so everything is re-queued) — that is exactly the state
+   * a fresh workspace or a kill-before-flush leaves behind.
+   *
+   * Only `YAAM_RECONCILE_CACHE=off` gives `known:false`: the engine is bypassing
+   * the cache, so file completeness cannot be judged from it and the full sync
+   * falls back to the mtime-only fast-path instead of re-parsing everything.
+   */
+  private async readCacheCoverage(): Promise<CacheCoverage> {
+    if ((process.env.YAAM_RECONCILE_CACHE ?? '').toLowerCase() === 'off') {
+      return { known: false, present: new Set(), pending: new Map() };
+    }
+
+    const empty: CacheCoverage = { known: true, present: new Set(), pending: new Map() };
+    const dir = process.env.YAAM_RECONCILE_CACHE_DIR || path.resolve(process.cwd(), '.yaam');
+    try {
+      const fs = await import('fs/promises');
+      const doc = JSON.parse(await fs.readFile(path.resolve(dir, 'reconcile-cache.json'), 'utf-8'));
+      const files = doc?.files;
+      if (!files || typeof files !== 'object') return empty;
+
+      const present = new Set<string>();
+      const pending = new Map<string, number>();
+      for (const [rel, entry] of Object.entries(files as Record<string, any>)) {
+        present.add(rel);
+        const n = Number((entry as any)?.refs_pending ?? 0);
+        pending.set(rel, Number.isFinite(n) && n > 0 ? n : 0);
+      }
+      return { known: true, present, pending };
+    } catch {
+      return empty;
+    }
+  }
+
   public async scheduleFull() {
     this.isPriming = true;
     try {
@@ -262,8 +321,28 @@ export class Reconciler {
       const allFiles = await walkAsync(process.cwd());
       const allFilesSet = new Set(allFiles.map((f: string) => walkPath.relative(process.cwd(), f)));
 
+      // Ask the engine's reconcile cache which files are provably complete.
+      // The graph query above only tells us the engine *knows* a file; it does
+      // not tell us whether that file's references were fully resolved. The
+      // cache's `refs_pending` is the only such signal the daemon exposes, and
+      // it is the one Leg 1 invalidates on (entry_is_valid rejects pending>0).
+      const cache = await this.readCacheCoverage();
+
+      let reconciledCount = 0;
+      let unresolvedRefs = 0;
+      for (const rel of allFilesSet) {
+        if (cache.known) {
+          const pending = cache.pending.get(rel) ?? 0;
+          unresolvedRefs += pending;
+          if (pending === 0 && cache.present.has(rel) && graphFiles.has(rel)) reconciledCount++;
+        } else if (graphFiles.has(rel)) {
+          reconciledCount++;
+        }
+      }
+
       let queued = 0;
       let primed = 0;
+      let requeuedIncomplete = 0;
 
       // Process file stats sequentially to prevent Node.js OOM
       for (const absPath of allFiles) {
@@ -278,12 +357,29 @@ export class Reconciler {
             continue;
           }
 
-          if (stat.mtimeMs > lastReconciled) {
-            // File changed since last reconciliation (or is new) — queue it
+          // Coverage-aware skip: only a file that is *provably* complete may be
+          // skipped. Complete means the graph knows it (a File node with an
+          // mtime) and, when the cache is readable, its entry exists with zero
+          // pending references. This is what makes "who calls X" truthful: an
+          // engine restart mid-queue drops unresolved refs in memory, and those
+          // files are re-queued here even though their mtime never changed.
+          const pendingRefs = cache.known ? (cache.pending.get(relPath) ?? 0) : 0;
+          const cacheComplete = !cache.known || (cache.present.has(relPath) && pendingRefs === 0);
+          const graphKnowsFile = graphFiles.has(relPath);
+          const mtimeChanged = stat.mtimeMs > lastReconciled;
+
+          if (mtimeChanged || !cacheComplete || !graphKnowsFile) {
+            if (!mtimeChanged && (!cacheComplete || !graphKnowsFile)) {
+              // Unchanged content but incomplete coverage: drop the primed hash
+              // and force the file through runSync()'s hash fast-path.
+              this.contentHashes.delete(relPath);
+              this.forceReconcile.add(relPath);
+              requeuedIncomplete++;
+            }
             this.syncQueue.add(relPath);
             queued++;
           } else {
-            // File unchanged — prime the hash so runSync() skips it
+            // File unchanged and covered — prime the hash so runSync() skips it
             const content = await fs.readFile(absPath, 'utf-8');
             this.contentHashes.set(relPath, this.hashContent(content));
             primed++;
@@ -294,7 +390,16 @@ export class Reconciler {
       console.error("[YAAM Reconciler] Full sync error:", err); /* skip */ }
       }
 
-      console.log(`[YAAM Reconciler] scheduleFull completed. Queued: ${queued}, Primed (Skipped): ${primed}`);
+      // One line per full sync so an incomplete graph is visible instead of
+      // silent. `reconciled` counts discovered files that are provably complete
+      // (graph File node + cache entry with zero pending refs); `unresolved` is
+      // the engine's pending reference count across those files.
+      if (cache.known) {
+        console.log(`[YAAM Reconciler] coverage: ${reconciledCount}/${allFilesSet.size} files, ${unresolvedRefs} refs pending`);
+      } else {
+        console.log(`[YAAM Reconciler] coverage: ${reconciledCount}/${allFilesSet.size} files, refs pending unknown (reconcile cache off/unreadable)`);
+      }
+      console.log(`[YAAM Reconciler] scheduleFull completed. Queued: ${queued} (${requeuedIncomplete} re-queued for coverage), Primed (Skipped): ${primed}`);
 
       // Delete stale files (in graph but not on disk).
       for (const [fileId, _] of graphFiles) {
@@ -367,8 +472,12 @@ export class Reconciler {
 
           // Skip if content hasn't changed since last reconciliation.
           const newHash = this.hashContent(content);
+          // A file queued for coverage (not an mtime change) must not be skipped
+          // by the content-hash fast-path — the engine needs to re-parse it and
+          // re-queue its unresolved references.
+          const forced = this.forceReconcile.delete(relPath);
           const existingHash = this.contentHashes.get(relPath);
-          if (existingHash === newHash) {
+          if (!forced && existingHash === newHash) {
             skipped++;
             const newStat = await fs.stat(resolved);
             this.fileMtimes.set(relPath, newStat.mtimeMs);
